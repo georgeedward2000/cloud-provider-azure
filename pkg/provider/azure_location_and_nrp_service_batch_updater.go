@@ -221,7 +221,27 @@ func NRPAPIClientUpdateNRPLocations(
 
 	// Send the request
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	var resp *http.Response
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+
+		klog.V(2).Infof("NRPAPIClientUpdateNRPLocations: attempt %d/%d failed: %v", i+1, maxRetries, err)
+
+		if i < maxRetries-1 {
+			// Exponential backoff: 1s, 2s, 4s
+			backoff := time.Duration(1<<uint(i)) * time.Second
+			select {
+			case <-time.After(backoff):
+				// Continue to next retry
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled during retry: %w", ctx.Err())
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("failed to send HTTP request: %w", err)
 	}
@@ -259,7 +279,28 @@ func NRPAPIClientUpdateNRPServices(ctx context.Context, createServicesRequestDTO
 
 	// Send the request
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+
+	var resp *http.Response
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+
+		klog.V(2).Infof("NRPAPIClientUpdateNRPServices: attempt %d/%d failed: %v", i+1, maxRetries, err)
+
+		if i < maxRetries-1 {
+			// Exponential backoff: 1s, 2s, 4s
+			backoff := time.Duration(1<<uint(i)) * time.Second
+			select {
+			case <-time.After(backoff):
+				// Continue to next retry
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled during retry: %w", ctx.Err())
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("failed to send HTTP request: %w", err)
 	}
