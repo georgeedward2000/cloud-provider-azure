@@ -130,6 +130,7 @@ type Cloud struct {
 	routeUpdater                      batchProcessor
 	backendPoolUpdater                batchProcessor
 	locationAndNRPServiceBatchUpdater batchProcessor
+	podEgressResourceUpdater          batchProcessor
 
 	vmCache        azcache.Resource
 	lbCache        azcache.Resource
@@ -144,6 +145,8 @@ type Cloud struct {
 	pipCache azcache.Resource
 	// Add service lister to always get latest service
 	serviceLister corelisters.ServiceLister
+	// Add pod lister to always get latest pod
+	podLister corelisters.PodLister
 	// node-sync-loop routine and service-reconcile routine should not update LoadBalancer at the same time
 	serviceReconcileLock sync.Mutex
 
@@ -155,7 +158,6 @@ type Cloud struct {
 	multipleStandardLoadBalancersActiveServicesLock sync.Mutex
 	multipleStandardLoadBalancersActiveNodesLock    sync.Mutex
 	localServiceNameToServiceInfoMap                sync.Map
-	localServiceNameToNRPServiceMap                 sync.Map
 	endpointSlicesCache                             sync.Map
 
 	azureResourceLocker *AzureResourceLocker
@@ -262,6 +264,20 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 	if config == nil {
 		// should not reach here
 		return fmt.Errorf("InitializeCloudFromConfig: cannot initialize from nil config")
+	}
+
+	// Use a single flag to determine if the service gateway is enabled.
+	// All 3 conditions must be true:
+	// 1. ServiceGatewayEnabled is true
+	// 2. lb sku is standardV2
+	// 3. backendPoolType is PodIP
+	if az.ServiceGatewayEnabled && az.IsLBBackendPoolTypePodIPAndUseStandardV2LoadBalancer() {
+		klog.V(2).Info("Service Gateway is enabled, using PodIP backend pool type with Standard V2 Load Balancer")
+		az.ServiceGatewayEnabled = true
+	} else {
+		klog.V(2).Info("CLB-ENECHITOAIA-Service Gateway is not enabled")
+		klog.V(2).Infof("CLB-ENECHITOAIA-ServiceGatewayEnabled=%t, LoadBalancerSKU=%s, LoadBalancerBackendPoolConfigurationType=%s", az.ServiceGatewayEnabled, az.LoadBalancerSKU, az.LoadBalancerBackendPoolConfigurationType)
+		az.ServiceGatewayEnabled = false
 	}
 
 	if config.RouteTableResourceGroup == "" {
@@ -376,7 +392,8 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 		az.LoadBalancerBackendPool = newBackendPoolTypeNodeIPConfig(az)
 	} else if az.IsLBBackendPoolTypeNodeIP() {
 		az.LoadBalancerBackendPool = newBackendPoolTypeNodeIP(az)
-	} else if az.IsLBBackendPoolTypePodIPAndUseStandardV2LoadBalancer() {
+	} else if az.IsLBBackendPoolTypePodIP() {
+		klog.V(2).Info("CLB-ENECHITOAIA-Service Gateway is enabled, using PodIP backend pool type with Standard V2 Load Balancer")
 		az.LoadBalancerBackendPool = newBackendPoolTypePodIP(az)
 	}
 
@@ -480,6 +497,7 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 	if err != nil {
 		return err
 	}
+
 	// updating routes and syncing zones only in CCM
 	if callFromCCM {
 		// start delayed route updater.
@@ -496,9 +514,21 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 		}
 
 		// start NRP location and service batch updater.
-		if az.IsLBBackendPoolTypePodIPAndUseStandardV2LoadBalancer() {
+		if az.ServiceGatewayEnabled {
+			klog.V(2).Info("CLB-ENECHITOAIA-Service Gateway is enabled")
+			klog.V(2).Info("CLB-ENECHITOAIA-initializing diff tracker")
+			err = az.initializeDiffTracker()
+			if err != nil {
+				klog.Errorf("InitializeCloudFromConfig: failed to initialize difftracker: %s", err.Error())
+			}
+
+			klog.V(2).Info("CLB-ENECHITOAIA-starting NRP location and service batch updater")
 			az.locationAndNRPServiceBatchUpdater = newLocationAndNRPServiceBatchUpdater(az)
 			go az.locationAndNRPServiceBatchUpdater.run(ctx)
+
+			klog.V(2).Info("CLB-ENECHITOAIA-starting pod egress resource updater")
+			az.podEgressResourceUpdater = newPodEgressResourceUpdater(az)
+			go az.podEgressResourceUpdater.run(ctx)
 		}
 		// Azure Stack does not support zone at the moment
 		// https://docs.microsoft.com/en-us/azure-stack/user/azure-stack-network-differences?view=azs-2102
@@ -514,14 +544,17 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 		}
 	}
 
-	if az.IsLBBackendPoolTypePodIPAndUseStandardV2LoadBalancer() {
-		err = az.initializeDiffTracker()
-		if err != nil {
-			klog.Errorf("InitializeCloudFromConfig: failed to initialize difftracker: %s", err.Error())
-		}
-	}
-
 	return nil
+}
+
+func (az *Cloud) TriggerLocationAndNRPServiceBatchUpdate() {
+	select {
+	case az.locationAndNRPServiceBatchUpdater.(*locationAndNRPServiceBatchUpdater).channelUpdateTrigger <- true:
+		// trigger batch update
+	default:
+		// channel is full, do nothing
+		klog.V(2).Info("az.locationAndNRPServiceBatchUpdater.channelUpdateTrigger is full. Batch update is already triggered.")
+	}
 }
 
 func (az *Cloud) initializeDiffTracker() error {
@@ -799,6 +832,10 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 	az.serviceLister = informerFactory.Core().V1().Services().Lister()
 
 	az.setUpEndpointSlicesInformer(informerFactory)
+
+	if az.ServiceGatewayEnabled {
+		az.setUpPodInformerForEgress()
+	}
 }
 
 // updateNodeCaches updates local cache for node's zones and external resource groups.
