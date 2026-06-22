@@ -687,7 +687,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 		if dt.NRPResources.NATGateways.Has(serviceUID) {
 			klog.V(2).Infof("Engine.AddPod: Service %s exists in NRP, adding pod %s immediately", serviceUID, podKey)
 			err := dt.updateK8sPodLocked(UpdatePodInputType{
-				PodOperation:           ADD,
+				PodOperation:           Add,
 				PublicOutboundIdentity: serviceUID,
 				Location:               location,
 				Address:                address,
@@ -751,7 +751,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 		// Service is ready - add pod immediately
 		klog.V(2).Infof("Engine.AddPod: Service %s is ready, adding pod %s immediately", serviceUID, podKey)
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
-			PodOperation:           ADD,
+			PodOperation:           Add,
 			PublicOutboundIdentity: serviceUID,
 			Location:               location,
 			Address:                address,
@@ -771,7 +771,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 		// for safety in case the outbound update path is implemented later.
 		klog.V(2).Infof("Engine.AddPod: Service %s is updating, adding pod %s immediately", serviceUID, podKey)
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
-			PodOperation:           ADD,
+			PodOperation:           Add,
 			PublicOutboundIdentity: serviceUID,
 			Location:               location,
 			Address:                address,
@@ -819,12 +819,12 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 		serviceUID, location, address, namespace, name)
 
 	// Check counter BEFORE removing pod to determine if this is the last pod
-	val, ok := dt.LocalServiceNameToNRPServiceMap.Load(strings.ToLower(serviceUID))
+	val, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(serviceUID))
 	if !ok {
-		klog.Warningf("Engine.DeletePod: Service %s not found in LocalServiceNameToNRPServiceMap", serviceUID)
+		klog.Warningf("Engine.DeletePod: Service %s not found in outboundIdentityPodRefCount", serviceUID)
 		// Still try to remove pod from DiffTracker
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
-			PodOperation:           REMOVE,
+			PodOperation:           Remove,
 			PublicOutboundIdentity: serviceUID,
 			Location:               location,
 			Address:                address,
@@ -850,7 +850,7 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 
 	// Remove pod from DiffTracker (this also updates the counter via UpdateK8sPod)
 	err := dt.updateK8sPodLocked(UpdatePodInputType{
-		PodOperation:           REMOVE,
+		PodOperation:           Remove,
 		PublicOutboundIdentity: serviceUID,
 		Location:               location,
 		Address:                address,
@@ -865,7 +865,7 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 
 	if isLastPod {
 		// This was the last pod - mark service for deletion
-		// Note: LocalServiceNameToNRPServiceMap already updated by UpdateK8sPod
+		// Note: outboundIdentityPodRefCount already updated by UpdateK8sPod
 		klog.V(2).Infof("Engine.DeletePod: Last pod removed for service %s, marking for deletion", serviceUID)
 
 		// Check if service is tracked
@@ -934,7 +934,7 @@ func (dt *DiffTracker) promotePendingPodsLocked(serviceUID string) {
 			pod.PodKey, pod.Location, pod.Address)
 
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
-			PodOperation:           ADD,
+			PodOperation:           Add,
 			PublicOutboundIdentity: serviceUID,
 			Location:               pod.Location,
 			Address:                pod.Address,

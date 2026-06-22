@@ -208,13 +208,14 @@ func GetTestCloudWithContainerLoadBalancer(ctrl *gomock.Controller) (az *Cloud) 
 		ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
 		ServiceGatewayID:           "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ServiceNetworking/serviceGateways/" + consts.DefaultServiceGatewayResourceName,
 	}
-	az.diffTracker = difftracker.InitializeDiffTracker(
-		difftracker.K8s_State{
+	var err error
+	az.diffTracker, err = difftracker.New(
+		difftracker.K8sState{
 			Services: utilsets.NewString(),
 			Egresses: utilsets.NewString(),
 			Nodes:    make(map[string]difftracker.Node),
 		},
-		difftracker.NRP_State{
+		difftracker.NRPState{
 			LoadBalancers: utilsets.NewString(),
 			NATGateways:   utilsets.NewString(),
 			Locations:     make(map[string]difftracker.NRPLocation),
@@ -223,6 +224,9 @@ func GetTestCloudWithContainerLoadBalancer(ctrl *gomock.Controller) (az *Cloud) 
 		az.NetworkClientFactory,
 		az.KubeClient,
 	)
+	if err != nil {
+		panic("GetTestCloudWithContainerLoadBalancer: failed to initialize diffTracker: " + err.Error())
+	}
 	return az
 }
 

@@ -130,3 +130,16 @@ func (s *IgnoreCaseSet) Len() int {
 	}
 	return s.set.Len()
 }
+
+// Difference returns a new IgnoreCaseSet containing the items in s that are not
+// present in other (i.e. the set difference s \ other). It is safe to call on
+// nil or uninitialized sets.
+func (s *IgnoreCaseSet) Difference(other *IgnoreCaseSet) *IgnoreCaseSet {
+	result := NewString()
+	for _, item := range s.UnsortedList() {
+		if !other.Has(item) {
+			result.Insert(item)
+		}
+	}
+	return result
+}

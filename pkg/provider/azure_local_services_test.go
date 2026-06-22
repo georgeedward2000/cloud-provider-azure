@@ -812,12 +812,12 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cloud := GetTestCloudWithContainerLoadBalancer(ctrl)
 
-			k8s := difftracker.K8s_State{
+			k8s := difftracker.K8sState{
 				Services: utilsets.NewString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
 				Egresses: utilsets.NewString(),
 				Nodes:    make(map[string]difftracker.Node),
 			}
-			nrp := difftracker.NRP_State{
+			nrp := difftracker.NRPState{
 				LoadBalancers: utilsets.NewString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
 				NATGateways:   utilsets.NewString(),
 				Locations:     make(map[string]difftracker.NRPLocation),
@@ -832,7 +832,8 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 				// },
 			}
 
-			cloud.diffTracker = difftracker.InitializeDiffTracker(k8s, nrp, difftracker.Config{
+			var err error
+			cloud.diffTracker, err = difftracker.New(k8s, nrp, difftracker.Config{
 				SubscriptionID:             cloud.SubscriptionID,
 				ResourceGroup:              cloud.ResourceGroup,
 				Location:                   cloud.Location,
@@ -840,6 +841,9 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 				ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
 				ServiceGatewayID:           cloud.GetServiceGatewayID(),
 			}, cloud.NetworkClientFactory, nil)
+			if err != nil {
+				t.Fatalf("failed to initialize diffTracker: %v", err)
+			}
 
 			cloud.localServiceNameToServiceInfoMap = sync.Map{}
 			if !tc.notLocal {
@@ -854,8 +858,6 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 				"node1": utilsets.NewString("10.0.0.1"),
 				"node2": utilsets.NewString("10.0.0.2"),
 			}
-			cloud.diffTracker.LocalServiceNameToNRPServiceMap = sync.Map{}
-			cloud.diffTracker.LocalServiceNameToNRPServiceMap.Store("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", struct{}{})
 
 			// Engine pattern is now wired (Phase 6 complete)
 			// EndpointSlice informer calls diffTracker.UpdateEndpoints which handles buffering/state
@@ -869,7 +871,7 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 			informerFactory.Start(stopChan)
 			time.Sleep(100 * time.Millisecond)
 
-			_, err := client.DiscoveryV1().EndpointSlices("test").Update(context.Background(), tc.updatedEPS, metav1.UpdateOptions{})
+			_, err = client.DiscoveryV1().EndpointSlices("test").Update(context.Background(), tc.updatedEPS, metav1.UpdateOptions{})
 			assert.NoError(t, err)
 			time.Sleep(2 * time.Second)
 		})

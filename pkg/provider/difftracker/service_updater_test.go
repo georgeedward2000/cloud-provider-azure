@@ -40,12 +40,12 @@ func TestServiceUpdaterGracefulStop(t *testing.T) {
 // TestServiceUpdaterProcessBatchFlow tests that processBatch correctly categorizes work
 func TestServiceUpdaterProcessBatchFlow(t *testing.T) {
 	dt := &DiffTracker{
-		NRPResources: NRP_State{
+		NRPResources: NRPState{
 			LoadBalancers: utilsets.NewString(),
 			NATGateways:   utilsets.NewString(),
 			Locations:     make(map[string]NRPLocation),
 		},
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Services: utilsets.NewString(),
 			Egresses: utilsets.NewString(),
 			Nodes:    make(map[string]Node),

@@ -547,7 +547,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 		dt := &DiffTracker{
 			kubeClient:          kubeClient,
 			pendingPodDeletions: make(map[string]*PendingPodDeletion),
-			NRPResources: NRP_State{
+			NRPResources: NRPState{
 				Locations: make(map[string]NRPLocation),
 			},
 		}
@@ -587,7 +587,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 		dt := &DiffTracker{
 			kubeClient:          kubeClient,
 			pendingPodDeletions: make(map[string]*PendingPodDeletion),
-			NRPResources: NRP_State{
+			NRPResources: NRPState{
 				Locations: map[string]NRPLocation{
 					"192.168.1.1": {
 						Addresses: map[string]NRPAddress{
@@ -635,7 +635,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 		dt := &DiffTracker{
 			kubeClient:          kubeClient,
 			pendingPodDeletions: make(map[string]*PendingPodDeletion),
-			NRPResources: NRP_State{
+			NRPResources: NRPState{
 				Locations: make(map[string]NRPLocation), // Address not in NRP
 			},
 		}
@@ -667,7 +667,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 		dt := &DiffTracker{
 			kubeClient:          kubeClient,
 			pendingPodDeletions: make(map[string]*PendingPodDeletion),
-			NRPResources: NRP_State{
+			NRPResources: NRPState{
 				Locations: make(map[string]NRPLocation),
 			},
 		}
@@ -694,7 +694,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 		dt := &DiffTracker{
 			kubeClient:          kubeClient,
 			pendingPodDeletions: make(map[string]*PendingPodDeletion),
-			NRPResources: NRP_State{
+			NRPResources: NRPState{
 				Locations: make(map[string]NRPLocation),
 			},
 		}
@@ -711,7 +711,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 func TestIsAddressInNRPLocked(t *testing.T) {
 	tests := []struct {
 		name       string
-		nrpState   NRP_State
+		nrpState   NRPState
 		serviceUID string
 		location   string
 		address    string
@@ -719,7 +719,7 @@ func TestIsAddressInNRPLocked(t *testing.T) {
 	}{
 		{
 			name: "address exists with service",
-			nrpState: NRP_State{
+			nrpState: NRPState{
 				Locations: map[string]NRPLocation{
 					"192.168.1.1": {
 						Addresses: map[string]NRPAddress{
@@ -737,7 +737,7 @@ func TestIsAddressInNRPLocked(t *testing.T) {
 		},
 		{
 			name: "address exists but different service",
-			nrpState: NRP_State{
+			nrpState: NRPState{
 				Locations: map[string]NRPLocation{
 					"192.168.1.1": {
 						Addresses: map[string]NRPAddress{
@@ -755,7 +755,7 @@ func TestIsAddressInNRPLocked(t *testing.T) {
 		},
 		{
 			name: "location does not exist",
-			nrpState: NRP_State{
+			nrpState: NRPState{
 				Locations: map[string]NRPLocation{},
 			},
 			serviceUID: "service-1",
@@ -765,7 +765,7 @@ func TestIsAddressInNRPLocked(t *testing.T) {
 		},
 		{
 			name: "address does not exist in location",
-			nrpState: NRP_State{
+			nrpState: NRPState{
 				Locations: map[string]NRPLocation{
 					"192.168.1.1": {
 						Addresses: map[string]NRPAddress{
@@ -783,7 +783,7 @@ func TestIsAddressInNRPLocked(t *testing.T) {
 		},
 		{
 			name: "address exists but services is nil",
-			nrpState: NRP_State{
+			nrpState: NRPState{
 				Locations: map[string]NRPLocation{
 					"192.168.1.1": {
 						Addresses: map[string]NRPAddress{
@@ -877,7 +877,7 @@ func TestCheckPendingPodDeletions_Concurrent(t *testing.T) {
 	dt := &DiffTracker{
 		kubeClient:          kubeClient,
 		pendingPodDeletions: make(map[string]*PendingPodDeletion),
-		NRPResources: NRP_State{
+		NRPResources: NRPState{
 			Locations: make(map[string]NRPLocation),
 		},
 	}

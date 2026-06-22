@@ -26,12 +26,12 @@ func TestDiffTracker_DeepEqual(t *testing.T) {
 		{
 			name: "equal empty states",
 			dt: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString(),
 					Egresses: sets.NewString(),
 					Nodes:    map[string]Node{},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString(),
 					NATGateways:   sets.NewString(),
 					Locations:     map[string]NRPLocation{},
@@ -42,12 +42,12 @@ func TestDiffTracker_DeepEqual(t *testing.T) {
 		{
 			name: "equal states with services",
 			dt: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1", "service2"),
 					Egresses: sets.NewString(),
 					Nodes:    map[string]Node{},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service2"),
 					NATGateways:   sets.NewString(),
 					Locations:     map[string]NRPLocation{},
@@ -58,12 +58,12 @@ func TestDiffTracker_DeepEqual(t *testing.T) {
 		{
 			name: "services not equal",
 			dt: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1", "service2"),
 					Egresses: sets.NewString(),
 					Nodes:    map[string]Node{},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1"),
 					NATGateways:   sets.NewString(),
 					Locations:     map[string]NRPLocation{},
@@ -75,7 +75,7 @@ func TestDiffTracker_DeepEqual(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := tt.dt.DeepEqual()
+			result := tt.dt.deepEqualLocked()
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -83,30 +83,30 @@ func TestDiffTracker_DeepEqual(t *testing.T) {
 
 func TestUpdateK8sService(t *testing.T) {
 	dt := &DiffTracker{
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Services: sets.NewString(),
 		},
 	}
 
-	// Test ADD operation
-	err := dt.UpdateK8sService(UpdateK8sResource{
-		Operation: ADD,
+	// Test Add operation
+	err := dt.EnqueueK8sServiceOperation(UpdateK8sResource{
+		Operation: Add,
 		ID:        "service1",
 	})
 	assert.NoError(t, err)
 	assert.True(t, dt.K8sResources.Services.Has("service1"))
 
-	// Test REMOVE operation
-	err = dt.UpdateK8sService(UpdateK8sResource{
-		Operation: REMOVE,
+	// Test Remove operation
+	err = dt.EnqueueK8sServiceOperation(UpdateK8sResource{
+		Operation: Remove,
 		ID:        "service1",
 	})
 	assert.NoError(t, err)
 	assert.False(t, dt.K8sResources.Services.Has("service1"))
 
 	// Test invalid operation
-	err = dt.UpdateK8sService(UpdateK8sResource{
-		Operation: UPDATE,
+	err = dt.EnqueueK8sServiceOperation(UpdateK8sResource{
+		Operation: Update,
 		ID:        "service1",
 	})
 	assert.Error(t, err)
@@ -114,10 +114,10 @@ func TestUpdateK8sService(t *testing.T) {
 
 func TestGetSyncLoadBalancerServices(t *testing.T) {
 	dt := &DiffTracker{
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Services: sets.NewString("service1", "service2", "service3"),
 		},
-		NRPResources: NRP_State{
+		NRPResources: NRPState{
 			LoadBalancers: sets.NewString("service2", "service3", "service4"),
 		},
 	}
@@ -135,7 +135,7 @@ func TestGetSyncLoadBalancerServices(t *testing.T) {
 
 func TestUpdateK8sEndpoints(t *testing.T) {
 	dt := &DiffTracker{
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Nodes: map[string]Node{},
 		},
 	}
@@ -171,14 +171,14 @@ func TestUpdateK8sEndpoints(t *testing.T) {
 
 func TestUpdateK8sPod(t *testing.T) {
 	dt := &DiffTracker{
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Nodes: map[string]Node{},
 		},
 	}
 
 	// Test adding new egress assignment
 	input := UpdatePodInputType{
-		PodOperation:           ADD,
+		PodOperation:           Add,
 		PublicOutboundIdentity: "public1",
 		Location:               "node1",
 		Address:                "10.0.0.1",
@@ -194,7 +194,7 @@ func TestUpdateK8sPod(t *testing.T) {
 
 	// Test removing egress assignment
 	input = UpdatePodInputType{
-		PodOperation: REMOVE,
+		PodOperation: Remove,
 		Location:     "node1",
 		Address:      "10.0.0.1",
 	}
@@ -210,7 +210,7 @@ func TestGetSyncLocationsAddresses(t *testing.T) {
 	// Setup a diff tracker with some pods and services
 	// Note: Services must be "ready" (exist in NRP or be in StateCreated) to be included in sync
 	dt := &DiffTracker{
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Nodes: map[string]Node{
 				"node1": {
 					Pods: map[string]Pod{
@@ -222,7 +222,7 @@ func TestGetSyncLocationsAddresses(t *testing.T) {
 				},
 			},
 		},
-		NRPResources: NRP_State{
+		NRPResources: NRPState{
 			LoadBalancers: sets.NewString("service1"), // Service must exist in NRP to pass filtering
 			NATGateways:   sets.NewString("public1"),  // NAT Gateway must exist in NRP to pass filtering
 			Locations:     map[string]NRPLocation{},
@@ -255,9 +255,9 @@ func TestGetSyncLocationsAddresses(t *testing.T) {
 }
 
 func TestOperation_String(t *testing.T) {
-	assert.Equal(t, "ADD", ADD.String())
-	assert.Equal(t, "REMOVE", REMOVE.String())
-	assert.Equal(t, "UPDATE", UPDATE.String())
+	assert.Equal(t, "Add", Add.String())
+	assert.Equal(t, "Remove", Remove.String())
+	assert.Equal(t, "Update", Update.String())
 }
 func TestUpdateNRPLoadBalancers(t *testing.T) {
 	tests := []struct {
@@ -268,10 +268,10 @@ func TestUpdateNRPLoadBalancers(t *testing.T) {
 		{
 			name: "add services from K8s to NRP",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1", "service2", "service3"),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1"),
 				},
 			},
@@ -280,10 +280,10 @@ func TestUpdateNRPLoadBalancers(t *testing.T) {
 		{
 			name: "remove services from NRP that are not in K8s",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1"),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service2", "service3"),
 				},
 			},
@@ -292,10 +292,10 @@ func TestUpdateNRPLoadBalancers(t *testing.T) {
 		{
 			name: "add and remove services to sync K8s and NRP",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1", "service2", "service4"),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service3", "service5"),
 				},
 			},
@@ -304,10 +304,10 @@ func TestUpdateNRPLoadBalancers(t *testing.T) {
 		{
 			name: "no changes needed when K8s and NRP are in sync",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1", "service2"),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service2"),
 				},
 			},
@@ -331,34 +331,34 @@ func TestUpdateNRPLoadBalancers(t *testing.T) {
 }
 func TestUpdateK8sEgress(t *testing.T) {
 	dt := &DiffTracker{
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Egresses: sets.NewString(),
 		},
 	}
 
-	// Test ADD operation
-	err := dt.UpdateK8sEgress(UpdateK8sResource{
-		Operation: ADD,
+	// Test Add operation
+	err := dt.EnqueueK8sEgressOperation(UpdateK8sResource{
+		Operation: Add,
 		ID:        "egress1",
 	})
 	assert.NoError(t, err)
 	assert.True(t, dt.K8sResources.Egresses.Has("egress1"))
 
-	// Test REMOVE operation
-	err = dt.UpdateK8sEgress(UpdateK8sResource{
-		Operation: REMOVE,
+	// Test Remove operation
+	err = dt.EnqueueK8sEgressOperation(UpdateK8sResource{
+		Operation: Remove,
 		ID:        "egress1",
 	})
 	assert.NoError(t, err)
 	assert.False(t, dt.K8sResources.Egresses.Has("egress1"))
 
 	// Test invalid operation
-	err = dt.UpdateK8sEgress(UpdateK8sResource{
-		Operation: UPDATE,
+	err = dt.EnqueueK8sEgressOperation(UpdateK8sResource{
+		Operation: Update,
 		ID:        "egress1",
 	})
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "error - ResourceType=Egress, Operation=UPDATE and ID=egress1")
+	assert.Contains(t, err.Error(), "error - ResourceType=Egress, Operation=Update and ID=egress1")
 }
 func TestGetSyncNRPNATGateways(t *testing.T) {
 	tests := []struct {
@@ -409,10 +409,10 @@ func TestGetSyncNRPNATGateways(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Initialize DiffTracker with the test case data
 			dt := &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Egresses: sets.NewString(tt.k8sEgresses...),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					NATGateways: sets.NewString(tt.nrpNATGateways...),
 				},
 			}
@@ -447,10 +447,10 @@ func TestUpdateNRPNATGateways(t *testing.T) {
 		{
 			name: "add egresses from K8s to NRP",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Egresses: sets.NewString("egress1", "egress2", "egress3"),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					NATGateways: sets.NewString("egress1"),
 				},
 			},
@@ -459,10 +459,10 @@ func TestUpdateNRPNATGateways(t *testing.T) {
 		{
 			name: "remove egresses from NRP that are not in K8s",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Egresses: sets.NewString("egress1"),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					NATGateways: sets.NewString("egress1", "egress2", "egress3"),
 				},
 			},
@@ -471,10 +471,10 @@ func TestUpdateNRPNATGateways(t *testing.T) {
 		{
 			name: "add and remove egresses to sync K8s and NRP",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Egresses: sets.NewString("egress1", "egress2", "egress4"),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					NATGateways: sets.NewString("egress1", "egress3", "egress5"),
 				},
 			},
@@ -483,10 +483,10 @@ func TestUpdateNRPNATGateways(t *testing.T) {
 		{
 			name: "no changes needed when K8s and NRP are in sync",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Egresses: sets.NewString("egress1", "egress2"),
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					NATGateways: sets.NewString("egress1", "egress2"),
 				},
 			},
@@ -517,10 +517,10 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 		{
 			name: "sync empty states",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Nodes: map[string]Node{},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					Locations: map[string]NRPLocation{},
 				},
 			},
@@ -529,7 +529,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 		{
 			name: "add new location and address",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Nodes: map[string]Node{
 						"node1": {
 							Pods: map[string]Pod{
@@ -541,7 +541,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1"), // Service must exist in NRP to pass filtering
 					NATGateways:   sets.NewString("public1"),  // NAT Gateway must exist in NRP to pass filtering
 					Locations:     map[string]NRPLocation{},
@@ -556,7 +556,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 		{
 			name: "update existing address with new identity",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Nodes: map[string]Node{
 						"node1": {
 							Pods: map[string]Pod{
@@ -568,7 +568,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service2"), // Services must exist in NRP to pass filtering
 					NATGateways:   sets.NewString("public1"),              // NAT Gateway must exist in NRP to pass filtering
 					Locations: map[string]NRPLocation{
@@ -591,7 +591,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 		{
 			name: "remove address that no longer exists in K8s",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Nodes: map[string]Node{
 						"node1": {
 							Pods: map[string]Pod{
@@ -602,7 +602,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service2"), // Services must exist in NRP to pass filtering
 					Locations: map[string]NRPLocation{
 						"node1": {
@@ -627,7 +627,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 		{
 			name: "remove location that no longer exists in K8s",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Nodes: map[string]Node{
 						"node1": {
 							Pods: map[string]Pod{
@@ -638,7 +638,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service2"), // Services must exist in NRP to pass filtering
 					Locations: map[string]NRPLocation{
 						"node1": {
@@ -667,7 +667,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 		{
 			name: "complex case with multiple operations",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Nodes: map[string]Node{
 						"node1": {
 							Pods: map[string]Pod{
@@ -686,7 +686,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					// Services must exist in NRP to pass filtering
 					LoadBalancers: sets.NewString("service1", "service2", "service3", "service4", "service5"),
 					NATGateways:   sets.NewString("public1"),
@@ -772,7 +772,7 @@ func TestUpdateLocationsAddresses(t *testing.T) {
 
 func createTestDiffTracker() *DiffTracker {
 	return &DiffTracker{
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Services: sets.NewString(),
 			Egresses: sets.NewString(),
 			Nodes: map[string]Node{
@@ -786,7 +786,7 @@ func createTestDiffTracker() *DiffTracker {
 				},
 			},
 		},
-		NRPResources: NRP_State{
+		NRPResources: NRPState{
 			LoadBalancers: sets.NewString(),
 			NATGateways:   sets.NewString(),
 			Locations: map[string]NRPLocation{
@@ -814,7 +814,7 @@ func TestGetSyncOperations(t *testing.T) {
 		{
 			name: "states already in sync",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1"),
 					Egresses: sets.NewString("egress1"),
 					Nodes: map[string]Node{
@@ -827,7 +827,7 @@ func TestGetSyncOperations(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1"),
 					NATGateways:   sets.NewString("egress1"),
 					Locations: map[string]NRPLocation{
@@ -841,7 +841,7 @@ func TestGetSyncOperations(t *testing.T) {
 					},
 				},
 			},
-			expectedSyncStatus:      ALREADY_IN_SYNC,
+			expectedSyncStatus:      AlreadyInSync,
 			expectedLoadBalancerOps: false,
 			expectedNATGatewayOps:   false,
 			expectedLocationOps:     false,
@@ -849,7 +849,7 @@ func TestGetSyncOperations(t *testing.T) {
 		{
 			name: "services out of sync",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1", "service2"),
 					Egresses: sets.NewString("egress1"),
 					Nodes: map[string]Node{
@@ -862,7 +862,7 @@ func TestGetSyncOperations(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1"),
 					NATGateways:   sets.NewString("egress1"),
 					Locations: map[string]NRPLocation{
@@ -876,7 +876,7 @@ func TestGetSyncOperations(t *testing.T) {
 					},
 				},
 			},
-			expectedSyncStatus:      SUCCESS,
+			expectedSyncStatus:      Success,
 			expectedLoadBalancerOps: true,
 			expectedNATGatewayOps:   false,
 			expectedLocationOps:     false,
@@ -884,7 +884,7 @@ func TestGetSyncOperations(t *testing.T) {
 		{
 			name: "egresses out of sync",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1"),
 					Egresses: sets.NewString("egress1", "egress2"),
 					Nodes: map[string]Node{
@@ -897,7 +897,7 @@ func TestGetSyncOperations(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1"),
 					NATGateways:   sets.NewString("egress1"),
 					Locations: map[string]NRPLocation{
@@ -911,7 +911,7 @@ func TestGetSyncOperations(t *testing.T) {
 					},
 				},
 			},
-			expectedSyncStatus:      SUCCESS,
+			expectedSyncStatus:      Success,
 			expectedLoadBalancerOps: false,
 			expectedNATGatewayOps:   true,
 			expectedLocationOps:     false,
@@ -919,7 +919,7 @@ func TestGetSyncOperations(t *testing.T) {
 		{
 			name: "locations out of sync",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1", "service2"), // service2 must also exist in K8s to avoid removal
 					Egresses: sets.NewString("egress1"),
 					Nodes: map[string]Node{
@@ -932,7 +932,7 @@ func TestGetSyncOperations(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service2"), // Both services exist in NRP (pass filtering)
 					NATGateways:   sets.NewString("egress1"),
 					Locations: map[string]NRPLocation{
@@ -946,7 +946,7 @@ func TestGetSyncOperations(t *testing.T) {
 					},
 				},
 			},
-			expectedSyncStatus:      SUCCESS,
+			expectedSyncStatus:      Success,
 			expectedLoadBalancerOps: false, // Both services already in sync between K8s and NRP
 			expectedNATGatewayOps:   false,
 			expectedLocationOps:     true, // service2 needs to be added to location
@@ -954,7 +954,7 @@ func TestGetSyncOperations(t *testing.T) {
 		{
 			name: "multiple components out of sync",
 			initialState: &DiffTracker{
-				K8sResources: K8s_State{
+				K8sResources: K8sState{
 					Services: sets.NewString("service1", "service3"),
 					Egresses: sets.NewString("egress1", "egress3"),
 					Nodes: map[string]Node{
@@ -971,7 +971,7 @@ func TestGetSyncOperations(t *testing.T) {
 						},
 					},
 				},
-				NRPResources: NRP_State{
+				NRPResources: NRPState{
 					LoadBalancers: sets.NewString("service1", "service2"),
 					NATGateways:   sets.NewString("egress1", "egress2"),
 					Locations: map[string]NRPLocation{
@@ -988,7 +988,7 @@ func TestGetSyncOperations(t *testing.T) {
 					},
 				},
 			},
-			expectedSyncStatus:      SUCCESS,
+			expectedSyncStatus:      Success,
 			expectedLoadBalancerOps: true,
 			expectedNATGatewayOps:   true,
 			expectedLocationOps:     true,
@@ -1001,7 +1001,7 @@ func TestGetSyncOperations(t *testing.T) {
 
 			assert.Equal(t, tt.expectedSyncStatus, result.SyncStatus)
 
-			if tt.expectedSyncStatus == ALREADY_IN_SYNC {
+			if tt.expectedSyncStatus == AlreadyInSync {
 				return
 			}
 
@@ -1040,7 +1040,7 @@ func TestGetSyncOperations(t *testing.T) {
 // Cluster and fully sync NRP accordingly. This test verifies if the DiffTracker is able to sync K8s Cluster and NRP
 // correctly when there is a huge discrepancy between K8s Cluster and NRP.
 func TestInitializeDiffTracker(t *testing.T) {
-	K8sResources := K8s_State{
+	K8sResources := K8sState{
 		Services: sets.NewString("Service0", "Service1", "Service2"),
 		Egresses: sets.NewString("Egress0", "Egress1", "Egress2"),
 		Nodes: map[string]Node{
@@ -1075,7 +1075,7 @@ func TestInitializeDiffTracker(t *testing.T) {
 		},
 	}
 
-	NRPResources := NRP_State{
+	NRPResources := NRPState{
 		LoadBalancers: sets.NewString("Service0", "Service6", "Service5"),
 		NATGateways:   sets.NewString("Egress0", "Egress6", "Egress5"),
 		Locations: map[string]NRPLocation{
@@ -1106,7 +1106,7 @@ func TestInitializeDiffTracker(t *testing.T) {
 	}
 
 	expectedSyncOperations := &SyncDiffTrackerReturnType{
-		SyncStatus: SUCCESS,
+		SyncStatus: Success,
 		LoadBalancerUpdates: SyncServicesReturnType{
 			Additions: sets.NewString("Service1", "Service2"),
 			Removals:  sets.NewString("Service6", "Service5"),
@@ -1162,7 +1162,8 @@ func TestInitializeDiffTracker(t *testing.T) {
 	defer ctrl.Finish()
 	mockFactory := mock_azclient.NewMockClientFactory(ctrl)
 	mockKubeClient := fake.NewSimpleClientset()
-	diffTracker := InitializeDiffTracker(K8sResources, NRPResources, config, mockFactory, mockKubeClient)
+	diffTracker, err := New(K8sResources, NRPResources, config, mockFactory, mockKubeClient)
+	assert.NoError(t, err)
 	syncOperations := diffTracker.GetSyncOperations()
 	// It follows a call to ServiceGateway API and if it is successful we can proceed with syncing difftracker.NRP
 	diffTracker.UpdateNRPLoadBalancers(syncOperations.LoadBalancerUpdates)
@@ -1183,7 +1184,7 @@ func TestInitializeDiffTracker(t *testing.T) {
 	// - Node3 (PartialUpdate with empty Addresses): Entire location deleted
 	expectedDiffTracker := &DiffTracker{
 		K8sResources: K8sResources,
-		NRPResources: NRP_State{
+		NRPResources: NRPState{
 			LoadBalancers: sets.NewString("Service0", "Service1", "Service2"),
 			NATGateways:   sets.NewString("Egress0", "Egress1", "Egress2"),
 			Locations: map[string]NRPLocation{

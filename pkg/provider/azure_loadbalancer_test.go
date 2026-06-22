@@ -837,23 +837,27 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 
 			az := GetTestCloudWithContainerLoadBalancer(ctrl)
 
-			k8s := difftracker.K8s_State{
+			k8s := difftracker.K8sState{
 				Services: utilsets.NewString(),
 				Egresses: utilsets.NewString(),
 				Nodes:    make(map[string]difftracker.Node),
 			}
-			nrp := difftracker.NRP_State{
+			nrp := difftracker.NRPState{
 				LoadBalancers: utilsets.NewString(),
 				NATGateways:   utilsets.NewString(),
 				Locations:     make(map[string]difftracker.NRPLocation),
 			}
-			az.diffTracker = difftracker.InitializeDiffTracker(k8s, nrp, difftracker.Config{
+			var err error
+			az.diffTracker, err = difftracker.New(k8s, nrp, difftracker.Config{
 				SubscriptionID:             az.SubscriptionID,
 				ResourceGroup:              az.ResourceGroup,
 				Location:                   az.Location,
 				ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
 				ServiceGatewayID:           az.GetServiceGatewayID(),
 			}, az.NetworkClientFactory, nil)
+			if err != nil {
+				t.Fatalf("failed to initialize diffTracker: %v", err)
+			}
 
 			// 			az.locationAndNRPServiceBatchUpdater = newLocationAndNRPServiceBatchUpdater(az)
 			// 			ctx, cancel := context.WithCancel(context.Background())
@@ -884,8 +888,6 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 			mockPLSRepo := privatelinkservice.NewMockRepository(ctrl)
 			mockPLSRepo.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armnetwork.PrivateLinkService{ID: to.Ptr(consts.PrivateLinkServiceNotExistID)}, nil).AnyTimes()
 			az.plsRepo = mockPLSRepo
-			fmt.Printf("------BEFORE----------\n")
-			printSyncMap(&az.diffTracker.LocalServiceNameToNRPServiceMap)
 			lbStatus, err := az.EnsureLoadBalancer(context.TODO(), testClusterName, &service, clusterResources.nodes)
 			assert.Nil(t, err, "TestCase[%d]: %s", i, c.desc)
 			assert.NotNil(t, lbStatus, "TestCase[%d]: %s", i, c.desc)
@@ -893,18 +895,8 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 			assert.Nil(t, rerr, "TestCase[%d]: %s", i, c.desc)
 			assert.Equal(t, 1, len(result), "TestCase[%d]: %s", i, c.desc)
 			assert.Equal(t, 1, len(result[0].Properties.LoadBalancingRules), "TestCase[%d]: %s", i, c.desc)
-			fmt.Printf("------AFTER----------\n")
-			printSyncMap(&az.diffTracker.LocalServiceNameToNRPServiceMap)
-			fmt.Printf("------END---------\n")
 		})
 	}
-}
-
-func printSyncMap(m *sync.Map) {
-	m.Range(func(k, v interface{}) bool {
-		fmt.Printf("key: %v, value: %v\n", k, v)
-		return true
-	})
 }
 
 func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
@@ -949,17 +941,18 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 
 			az := GetTestCloudWithContainerLoadBalancer(ctrl)
 
-			k8s := difftracker.K8s_State{
+			k8s := difftracker.K8sState{
 				Services: utilsets.NewString(),
 				Egresses: utilsets.NewString(),
 				Nodes:    make(map[string]difftracker.Node),
 			}
-			nrp := difftracker.NRP_State{
+			nrp := difftracker.NRPState{
 				LoadBalancers: utilsets.NewString(),
 				NATGateways:   utilsets.NewString(),
 				Locations:     make(map[string]difftracker.NRPLocation),
 			}
-			az.diffTracker = difftracker.InitializeDiffTracker(k8s, nrp, difftracker.Config{
+			var err error
+			az.diffTracker, err = difftracker.New(k8s, nrp, difftracker.Config{
 				SubscriptionID:             az.SubscriptionID,
 				ResourceGroup:              az.ResourceGroup,
 				Location:                   az.Location,
@@ -967,6 +960,9 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 				ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
 				ServiceGatewayID:           az.GetServiceGatewayID(),
 			}, az.NetworkClientFactory, nil)
+			if err != nil {
+				t.Fatalf("failed to initialize diffTracker: %v", err)
+			}
 
 			// Engine pattern is now wired for inbound services (Phase 6 complete)
 			// ServiceUpdater and LocationsUpdater goroutines are started in InitializeCloudFromConfig

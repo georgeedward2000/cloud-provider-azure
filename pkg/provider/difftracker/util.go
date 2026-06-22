@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"k8s.io/klog/v2"
+
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
 // extractAzureErrorInfo extracts HTTP status code and a canonical error code from an Azure SDK error.
@@ -70,7 +73,18 @@ func extractAzureErrorInfo(err error) (httpStatus int, errorCode string) {
 }
 
 func (operation Operation) String() string {
-	return [...]string{"ADD", "REMOVE", "UPDATE"}[operation]
+	switch operation {
+	case UnknownOperation:
+		return "UnknownOperation"
+	case Add:
+		return "Add"
+	case Remove:
+		return "Remove"
+	case Update:
+		return "Update"
+	default:
+		return fmt.Sprintf("Operation(%d)", int(operation))
+	}
 }
 
 func (operation Operation) MarshalJSON() ([]byte, error) {
@@ -78,7 +92,16 @@ func (operation Operation) MarshalJSON() ([]byte, error) {
 }
 
 func (updateAction UpdateAction) String() string {
-	return [...]string{"PartialUpdate", "FullUpdate"}[updateAction]
+	switch updateAction {
+	case UnknownUpdateAction:
+		return "UnknownUpdateAction"
+	case PartialUpdate:
+		return "PartialUpdate"
+	case FullUpdate:
+		return "FullUpdate"
+	default:
+		return fmt.Sprintf("UpdateAction(%d)", int(updateAction))
+	}
 }
 
 func (updateAction UpdateAction) MarshalJSON() ([]byte, error) {
@@ -104,7 +127,16 @@ func (updateAction *UpdateAction) UnmarshalJSON(data []byte) error {
 }
 
 func (syncStatus SyncStatus) String() string {
-	return [...]string{"ALREADY_IN_SYNC", "SUCCESS"}[syncStatus]
+	switch syncStatus {
+	case UnknownSyncStatus:
+		return "UnknownSyncStatus"
+	case AlreadyInSync:
+		return "AlreadyInSync"
+	case Success:
+		return "Success"
+	default:
+		return fmt.Sprintf("SyncStatus(%d)", int(syncStatus))
+	}
 }
 
 func (syncStatus SyncStatus) MarshalJSON() ([]byte, error) {
@@ -117,89 +149,56 @@ func (pod *Pod) HasIdentities() bool {
 	return pod.InboundIdentities.Len() > 0 || pod.PublicOutboundIdentity != ""
 }
 
-// DeepEqual compares the K8s and NRP states to check if they are in sync
-func (dt *DiffTracker) DeepEqual() bool {
-	klog.Infof("DeepEqual: Checking equality - K8s Services=%d, NRP LoadBalancers=%d, K8s Egresses=%d, NRP NATGateways=%d",
+// deepEqualLocked compares the K8s and NRP states to check if they are in sync.
+// Callers must hold dt.mu.
+func (dt *DiffTracker) deepEqualLocked() bool {
+	klog.V(4).Infof("DeepEqual: Checking equality - K8s Services=%d, NRP LoadBalancers=%d, K8s Egresses=%d, NRP NATGateways=%d, K8s Nodes=%d, NRP Locations=%d",
 		dt.K8sResources.Services.Len(), dt.NRPResources.LoadBalancers.Len(),
-		dt.K8sResources.Egresses.Len(), dt.NRPResources.NATGateways.Len())
+		dt.K8sResources.Egresses.Len(), dt.NRPResources.NATGateways.Len(),
+		len(dt.K8sResources.Nodes), len(dt.NRPResources.Locations))
 
-	// Compare Services with LoadBalancers
-	if dt.K8sResources.Services.Len() != dt.NRPResources.LoadBalancers.Len() {
-		klog.Infof("DeepEqual: Services and LoadBalancers length mismatch")
+	// Compare Services with LoadBalancers and Egresses with NATGateways.
+	if !dt.K8sResources.Services.Equals(dt.NRPResources.LoadBalancers) {
+		klog.V(4).Infof("DeepEqual: Services and LoadBalancers mismatch")
 		return false
 	}
-	for _, service := range dt.K8sResources.Services.UnsortedList() {
-		if !dt.NRPResources.LoadBalancers.Has(service) {
-			klog.Infof("DeepEqual: Service %s not found in LoadBalancers", service)
-			return false
-		}
-	}
-	for _, service := range dt.NRPResources.LoadBalancers.UnsortedList() {
-		if !dt.K8sResources.Services.Has(service) {
-			klog.Infof("DeepEqual: LoadBalancer %s not found in Services", service)
-			return false
-		}
-	}
-
-	// Compare Egresses with NATGateways
-	if dt.K8sResources.Egresses.Len() != dt.NRPResources.NATGateways.Len() {
-		klog.Infof("DeepEqual: Egresses and NATGateways length mismatch")
+	if !dt.K8sResources.Egresses.Equals(dt.NRPResources.NATGateways) {
+		klog.V(4).Infof("DeepEqual: Egresses and NATGateways mismatch")
 		return false
 	}
-	for _, egress := range dt.K8sResources.Egresses.UnsortedList() {
-		if !dt.NRPResources.NATGateways.Has(egress) {
-			klog.Infof("DeepEqual: Egress %s not found in NATGateways", egress)
-			return false
-		}
-	}
-	for _, egress := range dt.NRPResources.NATGateways.UnsortedList() {
-		if !dt.K8sResources.Egresses.Has(egress) {
-			klog.Infof("DeepEqual: NATGateway %s not found in Egresses", egress)
-			return false
-		}
-	}
 
-	// Compare Nodes with Locations
+	// Compare Nodes with Locations.
 	if len(dt.K8sResources.Nodes) != len(dt.NRPResources.Locations) {
-		klog.V(2).Infof("DiffTracker.DeepEqual: Nodes and Locations length mismatch")
+		klog.V(4).Infof("DeepEqual: Nodes and Locations length mismatch")
 		return false
 	}
 	for nodeKey, node := range dt.K8sResources.Nodes {
 		nrpLocation, exists := dt.NRPResources.Locations[nodeKey]
 		if !exists {
-			klog.V(2).Infof("DiffTracker.DeepEqual: Node %s not found in Locations\n", nodeKey)
+			klog.V(4).Infof("DeepEqual: Node %s not found in Locations", nodeKey)
 			return false
 		}
 
-		// Compare Pods with Addresses
+		// Compare Pods with Addresses.
 		if len(node.Pods) != len(nrpLocation.Addresses) {
-			klog.V(2).Infof("DiffTracker.DeepEqual: Pods and Addresses length mismatch for node %s\n", nodeKey)
+			klog.V(4).Infof("DeepEqual: Pods and Addresses length mismatch for node %s", nodeKey)
 			return false
 		}
 		for podKey, pod := range node.Pods {
 			nrpAddress, exists := nrpLocation.Addresses[podKey]
 			if !exists {
-				klog.V(2).Infof("DiffTracker.DeepEqual: Pod %s not found in Addresses for node %s\n", podKey, nodeKey)
+				klog.V(4).Infof("DeepEqual: Pod %s not found in Addresses for node %s", podKey, nodeKey)
 				return false
 			}
 
-			// Compare [...InboundIdentities, PublicOutboundIdentity] with Services
-			combinedIdentities := []string{}
-			combinedIdentities = append(combinedIdentities, pod.InboundIdentities.UnsortedList()...)
+			// Compare [...InboundIdentities, PublicOutboundIdentity] with Services.
+			combinedIdentities := utilsets.NewString(pod.InboundIdentities.UnsortedList()...)
 			if pod.PublicOutboundIdentity != "" {
-				combinedIdentities = append(combinedIdentities, pod.PublicOutboundIdentity)
+				combinedIdentities.Insert(pod.PublicOutboundIdentity)
 			}
-
-			if len(combinedIdentities) != nrpAddress.Services.Len() {
-				klog.V(2).Infof("DiffTracker.DeepEqual: Combined identities length mismatch for pod %s in node %s\n", podKey, nodeKey)
+			if !combinedIdentities.Equals(nrpAddress.Services) {
+				klog.V(4).Infof("DeepEqual: Identities and Services mismatch for pod %s in node %s", podKey, nodeKey)
 				return false
-			}
-
-			for _, identity := range combinedIdentities {
-				if !nrpAddress.Services.Has(identity) {
-					klog.V(2).Infof("DiffTracker.DeepEqual: Identity %s not found in Services for pod %s in node %s\n", identity, podKey, nodeKey)
-					return false
-				}
 			}
 		}
 	}
@@ -207,8 +206,8 @@ func (dt *DiffTracker) DeepEqual() bool {
 	return true
 }
 
-func (syncServicesReturnType *SyncServicesReturnType) Equals(other *SyncServicesReturnType) bool {
-	return syncServicesReturnType.Additions.Equals(other.Additions) && syncServicesReturnType.Removals.Equals(other.Removals)
+func (s *SyncServicesReturnType) Equals(other *SyncServicesReturnType) bool {
+	return s.Additions.Equals(other.Additions) && s.Removals.Equals(other.Removals)
 }
 
 // Equals compares two LocationData objects for equality
@@ -254,28 +253,28 @@ func (ld *LocationData) Equals(other *LocationData) bool {
 }
 
 // Equals compares two SyncDiffTrackerReturnType objects for equality
-func (sdts *SyncDiffTrackerReturnType) Equals(other *SyncDiffTrackerReturnType) bool {
-	if sdts.SyncStatus != other.SyncStatus {
+func (s *SyncDiffTrackerReturnType) Equals(other *SyncDiffTrackerReturnType) bool {
+	if s.SyncStatus != other.SyncStatus {
 		return false
 	}
 
-	if !sdts.LoadBalancerUpdates.Additions.Equals(other.LoadBalancerUpdates.Additions) {
+	if !s.LoadBalancerUpdates.Additions.Equals(other.LoadBalancerUpdates.Additions) {
 		return false
 	}
 
-	if !sdts.LoadBalancerUpdates.Removals.Equals(other.LoadBalancerUpdates.Removals) {
+	if !s.LoadBalancerUpdates.Removals.Equals(other.LoadBalancerUpdates.Removals) {
 		return false
 	}
 
-	if !sdts.NATGatewayUpdates.Additions.Equals(other.NATGatewayUpdates.Additions) {
+	if !s.NATGatewayUpdates.Additions.Equals(other.NATGatewayUpdates.Additions) {
 		return false
 	}
 
-	if !sdts.NATGatewayUpdates.Removals.Equals(other.NATGatewayUpdates.Removals) {
+	if !s.NATGatewayUpdates.Removals.Equals(other.NATGatewayUpdates.Removals) {
 		return false
 	}
 
-	if !sdts.LocationData.Equals(&other.LocationData) {
+	if !s.LocationData.Equals(&other.LocationData) {
 		return false
 	}
 
@@ -284,11 +283,19 @@ func (sdts *SyncDiffTrackerReturnType) Equals(other *SyncDiffTrackerReturnType) 
 
 // Equals compares two DiffTracker objects for equality
 func (dt *DiffTracker) Equals(other *DiffTracker) bool {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
-
-	other.mu.Lock()
-	defer other.mu.Unlock()
+	// Lock both trackers in a consistent order (by pointer address) so that
+	// concurrent dt.Equals(other) and other.Equals(dt) calls can't deadlock.
+	// If both refer to the same object, lock only once to avoid self-deadlock.
+	first, second := dt, other
+	if reflect.ValueOf(first).Pointer() > reflect.ValueOf(second).Pointer() {
+		first, second = second, first
+	}
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	if second != first {
+		second.mu.Lock()
+		defer second.mu.Unlock()
+	}
 
 	if !dt.K8sResources.Services.Equals(other.K8sResources.Services) {
 		return false
@@ -364,6 +371,21 @@ func (dt *DiffTracker) Equals(other *DiffTracker) bool {
 	}
 
 	return true
+}
+
+// addressExists reports whether an address with the given key exists in a location.
+func addressExists(location NRPLocation, addressKey string) bool {
+	_, exists := location.Addresses[addressKey]
+	return exists
+}
+
+// createServiceRefsFromAddress returns a copy of the address's service references.
+func createServiceRefsFromAddress(addressValue Address) *utilsets.IgnoreCaseSet {
+	serviceRefs := utilsets.NewString()
+	for _, service := range addressValue.ServiceRef.UnsortedList() {
+		serviceRefs.Insert(service)
+	}
+	return serviceRefs
 }
 
 // Map LocationData to LocationsDataDTO to be used as payload in ServiceGateway API calls

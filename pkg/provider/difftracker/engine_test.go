@@ -26,12 +26,12 @@ import (
 // Helper function to create a test DiffTracker
 func newTestDiffTracker() *DiffTracker {
 	return &DiffTracker{
-		NRPResources: NRP_State{
+		NRPResources: NRPState{
 			LoadBalancers: utilsets.NewString(),
 			NATGateways:   utilsets.NewString(),
 			Locations:     make(map[string]NRPLocation),
 		},
-		K8sResources: K8s_State{
+		K8sResources: K8sState{
 			Services: utilsets.NewString(),
 			Egresses: utilsets.NewString(),
 			Nodes:    make(map[string]Node),

@@ -1,37 +1,42 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package difftracker
 
 import (
 	"k8s.io/klog/v2"
+
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
-// SyncServices handles the synchronization of services between K8s and NRP
-func GetServicesToSync(k8sServices, Services *utilsets.IgnoreCaseSet) SyncServicesReturnType {
-	klog.Infof("GetServicesToSync: K8s services (%d): %v", k8sServices.Len(), k8sServices.UnsortedList())
-	klog.Infof("GetServicesToSync: NRP services (%d): %v", Services.Len(), Services.UnsortedList())
+// GetServicesToSync handles the synchronization of services between K8s and NRP
+func GetServicesToSync(k8sServices, nrpServices *utilsets.IgnoreCaseSet) SyncServicesReturnType {
+	klog.V(2).Infof("GetServicesToSync: K8s services (%d): %v", k8sServices.Len(), k8sServices.UnsortedList())
+	klog.V(2).Infof("GetServicesToSync: NRP services (%d): %v", nrpServices.Len(), nrpServices.UnsortedList())
 
 	syncServices := SyncServicesReturnType{
-		Additions: utilsets.NewString(),
-		Removals:  utilsets.NewString(),
+		// Additions are in K8s but not yet in NRP; removals are in NRP but no
+		// longer in K8s.
+		Additions: k8sServices.Difference(nrpServices),
+		Removals:  nrpServices.Difference(k8sServices),
 	}
+	klog.V(4).Infof("GetServicesToSync: additions=%v, removals=%v",
+		syncServices.Additions.UnsortedList(), syncServices.Removals.UnsortedList())
 
-	for _, service := range k8sServices.UnsortedList() {
-		if Services.Has(service) {
-			continue
-		}
-		syncServices.Additions.Insert(service)
-		klog.Infof("GetServicesToSync: Added service %s to additions", service)
-	}
-
-	for _, service := range Services.UnsortedList() {
-		if k8sServices.Has(service) {
-			continue
-		}
-		syncServices.Removals.Insert(service)
-		klog.Infof("GetServicesToSync: Added service %s to removals", service)
-	}
-
-	klog.Infof("GetServicesToSync: Result - Additions: %d, Removals: %d", syncServices.Additions.Len(), syncServices.Removals.Len())
+	klog.V(2).Infof("GetServicesToSync: Result - Additions: %d, Removals: %d", syncServices.Additions.Len(), syncServices.Removals.Len())
 	return syncServices
 }
 
@@ -39,6 +44,11 @@ func (dt *DiffTracker) GetSyncLoadBalancerServices() SyncServicesReturnType {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 
+	return dt.getSyncLoadBalancerServicesLocked()
+}
+
+// getSyncLoadBalancerServicesLocked is the lock-free body. Callers must hold dt.mu.
+func (dt *DiffTracker) getSyncLoadBalancerServicesLocked() SyncServicesReturnType {
 	return GetServicesToSync(dt.K8sResources.Services, dt.NRPResources.LoadBalancers)
 }
 
@@ -46,23 +56,31 @@ func (dt *DiffTracker) GetSyncNRPNATGateways() SyncServicesReturnType {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 
-	return GetServicesToSync(dt.K8sResources.Egresses, dt.NRPResources.NATGateways)
+	return dt.getSyncNRPNATGatewaysLocked()
 }
 
-//==============================================================================
+// getSyncNRPNATGatewaysLocked is the lock-free body. Callers must hold dt.mu.
+func (dt *DiffTracker) getSyncNRPNATGatewaysLocked() SyncServicesReturnType {
+	return GetServicesToSync(dt.K8sResources.Egresses, dt.NRPResources.NATGateways)
+}
 
 func (dt *DiffTracker) GetSyncLocationsAddresses() LocationData {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 
+	return dt.getSyncLocationsAddressesLocked()
+}
+
+// getSyncLocationsAddressesLocked is the lock-free body. Callers must hold dt.mu.
+func (dt *DiffTracker) getSyncLocationsAddressesLocked() LocationData {
 	result := LocationData{
 		Action:    PartialUpdate,
 		Locations: make(map[string]Location),
 	}
 
 	// Iterate over all nodes in the K8s state
-	for nodeIp, node := range dt.K8sResources.Nodes {
-		nrpLocation, locationExists := dt.NRPResources.Locations[nodeIp]
+	for nodeIP, node := range dt.K8sResources.Nodes {
+		nrpLocation, locationExists := dt.NRPResources.Locations[nodeIP]
 		location := initializeLocation(locationExists)
 		locationUpdated := false
 
@@ -71,18 +89,16 @@ func (dt *DiffTracker) GetSyncLocationsAddresses() LocationData {
 			serviceRef := dt.createServiceRefFiltered(pod)
 
 			// Check if address exists in NRP and if service list changed
-			nrpAddressData, addressExists := nrpLocation.Addresses[address]
+			nrpAddressData, nrpAddrExists := nrpLocation.Addresses[address]
 
 			// Skip this address if:
 			// 1. No ready services AND address doesn't exist in NRP (nothing to sync)
 			// 2. ServiceRef matches what's already in NRP (no change)
-			if serviceRef.Len() == 0 && !addressExists {
-				// No services and address not in NRP - nothing to do
+			if serviceRef.Len() == 0 && !nrpAddrExists {
 				continue
 			}
 
-			if addressExists && serviceRef.Equals(nrpAddressData.Services) {
-				// ServiceRef matches NRP - no change needed
+			if nrpAddrExists && serviceRef.Equals(nrpAddressData.Services) {
 				continue
 			}
 
@@ -92,7 +108,7 @@ func (dt *DiffTracker) GetSyncLocationsAddresses() LocationData {
 			locationUpdated = true
 		}
 		if locationUpdated {
-			result.Locations[nodeIp] = location
+			result.Locations[nodeIP] = location
 		}
 	}
 
@@ -138,18 +154,6 @@ func initializeLocation(exists bool) Location {
 	}
 }
 
-// Helper function to create ServiceRef from Pod
-func createServiceRef(pod Pod) *utilsets.IgnoreCaseSet {
-	serviceRef := utilsets.NewString()
-	for _, identity := range pod.InboundIdentities.UnsortedList() {
-		serviceRef.Insert(identity)
-	}
-	if pod.PublicOutboundIdentity != "" {
-		serviceRef.Insert(pod.PublicOutboundIdentity)
-	}
-	return serviceRef
-}
-
 // createServiceRefFiltered creates ServiceRef but only includes services that are StateCreated
 // This prevents LocationsUpdater from trying to sync locations for services still being created
 // Must be called with dt.mu held
@@ -192,28 +196,30 @@ func (dt *DiffTracker) isServiceReady(serviceUID string, isInbound bool) bool {
 	return dt.NRPResources.NATGateways.Has(serviceUID)
 }
 
-// Helper function to find LocationData in result
-func findLocationData(result LocationData, location string) *Location {
-	for keyCurrentLocation := range result.Locations {
-		if keyCurrentLocation == location {
-			loc := result.Locations[keyCurrentLocation]
-			return &loc
-		}
+// findLocationData returns a pointer to the Location stored under the given key
+// in data, or nil if no such location exists.
+func findLocationData(data LocationData, location string) *Location {
+	if loc, ok := data.Locations[location]; ok {
+		return &loc
 	}
 	return nil
 }
 
-//==============================================================================
-
 func (dt *DiffTracker) GetSyncOperations() *SyncDiffTrackerReturnType {
-	if dt.DeepEqual() {
-		return &SyncDiffTrackerReturnType{SyncStatus: ALREADY_IN_SYNC}
+	// Take the lock once so DeepEqual and all three sync computations observe a
+	// single consistent snapshot of the state (avoids a data race with mutating
+	// methods and inconsistency between the individual GetSync* results).
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	if dt.deepEqualLocked() {
+		return &SyncDiffTrackerReturnType{SyncStatus: AlreadyInSync}
 	}
 
 	return &SyncDiffTrackerReturnType{
-		SyncStatus:          SUCCESS,
-		LoadBalancerUpdates: dt.GetSyncLoadBalancerServices(),
-		NATGatewayUpdates:   dt.GetSyncNRPNATGateways(),
-		LocationData:        dt.GetSyncLocationsAddresses(),
+		SyncStatus:          Success,
+		LoadBalancerUpdates: dt.getSyncLoadBalancerServicesLocked(),
+		NATGatewayUpdates:   dt.getSyncNRPNATGatewaysLocked(),
+		LocationData:        dt.getSyncLocationsAddressesLocked(),
 	}
 }

@@ -1,8 +1,23 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package difftracker
 
 import (
 	"k8s.io/klog/v2"
-	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
 func (dt *DiffTracker) UpdateNRPLoadBalancers(syncServicesReturnType SyncServicesReturnType) {
@@ -11,12 +26,12 @@ func (dt *DiffTracker) UpdateNRPLoadBalancers(syncServicesReturnType SyncService
 
 	for _, service := range syncServicesReturnType.Additions.UnsortedList() {
 		dt.NRPResources.LoadBalancers.Insert(service)
-		klog.V(2).Infof("Added service %s to NRP LoadBalancers\n", service)
+		klog.V(2).Infof("UpdateNRPLoadBalancers: Added service %s to NRP LoadBalancers", service)
 	}
 
 	for _, service := range syncServicesReturnType.Removals.UnsortedList() {
 		dt.NRPResources.LoadBalancers.Delete(service)
-		klog.V(2).Infof("Removed service %s from NRP LoadBalancers\n", service)
+		klog.V(2).Infof("UpdateNRPLoadBalancers: Removed service %s from NRP LoadBalancers", service)
 	}
 }
 
@@ -26,12 +41,12 @@ func (dt *DiffTracker) UpdateNRPNATGateways(syncServicesReturnType SyncServicesR
 
 	for _, service := range syncServicesReturnType.Additions.UnsortedList() {
 		dt.NRPResources.NATGateways.Insert(service)
-		klog.V(2).Infof("Added service %s to NRP NATGateways\n", service)
+		klog.V(2).Infof("UpdateNRPNATGateways: Added service %s to NRP NATGateways", service)
 	}
 
 	for _, service := range syncServicesReturnType.Removals.UnsortedList() {
 		dt.NRPResources.NATGateways.Delete(service)
-		klog.V(2).Infof("Removed service %s from NRP NATGateways\n", service)
+		klog.V(2).Infof("UpdateNRPNATGateways: Removed service %s from NRP NATGateways", service)
 	}
 }
 
@@ -90,19 +105,4 @@ func (dt *DiffTracker) UpdateLocationsAddresses(locationData LocationData) {
 			delete(dt.NRPResources.Locations, locationKey)
 		}
 	}
-}
-
-// Helper function to check if address exists in a location
-func addressExists(location NRPLocation, addressKey string) bool {
-	_, exists := location.Addresses[addressKey]
-	return exists
-}
-
-// Helper function to create service references from an address
-func createServiceRefsFromAddress(addressValue Address) *utilsets.IgnoreCaseSet {
-	serviceRefs := utilsets.NewString()
-	for _, service := range addressValue.ServiceRef.UnsortedList() {
-		serviceRefs.Insert(service)
-	}
-	return serviceRefs
 }

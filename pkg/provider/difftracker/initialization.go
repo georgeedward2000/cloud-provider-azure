@@ -79,7 +79,10 @@ func InitializeFromCluster(
 	}
 
 	// Initialize DiffTracker with computed state
-	diffTracker := initializeDiffTrackerWithState(k8s, nrp, config, networkClientFactory, kubeClient, localServiceNameToNRPServiceMap)
+	diffTracker, err := initializeDiffTrackerWithState(k8s, nrp, config, networkClientFactory, kubeClient, localServiceNameToNRPServiceMap)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize DiffTracker: %w", err)
+	}
 
 	// FIX FOR ORPHANED SERVICES: We intentionally do NOT enhance NRP state with orphaned Azure resources.
 	// Orphaned resources are LBs/NATs that exist in Azure but are NOT registered in ServiceGateway.
@@ -198,8 +201,8 @@ func validateInitializationInputs(kubeClient kubernetes.Interface, networkClient
 func buildK8sState(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
-) (K8s_State, *v1.ServiceList, map[string]*v1.Service, *discoveryv1.EndpointSliceList, *v1.PodList, map[string]int, map[string]string, error) {
-	k8s := K8s_State{
+) (K8sState, *v1.ServiceList, map[string]*v1.Service, *discoveryv1.EndpointSliceList, *v1.PodList, map[string]int, map[string]string, error) {
+	k8s := K8sState{
 		Services: utilsets.NewString(),
 		Egresses: utilsets.NewString(),
 		Nodes:    make(map[string]Node),
@@ -209,25 +212,25 @@ func buildK8sState(
 	// Build node name to IP mapping
 	nodeNameToIPMap, err := buildNodeNameToIPMap(ctx, kubeClient)
 	if err != nil {
-		return K8s_State{}, nil, nil, nil, nil, nil, nil, err
+		return K8sState{}, nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Fetch and process services
 	serviceList, serviceUIDToService, err := processK8sServices(ctx, kubeClient, &k8s, localServiceNameToNRPServiceMap)
 	if err != nil {
-		return K8s_State{}, nil, nil, nil, nil, nil, nil, err
+		return K8sState{}, nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Fetch and process endpoint slices
 	endpointSliceList, err := processK8sEndpoints(ctx, kubeClient, &k8s, nodeNameToIPMap)
 	if err != nil {
-		return K8s_State{}, nil, nil, nil, nil, nil, nil, err
+		return K8sState{}, nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Fetch and process egress pods
 	egressPodList, err := processK8sEgresses(ctx, kubeClient, &k8s, nodeNameToIPMap, localServiceNameToNRPServiceMap)
 	if err != nil {
-		return K8s_State{}, nil, nil, nil, nil, nil, nil, err
+		return K8sState{}, nil, nil, nil, nil, nil, nil, err
 	}
 
 	return k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, localServiceNameToNRPServiceMap, nodeNameToIPMap, nil
@@ -469,7 +472,7 @@ func recoverStuckFinalizers(
 func processK8sServices(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
-	k8s *K8s_State,
+	k8s *K8sState,
 	localServiceNameToNRPServiceMap map[string]int,
 ) (*v1.ServiceList, map[string]*v1.Service, error) {
 	services, err := kubeClient.CoreV1().Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
@@ -503,7 +506,7 @@ func processK8sServices(
 func processK8sEndpoints(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
-	k8s *K8s_State,
+	k8s *K8sState,
 	nodeNameToIPMap map[string]string,
 ) (*discoveryv1.EndpointSliceList, error) {
 	endpointSliceList, err := kubeClient.DiscoveryV1().EndpointSlices(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
@@ -556,7 +559,7 @@ func processK8sEndpoints(
 func processK8sEgresses(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
-	k8s *K8s_State,
+	k8s *K8sState,
 	nodeNameToIPMap map[string]string,
 	localServiceNameToNRPServiceMap map[string]int,
 ) (*v1.PodList, error) {
@@ -606,8 +609,8 @@ func buildNRPState(
 	ctx context.Context,
 	config Config,
 	networkClientFactory azclient.ClientFactory,
-) (NRP_State, *utilsets.IgnoreCaseSet, *utilsets.IgnoreCaseSet, []*armnetwork.PublicIPAddress, map[string]string, error) {
-	nrp := NRP_State{
+) (NRPState, *utilsets.IgnoreCaseSet, *utilsets.IgnoreCaseSet, []*armnetwork.PublicIPAddress, map[string]string, error) {
+	nrp := NRPState{
 		LoadBalancers: utilsets.NewString(),
 		NATGateways:   utilsets.NewString(),
 		Locations:     make(map[string]NRPLocation),
@@ -615,24 +618,24 @@ func buildNRPState(
 
 	// Fetch ServiceGateway services
 	if err := fetchServiceGatewayServices(ctx, config, networkClientFactory, &nrp); err != nil {
-		return NRP_State{}, nil, nil, nil, nil, err
+		return NRPState{}, nil, nil, nil, nil, err
 	}
 
 	// Fetch ServiceGateway locations
 	if err := fetchServiceGatewayLocations(ctx, config, networkClientFactory, &nrp); err != nil {
-		return NRP_State{}, nil, nil, nil, nil, err
+		return NRPState{}, nil, nil, nil, nil, err
 	}
 
 	// Fetch Azure LoadBalancers
 	currentLBs, err := fetchAzureLoadBalancers(ctx, config, networkClientFactory)
 	if err != nil {
-		return NRP_State{}, nil, nil, nil, nil, err
+		return NRPState{}, nil, nil, nil, nil, err
 	}
 
 	// Fetch Azure NAT Gateways
 	currentNATs, err := fetchAzureNATGateways(ctx, config, networkClientFactory)
 	if err != nil {
-		return NRP_State{}, nil, nil, nil, nil, err
+		return NRPState{}, nil, nil, nil, nil, err
 	}
 
 	// Fetch Azure Public IPs - both for External IP recovery (map) and orphan cleanup (raw slice)
@@ -652,7 +655,7 @@ func fetchServiceGatewayServices(
 	ctx context.Context,
 	config Config,
 	networkClientFactory azclient.ClientFactory,
-	nrp *NRP_State,
+	nrp *NRPState,
 ) error {
 	sgwClient := networkClientFactory.GetServiceGatewayClient()
 	servicesDTO, err := sgwClient.GetServices(ctx, config.ResourceGroup, config.ServiceGatewayResourceName)
@@ -694,7 +697,7 @@ func fetchServiceGatewayLocations(
 	ctx context.Context,
 	config Config,
 	networkClientFactory azclient.ClientFactory,
-	nrp *NRP_State,
+	nrp *NRPState,
 ) error {
 	sgwClient := networkClientFactory.GetServiceGatewayClient()
 	locationsDTO, err := sgwClient.GetAddressLocations(ctx, config.ResourceGroup, config.ServiceGatewayResourceName)
@@ -788,17 +791,20 @@ func fetchAzurePublicIPs(
 
 // initializeDiffTrackerWithState creates a DiffTracker and populates initial state
 func initializeDiffTrackerWithState(
-	k8s K8s_State,
-	nrp NRP_State,
+	k8s K8sState,
+	nrp NRPState,
 	config Config,
 	networkClientFactory azclient.ClientFactory,
 	kubeClient kubernetes.Interface,
 	localServiceNameToNRPServiceMap map[string]int,
-) *DiffTracker {
-	diffTracker := InitializeDiffTracker(k8s, nrp, config, networkClientFactory, kubeClient)
-	diffTracker.LocalServiceNameToNRPServiceMap = *syncMapFromMap(localServiceNameToNRPServiceMap)
-	LogSyncStringIntMap("initializeDiffTrackerWithState: LocalServiceNameToNRPServiceMap", &diffTracker.LocalServiceNameToNRPServiceMap)
-	return diffTracker
+) (*DiffTracker, error) {
+	diffTracker, err := New(k8s, nrp, config, networkClientFactory, kubeClient)
+	if err != nil {
+		return nil, err
+	}
+	diffTracker.outboundIdentityPodRefCount = *syncMapFromMap(localServiceNameToNRPServiceMap)
+	LogSyncStringIntMap("initializeDiffTrackerWithState: outboundIdentityPodRefCount", &diffTracker.outboundIdentityPodRefCount)
+	return diffTracker, nil
 }
 
 // logSyncOperations logs the sync operations summary
@@ -837,7 +843,7 @@ func performReconciliation(
 	diffTracker *DiffTracker,
 	syncOps *SyncDiffTrackerReturnType,
 	serviceUIDToService map[string]*v1.Service,
-	nrp NRP_State,
+	nrp NRPState,
 	endpointSliceList *discoveryv1.EndpointSliceList,
 	k8sNodes map[string]Node,
 ) error {
@@ -1057,14 +1063,14 @@ func extractServiceUIDFromEndpointSlice(endpointSlice *discoveryv1.EndpointSlice
 }
 
 // ensureNodeExists ensures a node entry exists in K8s state
-func ensureNodeExists(k8s *K8s_State, nodeIP string) {
+func ensureNodeExists(k8s *K8sState, nodeIP string) {
 	if _, exists := k8s.Nodes[nodeIP]; !exists {
 		k8s.Nodes[nodeIP] = Node{Pods: make(map[string]Pod)}
 	}
 }
 
 // addInboundIdentityToPod adds an inbound identity to a pod
-func addInboundIdentityToPod(k8s *K8s_State, nodeIP, podIP, serviceUID string) {
+func addInboundIdentityToPod(k8s *K8sState, nodeIP, podIP, serviceUID string) {
 	pod, exists := k8s.Nodes[nodeIP].Pods[podIP]
 	if !exists {
 		pod = Pod{
@@ -1077,7 +1083,7 @@ func addInboundIdentityToPod(k8s *K8s_State, nodeIP, podIP, serviceUID string) {
 }
 
 // addOutboundIdentityToPod adds an outbound identity to a pod
-func addOutboundIdentityToPod(k8s *K8s_State, nodeIP, podIP, egressVal string) {
+func addOutboundIdentityToPod(k8s *K8sState, nodeIP, podIP, egressVal string) {
 	pod, exists := k8s.Nodes[nodeIP].Pods[podIP]
 	if !exists {
 		pod = Pod{
@@ -1266,7 +1272,7 @@ func (p *WorkerPool) Wait() error {
 
 // extractOldEndpointsFromNRP extracts the current endpoint state from NRP for a given inbound service
 // Returns map[podIP]nodeIP
-func extractOldEndpointsFromNRP(serviceUID string, nrp NRP_State) map[string]string {
+func extractOldEndpointsFromNRP(serviceUID string, nrp NRPState) map[string]string {
 	oldEndpoints := make(map[string]string)
 
 	// Iterate through all NRP locations to find addresses with this service's InboundIdentity
@@ -1324,7 +1330,7 @@ func extractNewEndpointsFromK8s(serviceUID string, endpointSliceList *discoveryv
 
 // extractOldPodsFromNRP extracts the current pod state from NRP for a given outbound service
 // Returns map[location:address]struct{} as a set
-func extractOldPodsFromNRP(serviceUID string, nrp NRP_State) map[string]struct{} {
+func extractOldPodsFromNRP(serviceUID string, nrp NRPState) map[string]struct{} {
 	oldPods := make(map[string]struct{})
 
 	// Iterate through all NRP locations to find addresses with this service's PublicOutboundIdentity
@@ -1363,7 +1369,7 @@ func extractNewPodsFromK8s(serviceUID string, k8sNodes map[string]Node) map[stri
 
 // enhanceNRPStateWithOrphans adds orphaned Azure resources to NRP state for deletion tracking
 // Orphaned resources are those that exist in Azure but not in ServiceGateway
-func enhanceNRPStateWithOrphans(nrp *NRP_State, currentLBs, currentNATs utilsets.IgnoreCaseSet) {
+func enhanceNRPStateWithOrphans(nrp *NRPState, currentLBs, currentNATs utilsets.IgnoreCaseSet) {
 	orphanedLBCount := 0
 	orphanedNATCount := 0
 
@@ -1460,7 +1466,7 @@ func (dt *DiffTracker) reconcileServices(syncOps *SyncDiffTrackerReturnType, ser
 //
 // reconcileInboundEndpoints reconciles endpoints for all inbound (LoadBalancer) services
 // Calls UpdateEndpoints with old state from NRP and new state from K8s
-func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRP_State, endpointSliceList *discoveryv1.EndpointSliceList, nodeNameToIPMap map[string]string) {
+func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRPState, endpointSliceList *discoveryv1.EndpointSliceList, nodeNameToIPMap map[string]string) {
 	klog.Infof("reconcileInboundEndpoints: starting endpoint reconciliation")
 
 	// Build union of all services: K8s services + NRP services
@@ -1507,7 +1513,7 @@ func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRP_State, endpointSliceLis
 //
 // reconcileOutboundPods reconciles pods for all outbound (NAT Gateway) services
 // Calls DeletePod for NRP-only pods, AddPod for K8s-only pods
-func (dt *DiffTracker) reconcileOutboundPods(nrp NRP_State, k8sNodes map[string]Node) {
+func (dt *DiffTracker) reconcileOutboundPods(nrp NRPState, k8sNodes map[string]Node) {
 	klog.Infof("reconcileOutboundPods: starting pod reconciliation")
 
 	// Build union of all services: K8s egresses + NRP NAT Gateways

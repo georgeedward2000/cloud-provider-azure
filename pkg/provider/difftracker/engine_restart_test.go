@@ -71,7 +71,7 @@ func TestEngineAddPod_AfterRestart(t *testing.T) {
 	assert.Equal(t, serviceUID, pod.PublicOutboundIdentity, "pod should have outbound identity")
 
 	// Verify counter was updated
-	val, ok := dt.LocalServiceNameToNRPServiceMap.Load(serviceUID)
+	val, ok := dt.outboundIdentityPodRefCount.Load(serviceUID)
 	assert.True(t, ok, "service should be in counter map")
 	assert.Equal(t, 1, val.(int), "counter should be 1")
 }
