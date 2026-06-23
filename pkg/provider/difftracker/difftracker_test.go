@@ -194,9 +194,10 @@ func TestUpdateK8sPod(t *testing.T) {
 
 	// Test removing egress assignment
 	input = UpdatePodInputType{
-		PodOperation: Remove,
-		Location:     "node1",
-		Address:      "10.0.0.1",
+		PodOperation:           Remove,
+		PublicOutboundIdentity: "public1",
+		Location:               "node1",
+		Address:                "10.0.0.1",
 	}
 
 	err = dt.UpdateK8sPod(input)
@@ -1623,4 +1624,193 @@ func TestMapNATGatewayUpdatesToServicesDataDTO_AdditionsAndRemovals(t *testing.T
 	sortServiceDTOs(actual.Services)
 
 	assert.Equal(t, expected, actual)
+}
+
+func emptyK8sState() K8sState {
+	return K8sState{
+		Services: sets.NewString(),
+		Egresses: sets.NewString(),
+		Nodes:    make(map[string]Node),
+	}
+}
+
+func emptyNRPState() NRPState {
+	return NRPState{
+		LoadBalancers: sets.NewString(),
+		NATGateways:   sets.NewString(),
+		Locations:     make(map[string]NRPLocation),
+	}
+}
+
+func validTestConfig() Config {
+	return Config{
+		SubscriptionID:             "test-subscription",
+		ResourceGroup:              "test-rg",
+		Location:                   "eastus",
+		VNetName:                   "test-vnet",
+		ServiceGatewayResourceName: "test-sgw",
+		ServiceGatewayID:           "/subscriptions/test-subscription/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
+	}
+}
+
+// TestNewSeedsOutboundRefCount verifies New seeds the outbound ref-counter from
+// the egress pods already present in the initial state, so the counter is
+// non-zero for identities that have backing pods at construction time.
+func TestNewSeedsOutboundRefCount(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockFactory := mock_azclient.NewMockClientFactory(ctrl)
+	mockKubeClient := fake.NewSimpleClientset()
+
+	k8s := emptyK8sState()
+	k8s.Nodes["node1"] = Node{Pods: map[string]Pod{
+		"10.0.0.1": {InboundIdentities: sets.NewString(), PublicOutboundIdentity: "egress1"},
+		"10.0.0.2": {InboundIdentities: sets.NewString(), PublicOutboundIdentity: "egress1"},
+		"10.0.0.3": {InboundIdentities: sets.NewString("svc1"), PublicOutboundIdentity: ""},
+	}}
+	k8s.Nodes["node2"] = Node{Pods: map[string]Pod{
+		"10.0.1.1": {InboundIdentities: sets.NewString(), PublicOutboundIdentity: "Egress2"},
+	}}
+
+	dt, err := New(k8s, emptyNRPState(), validTestConfig(), mockFactory, mockKubeClient)
+	assert.NoError(t, err)
+
+	val, ok := dt.outboundIdentityPodRefCount.Load("egress1")
+	assert.True(t, ok)
+	assert.Equal(t, 2, val.(int))
+
+	val, ok = dt.outboundIdentityPodRefCount.Load("egress2")
+	assert.True(t, ok, "identity key is lowercased")
+	assert.Equal(t, 1, val.(int))
+
+	_, ok = dt.outboundIdentityPodRefCount.Load("")
+	assert.False(t, ok, "pods without an egress identity are not counted")
+}
+
+// TestUpdateK8sEndpointsRelocation covers the case where the same pod IP appears
+// in both OldAddresses and NewAddresses but on a different node (relocation): the
+// pod must be removed from the old node and added to the new one.
+func TestUpdateK8sEndpointsRelocation(t *testing.T) {
+	dt := &DiffTracker{K8sResources: K8sState{Nodes: map[string]Node{}}}
+
+	errs := dt.UpdateK8sEndpoints(UpdateK8sEndpointsInputType{
+		InboundIdentity: "svc1",
+		NewAddresses:    map[string]string{"10.0.0.1": "node1"},
+	})
+	assert.Empty(t, errs)
+	assert.True(t, dt.K8sResources.Nodes["node1"].Pods["10.0.0.1"].InboundIdentities.Has("svc1"))
+
+	// Same pod IP moves from node1 to node2.
+	errs = dt.UpdateK8sEndpoints(UpdateK8sEndpointsInputType{
+		InboundIdentity: "svc1",
+		OldAddresses:    map[string]string{"10.0.0.1": "node1"},
+		NewAddresses:    map[string]string{"10.0.0.1": "node2"},
+	})
+	assert.Empty(t, errs)
+
+	// Old node is gone, new node holds the pod with svc1.
+	_, ok := dt.K8sResources.Nodes["node1"]
+	assert.False(t, ok, "pod must be removed from the old node")
+	pod, ok := dt.K8sResources.Nodes["node2"].Pods["10.0.0.1"]
+	assert.True(t, ok, "pod must be added to the new node")
+	assert.True(t, pod.InboundIdentities.Has("svc1"))
+}
+
+func TestUpdateK8sPodRejectsEmptyLocationOrAddress(t *testing.T) {
+	dt := &DiffTracker{K8sResources: K8sState{Nodes: map[string]Node{}}}
+
+	err := dt.UpdateK8sPod(UpdatePodInputType{PodOperation: Add, Location: "", Address: "10.0.0.1"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "must not be empty")
+
+	err = dt.UpdateK8sPod(UpdatePodInputType{PodOperation: Add, Location: "node1", Address: ""})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "must not be empty")
+}
+
+// TestUpdateK8sPodRemovePreservesInboundIdentities verifies that removing a pod's
+// egress assignment clears only the outbound identity and keeps the pod while it
+// still backs an inbound (LoadBalancer) service, whereas an egress-only pod is
+// removed entirely and its ref-counter released.
+func TestUpdateK8sPodRemovePreservesInboundIdentities(t *testing.T) {
+	dt := &DiffTracker{K8sResources: K8sState{Nodes: map[string]Node{}}}
+
+	errs := dt.UpdateK8sEndpoints(UpdateK8sEndpointsInputType{
+		InboundIdentity: "lb1",
+		NewAddresses:    map[string]string{"10.0.0.1": "node1"},
+	})
+	assert.Empty(t, errs)
+	assert.NoError(t, dt.UpdateK8sPod(UpdatePodInputType{
+		PodOperation:           Add,
+		PublicOutboundIdentity: "egressA",
+		Location:               "node1",
+		Address:                "10.0.0.1",
+	}))
+	val, ok := dt.outboundIdentityPodRefCount.Load("egressa")
+	assert.True(t, ok)
+	assert.Equal(t, 1, val.(int))
+
+	assert.NoError(t, dt.UpdateK8sPod(UpdatePodInputType{
+		PodOperation:           Remove,
+		PublicOutboundIdentity: "egressA",
+		Location:               "node1",
+		Address:                "10.0.0.1",
+	}))
+	pod, ok := dt.K8sResources.Nodes["node1"].Pods["10.0.0.1"]
+	assert.True(t, ok, "pod backing an inbound service must be kept")
+	assert.True(t, pod.InboundIdentities.Has("lb1"))
+	assert.Equal(t, "", pod.PublicOutboundIdentity)
+	_, ok = dt.outboundIdentityPodRefCount.Load("egressa")
+	assert.False(t, ok, "egress ref-counter must be released")
+
+	assert.NoError(t, dt.UpdateK8sPod(UpdatePodInputType{
+		PodOperation:           Add,
+		PublicOutboundIdentity: "egressB",
+		Location:               "node2",
+		Address:                "10.0.0.2",
+	}))
+	assert.NoError(t, dt.UpdateK8sPod(UpdatePodInputType{
+		PodOperation:           Remove,
+		PublicOutboundIdentity: "egressB",
+		Location:               "node2",
+		Address:                "10.0.0.2",
+	}))
+	_, nodeOK := dt.K8sResources.Nodes["node2"]
+	assert.False(t, nodeOK, "egress-only pod and its empty node must be removed")
+	_, ok = dt.outboundIdentityPodRefCount.Load("egressb")
+	assert.False(t, ok)
+}
+
+// TestGetSyncLocationsAddressesRemovesGoneNode verifies that when a node is gone
+// from K8s but still present in NRP, the location is emitted with an empty Addresses
+// map (AddressUpdateAction PartialUpdate). The Service Gateway treats an empty
+// addresses array as null and deletes the location; applying the result also drops
+// the location locally.
+func TestGetSyncLocationsAddressesRemovesGoneNode(t *testing.T) {
+	dt := &DiffTracker{
+		K8sResources: K8sState{Nodes: map[string]Node{}},
+		NRPResources: NRPState{
+			LoadBalancers: sets.NewString("service1", "service2"),
+			NATGateways:   sets.NewString(),
+			Locations: map[string]NRPLocation{
+				"node1": {
+					Addresses: map[string]NRPAddress{
+						"10.0.0.1": {Services: sets.NewString("service1")},
+						"10.0.0.2": {Services: sets.NewString("service2")},
+					},
+				},
+			},
+		},
+	}
+
+	result := dt.GetSyncLocationsAddresses()
+
+	loc, ok := result.Locations["node1"]
+	assert.True(t, ok)
+	assert.Equal(t, PartialUpdate, loc.AddressUpdateAction)
+	assert.Empty(t, loc.Addresses, "gone node must be emitted with an empty Addresses map")
+
+	dt.UpdateLocationsAddresses(result)
+	_, ok = dt.NRPResources.Locations["node1"]
+	assert.False(t, ok, "gone node's location must be removed locally")
 }

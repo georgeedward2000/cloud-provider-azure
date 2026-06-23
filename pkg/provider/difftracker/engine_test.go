@@ -478,15 +478,15 @@ func TestIsServiceReady_StateUpdateInProgress(t *testing.T) {
 		Config:     NewInboundServiceConfig(uid, makeInboundConfig(80)),
 		State:      StateUpdateInProgress,
 	}
-	assert.True(t, dt.isServiceReady(uid, true), "StateUpdateInProgress should be ready for inbound sync")
+	assert.True(t, dt.isServiceReadyToSync(uid, true), "StateUpdateInProgress should be ready for inbound sync")
 
 	// And StateCreated should still work.
 	dt.pendingServiceOps[uid].State = StateCreated
-	assert.True(t, dt.isServiceReady(uid, true), "StateCreated should be ready for inbound sync")
+	assert.True(t, dt.isServiceReadyToSync(uid, true), "StateCreated should be ready for inbound sync")
 
 	// StateCreationInProgress should NOT be ready.
 	dt.pendingServiceOps[uid].State = StateCreationInProgress
-	assert.False(t, dt.isServiceReady(uid, true), "StateCreationInProgress should NOT be ready")
+	assert.False(t, dt.isServiceReadyToSync(uid, true), "StateCreationInProgress should NOT be ready")
 }
 
 // TestEngineDeleteService_DuringUpdate verifies that DeleteService correctly transitions
