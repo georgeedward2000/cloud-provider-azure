@@ -146,7 +146,8 @@ func TestBuildInboundServiceResources_MismatchedPortCounts(t *testing.T) {
 		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
-	_, lb, _ := buildInboundServiceResources("test-service", config, dtConfig)
+	_, lb, _, err := buildInboundServiceResources("test-service", config, dtConfig)
+	assert.NoError(t, err)
 
 	// Should create 3 rules
 	assert.Len(t, lb.Properties.LoadBalancingRules, 3)
@@ -177,7 +178,8 @@ func TestBuildInboundServiceResources_EmptyConfig(t *testing.T) {
 		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
-	_, lb, _ := buildInboundServiceResources("test-service", config, dtConfig)
+	_, lb, _, err := buildInboundServiceResources("test-service", config, dtConfig)
+	assert.NoError(t, err)
 
 	// Should create LB with no rules (empty config is valid)
 	assert.Empty(t, lb.Properties.LoadBalancingRules)
@@ -201,7 +203,8 @@ func TestBuildInboundServiceResources_LongServiceUID(t *testing.T) {
 		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
-	pip, lb, _ := buildInboundServiceResources(longUID, config, dtConfig)
+	pip, lb, _, err := buildInboundServiceResources(longUID, config, dtConfig)
+	assert.NoError(t, err)
 
 	// Should handle long UIDs without truncation
 	assert.Equal(t, longUID, *lb.Name)
@@ -249,8 +252,10 @@ func TestBuildInboundServiceResources_MultipleConfigs(t *testing.T) {
 		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
-	pip1, lb1, _ := buildInboundServiceResources("service-1", config1, dtConfig)
-	pip2, lb2, _ := buildInboundServiceResources("service-2", config2, dtConfig)
+	pip1, lb1, _, err := buildInboundServiceResources("service-1", config1, dtConfig)
+	assert.NoError(t, err)
+	pip2, lb2, _, err := buildInboundServiceResources("service-2", config2, dtConfig)
+	assert.NoError(t, err)
 
 	// Should produce different resources
 	assert.NotEqual(t, *pip1.Name, *pip2.Name)

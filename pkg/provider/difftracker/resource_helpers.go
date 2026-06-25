@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package difftracker
 
 import (
@@ -7,7 +23,10 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -17,6 +36,7 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 	pip armnetwork.PublicIPAddress,
 	lb armnetwork.LoadBalancer,
 	servicesDTO ServicesDataDTO,
+	err error,
 ) {
 	pipName := fmt.Sprintf("%s-pip", serviceUID)
 
@@ -51,43 +71,64 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 		},
 	}
 
-	// Build LB rules and probes from config
+	// Build LB rules from config. No health probes are created: PodIP backend pools
+	// don't support them, so the LB's Probes field is left nil.
 	var lbRules []*armnetwork.LoadBalancingRule
-	var probes []*armnetwork.Probe
 
 	if config != nil && len(config.FrontendPorts) > 0 {
-		// For SLB with PodIP backend pool, we disable floating IP and don't create health probes
-		// Traffic goes directly to pod IPs on the backend port
+		idleTimeout := int32(4)
+		if config.IdleTimeoutMinutes != nil {
+			idleTimeout = *config.IdleTimeoutMinutes
+			if idleTimeout < 4 || idleTimeout > 30 {
+				return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: idle timeout %d out of range (4-30) for service %s", idleTimeout, serviceUID)
+			}
+		}
 		for i, frontendPort := range config.FrontendPorts {
 			backendPort := frontendPort.Port
 			if i < len(config.BackendPorts) {
 				backendPort = config.BackendPorts[i].Port
 			}
 
-			protocol := armnetwork.TransportProtocolTCP
-			if frontendPort.Protocol == "UDP" {
+			if frontendPort.Port < 1 || frontendPort.Port > 65534 {
+				return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: frontend port %d out of range (1-65534) for service %s", frontendPort.Port, serviceUID)
+			}
+			if backendPort < 1 || backendPort > 65535 {
+				return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: backend port %d out of range (1-65535) for service %s", backendPort, serviceUID)
+			}
+
+			var protocol armnetwork.TransportProtocol
+			switch {
+			case strings.EqualFold(frontendPort.Protocol, "TCP"):
+				protocol = armnetwork.TransportProtocolTCP
+			case strings.EqualFold(frontendPort.Protocol, "UDP"):
 				protocol = armnetwork.TransportProtocolUDP
+			default:
+				return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: unsupported protocol %q for service %s", frontendPort.Protocol, serviceUID)
 			}
 
 			ruleName := fmt.Sprintf("rule-%s-%d", strings.ToLower(frontendPort.Protocol), frontendPort.Port)
 
-			lbRules = append(lbRules, &armnetwork.LoadBalancingRule{
-				Name: to.Ptr(ruleName),
-				Properties: &armnetwork.LoadBalancingRulePropertiesFormat{
-					Protocol:             to.Ptr(protocol),
-					FrontendPort:         to.Ptr(frontendPort.Port),
-					BackendPort:          to.Ptr(backendPort),
-					EnableFloatingIP:     to.Ptr(false), // Disabled for PodIP backend
-					IdleTimeoutInMinutes: to.Ptr(int32(4)),
-					EnableTCPReset:       to.Ptr(true),
-					FrontendIPConfiguration: &armnetwork.SubResource{
-						ID: to.Ptr(frontendIPConfigID),
-					},
-					BackendAddressPool: &armnetwork.SubResource{
-						ID: to.Ptr(backendPoolID),
-					},
-					// No probe for PodIP backend pools
+			ruleProps := &armnetwork.LoadBalancingRulePropertiesFormat{
+				Protocol:             to.Ptr(protocol),
+				FrontendPort:         to.Ptr(frontendPort.Port),
+				BackendPort:          to.Ptr(backendPort),
+				EnableFloatingIP:     to.Ptr(false), // Disabled for PodIP backend
+				IdleTimeoutInMinutes: to.Ptr(idleTimeout),
+				FrontendIPConfiguration: &armnetwork.SubResource{
+					ID: to.Ptr(frontendIPConfigID),
 				},
+				BackendAddressPool: &armnetwork.SubResource{
+					ID: to.Ptr(backendPoolID),
+				},
+				// No probe for PodIP backend pools
+			}
+			if protocol == armnetwork.TransportProtocolTCP {
+				ruleProps.EnableTCPReset = to.Ptr(true)
+			}
+
+			lbRules = append(lbRules, &armnetwork.LoadBalancingRule{
+				Name:       to.Ptr(ruleName),
+				Properties: ruleProps,
 			})
 
 			klog.V(4).Infof("buildInboundServiceResources: created LB rule %s: frontend=%d backend=%d protocol=%s for service %s",
@@ -102,7 +143,7 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 		ID:       to.Ptr(fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/loadBalancers/%s", dtConfig.SubscriptionID, dtConfig.ResourceGroup, serviceUID)),
 		Location: to.Ptr(dtConfig.Location),
 		SKU: &armnetwork.LoadBalancerSKU{
-			Name: to.Ptr(armnetwork.LoadBalancerSKUNameService),
+			Name: to.Ptr(armnetwork.LoadBalancerSKUName(consts.LoadBalancerSKUNameService)),
 		},
 		Properties: &armnetwork.LoadBalancerPropertiesFormat{
 			Scope: to.Ptr(armnetwork.LoadBalancerScopePublic),
@@ -119,7 +160,6 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 			},
 			BackendAddressPools: backendPools,
 			LoadBalancingRules:  lbRules,
-			Probes:              probes,
 		},
 	}
 
@@ -137,7 +177,7 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 		dtConfig.ResourceGroup,
 	)
 
-	return pip, lb, servicesDTO
+	return pip, lb, servicesDTO, nil
 }
 
 // buildOutboundServiceResources constructs the PIP, NAT Gateway, and ServicesDTO for an outbound service
@@ -240,13 +280,14 @@ func ExtractInboundConfigFromService(service *v1.Service) *InboundConfig {
 		// For SLB with PodIP backend, we use TargetPort
 		// If TargetPort is not specified, default to Port
 		backendPort := port.Port
-		if port.TargetPort.Type == 0 && port.TargetPort.IntVal > 0 { // intstr.Int
-			backendPort = port.TargetPort.IntVal
-		} else if port.TargetPort.Type == 1 { // intstr.String
-			// Named ports not supported in SLB mode - use Port as fallback
-			serviceName := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
-			klog.V(2).Infof("Named targetPort %s not supported in SLB mode for service %s, using Port %d",
-				port.TargetPort.StrVal, serviceName, port.Port)
+		switch port.TargetPort.Type {
+		case intstr.Int:
+			if port.TargetPort.IntVal > 0 {
+				backendPort = port.TargetPort.IntVal
+			}
+		case intstr.String:
+			klog.Warningf("ExtractInboundConfigFromService: named targetPort %q is not supported for service %s/%s; falling back to port %d",
+				port.TargetPort.StrVal, service.Namespace, service.Name, port.Port)
 			backendPort = port.Port
 		}
 

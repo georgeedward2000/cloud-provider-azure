@@ -299,7 +299,12 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 	}
 
 	// Step 1: Build resources using shared helper
-	pipResource, lbResource, servicesDTO := buildInboundServiceResources(serviceUID, config, s.diffTracker.config)
+	pipResource, lbResource, servicesDTO, err := buildInboundServiceResources(serviceUID, config, s.diffTracker.config)
+	if err != nil {
+		klog.Errorf("ServiceUpdater: failed to build inbound resources correlationID=%s serviceUID=%s error=%v", correlationID, serviceUID, err)
+		s.onComplete(serviceUID, false, fmt.Errorf("failed to build inbound resources: %w", err))
+		return
+	}
 
 	// Step 2: Create Public IP and capture the response to get the allocated IP address
 	pipResponse, err := s.diffTracker.createOrUpdatePIPWithResponse(ctx, s.diffTracker.config.ResourceGroup, &pipResource)
@@ -386,7 +391,12 @@ func (s *ServiceUpdater) updateInboundService(serviceUID string, config *Inbound
 	// Rebuild the LB ARM model from the new config. We discard the PIP and DTO portions
 	// because we are doing a port-only/spec update; the underlying PIP is unchanged and
 	// the SGW service registration (which references the backend pool by ID) is stable.
-	_, lbResource, _ := buildInboundServiceResources(serviceUID, config, s.diffTracker.config)
+	_, lbResource, _, err := buildInboundServiceResources(serviceUID, config, s.diffTracker.config)
+	if err != nil {
+		klog.Errorf("ServiceUpdater: failed to build inbound resources for update correlationID=%s serviceUID=%s error=%v", correlationID, serviceUID, err)
+		s.onComplete(serviceUID, false, fmt.Errorf("failed to build inbound resources: %w", err))
+		return
+	}
 
 	if err := s.diffTracker.createOrUpdateLB(ctx, lbResource); err != nil {
 		httpStatus, errCode := extractAzureErrorInfo(err)

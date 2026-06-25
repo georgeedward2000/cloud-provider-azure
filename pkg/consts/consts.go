@@ -238,6 +238,9 @@ const (
 	LoadBalancerSKUStandard = "standard"
 	// LoadBalancerSKUService is the load balancer service SKU
 	LoadBalancerSKUService = "service"
+	// LoadBalancerSKUNameService is the case-sensitive ARM SKU name for the
+	// ServiceGateway inbound load balancer; it must be sent as "Service".
+	LoadBalancerSKUNameService = "Service"
 
 	// PodLabelServiceEgressGateway is the label used on the pod
 	PodLabelServiceEgressGateway = "kubernetes.azure.com/service-egress-gateway"

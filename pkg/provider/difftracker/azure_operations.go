@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // Package difftracker provides state tracking and synchronization between Kubernetes
 // resources and Azure Network Resource Provider (NRP) resources.
 //
@@ -19,14 +35,19 @@ package difftracker
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
 	v1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	servicehelper "k8s.io/cloud-provider/service/helpers"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/util/errutils"
 )
 
 // createOrUpdatePIP creates or updates a public IP address
@@ -38,14 +59,17 @@ func (dt *DiffTracker) createOrUpdatePIP(ctx context.Context, pipResourceGroup s
 // createOrUpdatePIPWithResponse creates or updates a public IP address and returns the response
 // containing the allocated IP address. Use this when you need the IP address after PIP creation.
 func (dt *DiffTracker) createOrUpdatePIPWithResponse(ctx context.Context, pipResourceGroup string, pip *armnetwork.PublicIPAddress) (*armnetwork.PublicIPAddress, error) {
+	if pip == nil {
+		return nil, fmt.Errorf("createOrUpdatePIPWithResponse: pip is nil")
+	}
 	pipName := ptr.Deref(pip.Name, "")
 	if pipName == "" {
 		return nil, fmt.Errorf("createOrUpdatePIPWithResponse: pip name is empty")
 	}
-	klog.Infof("createOrUpdatePIPWithResponse(%s): start", pipName)
+	klog.V(4).Infof("createOrUpdatePIPWithResponse(%s): start", pipName)
 
 	response, err := dt.networkClientFactory.GetPublicIPAddressClient().CreateOrUpdate(ctx, pipResourceGroup, pipName, *pip)
-	klog.V(10).Infof("PublicIPAddressClient.CreateOrUpdate(%s, %s): end", pipResourceGroup, pipName)
+	klog.V(4).Infof("PublicIPAddressClient.CreateOrUpdate(%s, %s): end", pipResourceGroup, pipName)
 	if err != nil {
 		klog.Warningf("PublicIPAddressClient.CreateOrUpdate(%s, %s) failed: %s", pipResourceGroup, pipName, err.Error())
 		return nil, err
@@ -59,12 +83,12 @@ func (dt *DiffTracker) deletePublicIP(ctx context.Context, pipResourceGroup stri
 	if pipName == "" {
 		return fmt.Errorf("deletePublicIP: pipName is empty")
 	}
-	klog.Infof("deletePublicIP(%s): start", pipName)
+	klog.V(4).Infof("deletePublicIP(%s): start", pipName)
 
 	err := dt.networkClientFactory.GetPublicIPAddressClient().Delete(ctx, pipResourceGroup, pipName)
-	klog.Infof("deletePublicIP(%s): end, error: %v", pipName, err)
+	klog.V(4).Infof("deletePublicIP(%s): end, error: %v", pipName, err)
 
-	if err != nil {
+	if _, err := errutils.CheckResourceExistsFromAzcoreError(err); err != nil {
 		klog.Warningf("deletePublicIP(%s) failed: %s", pipName, err.Error())
 		return err
 	}
@@ -78,10 +102,10 @@ func (dt *DiffTracker) createOrUpdateLB(ctx context.Context, lb armnetwork.LoadB
 	if lbName == "" {
 		return fmt.Errorf("createOrUpdateLB: load balancer name is empty")
 	}
-	klog.Infof("createOrUpdateLB(%s): start", lbName)
+	klog.V(4).Infof("createOrUpdateLB(%s): start", lbName)
 
 	_, err := dt.networkClientFactory.GetLoadBalancerClient().CreateOrUpdate(ctx, dt.config.ResourceGroup, lbName, lb)
-	klog.V(10).Infof("LoadBalancerClient.CreateOrUpdate(%s): end", lbName)
+	klog.V(4).Infof("LoadBalancerClient.CreateOrUpdate(%s): end", lbName)
 	if err != nil {
 		klog.Warningf("LoadBalancerClient.CreateOrUpdate(%s) failed: %v", lbName, err)
 		return err
@@ -92,29 +116,12 @@ func (dt *DiffTracker) createOrUpdateLB(ctx context.Context, lb armnetwork.LoadB
 
 // deleteLB deletes a load balancer by service UID
 func (dt *DiffTracker) deleteLB(ctx context.Context, uid string) error {
-	// Normalize
 	uid = strings.ToLower(uid)
+	klog.V(4).Infof("deleteLB: deleting LoadBalancer %s", uid)
 
-	// Try to retrieve the live Service
-	svc, err := dt.getServiceByUID(ctx, uid)
-	if err != nil {
-		// Service not found - try direct cleanup
-		klog.V(3).Infof("deleteLB: service uid %s not found, attempting direct LoadBalancer deletion", uid)
-
-		// Delete the load balancer directly by name (uid is the LB name)
-		if err := dt.networkClientFactory.GetLoadBalancerClient().Delete(ctx, dt.config.ResourceGroup, uid); err != nil {
-			klog.Warningf("deleteLB: failed to delete LoadBalancer %s directly: %v", uid, err)
-			return err
-		}
-
-		klog.V(3).Infof("deleteLB: successfully deleted LoadBalancer %s directly", uid)
-		return nil
-	}
-
-	// Service exists - use standard deletion
-	if err := dt.networkClientFactory.GetLoadBalancerClient().Delete(ctx, dt.config.ResourceGroup, uid); err != nil {
-		return fmt.Errorf("deleteLB: failed to delete LoadBalancer for service %s/%s (uid=%s): %w",
-			svc.Namespace, svc.Name, uid, err)
+	err := dt.networkClientFactory.GetLoadBalancerClient().Delete(ctx, dt.config.ResourceGroup, uid)
+	if _, err := errutils.CheckResourceExistsFromAzcoreError(err); err != nil {
+		return fmt.Errorf("deleteLB: failed to delete LoadBalancer (uid=%s): %w", uid, err)
 	}
 
 	return nil
@@ -126,7 +133,7 @@ func (dt *DiffTracker) createOrUpdateNatGateway(ctx context.Context, natGatewayR
 	if natGatewayName == "" {
 		return fmt.Errorf("createOrUpdateNatGateway: NAT gateway name is empty")
 	}
-	klog.Infof("createOrUpdateNatGateway(%s): start", natGatewayName)
+	klog.V(4).Infof("createOrUpdateNatGateway(%s): start", natGatewayName)
 
 	_, err := dt.networkClientFactory.GetNatGatewayClient().CreateOrUpdate(ctx, natGatewayResourceGroup, natGatewayName, natGateway)
 	if err != nil {
@@ -134,8 +141,8 @@ func (dt *DiffTracker) createOrUpdateNatGateway(ctx context.Context, natGatewayR
 		return err
 	}
 
-	klog.V(10).Infof("NatGatewayClient.CreateOrUpdate(%s): success", natGatewayName)
-	klog.Infof("createOrUpdateNatGateway(%s): end, error: nil", natGatewayName)
+	klog.V(4).Infof("NatGatewayClient.CreateOrUpdate(%s): success", natGatewayName)
+	klog.V(4).Infof("createOrUpdateNatGateway(%s): end, error: nil", natGatewayName)
 	return nil
 }
 
@@ -144,25 +151,25 @@ func (dt *DiffTracker) deleteNatGateway(ctx context.Context, natGatewayResourceG
 	if natGatewayName == "" {
 		return fmt.Errorf("deleteNatGateway: NAT gateway name is empty")
 	}
-	klog.Infof("deleteNatGateway(%s) in resource group %s: start", natGatewayName, natGatewayResourceGroup)
+	klog.V(4).Infof("deleteNatGateway(%s) in resource group %s: start", natGatewayName, natGatewayResourceGroup)
 
 	err := dt.networkClientFactory.GetNatGatewayClient().Delete(ctx, natGatewayResourceGroup, natGatewayName)
-	if err != nil {
+	if _, err := errutils.CheckResourceExistsFromAzcoreError(err); err != nil {
 		klog.Errorf("NatGatewayClient.Delete(%s) in resource group %s failed: %v", natGatewayName, natGatewayResourceGroup, err)
 		return err
 	}
 
-	klog.V(10).Infof("NatGatewayClient.Delete(%s) in resource group %s: success", natGatewayName, natGatewayResourceGroup)
-	klog.Infof("deleteNatGateway(%s) in resource group %s: end, error: nil", natGatewayName, natGatewayResourceGroup)
+	klog.V(4).Infof("NatGatewayClient.Delete(%s) in resource group %s: success", natGatewayName, natGatewayResourceGroup)
+	klog.V(4).Infof("deleteNatGateway(%s) in resource group %s: end, error: nil", natGatewayName, natGatewayResourceGroup)
 	return nil
 }
 
 // disassociateNatGatewayFromServiceGateway removes the NAT gateway association from the Service Gateway
 // This should be called before deleting the NAT gateway to properly clean up the references
 func (dt *DiffTracker) disassociateNatGatewayFromServiceGateway(ctx context.Context, serviceGatewayName string, natGatewayName string) error {
-	klog.Infof("disassociateNatGatewayFromServiceGateway: Disassociating NAT Gateway %s from Service Gateway %s in resource group %s", natGatewayName, serviceGatewayName, dt.config.ResourceGroup)
+	klog.V(2).Infof("disassociateNatGatewayFromServiceGateway: Disassociating NAT Gateway %s from Service Gateway %s in resource group %s", natGatewayName, serviceGatewayName, dt.config.ResourceGroup)
 
-	// Step 1: Get the service and remove the NAT gateway reference
+	// Step 1: clear the ServiceGateway-side reference if it still has one.
 	services, err := dt.networkClientFactory.GetServiceGatewayClient().GetServices(ctx, dt.config.ResourceGroup, serviceGatewayName)
 	if err != nil {
 		klog.Errorf("disassociateNatGatewayFromServiceGateway: Failed to get Service Gateway %s: %v", serviceGatewayName, err)
@@ -177,84 +184,80 @@ func (dt *DiffTracker) disassociateNatGatewayFromServiceGateway(ctx context.Cont
 		}
 	}
 
-	if serviceToBeUpdated == nil {
-		klog.Infof("disassociateNatGatewayFromServiceGateway: NAT Gateway %s is not associated with Service Gateway %s", natGatewayName, serviceGatewayName)
-		return nil
-	}
-
-	// Remove the NAT gateway reference from the service
-	if serviceToBeUpdated.Properties != nil {
+	if serviceToBeUpdated != nil && serviceToBeUpdated.Properties != nil && serviceToBeUpdated.Properties.PublicNatGatewayID != nil {
 		serviceToBeUpdated.Properties.PublicNatGatewayID = nil
-	}
-
-	updateServicesRequest := armnetwork.ServiceGatewayUpdateServicesRequest{
-		Action: ptr.To(armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate),
-		ServiceRequests: []*armnetwork.ServiceGatewayServiceRequest{
-			{
-				IsDelete: ptr.To(false),
-				Service:  serviceToBeUpdated,
+		updateServicesRequest := armnetwork.ServiceGatewayUpdateServicesRequest{
+			Action: ptr.To(armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate),
+			ServiceRequests: []*armnetwork.ServiceGatewayServiceRequest{
+				{
+					IsDelete: ptr.To(false),
+					Service:  serviceToBeUpdated,
+				},
 			},
-		},
+		}
+		if err := dt.networkClientFactory.GetServiceGatewayClient().UpdateServices(ctx, dt.config.ResourceGroup, serviceGatewayName, updateServicesRequest); err != nil {
+			klog.Errorf("disassociateNatGatewayFromServiceGateway: Failed to update Service Gateway %s to disassociate NAT Gateway %s: %v", serviceGatewayName, natGatewayName, err)
+			return fmt.Errorf("failed to update Service Gateway: %w", err)
+		}
 	}
 
-	err = dt.networkClientFactory.GetServiceGatewayClient().UpdateServices(ctx, dt.config.ResourceGroup, serviceGatewayName, updateServicesRequest)
-	if err != nil {
-		klog.Errorf("disassociateNatGatewayFromServiceGateway: Failed to update Service Gateway %s to disassociate NAT Gateway %s: %v", serviceGatewayName, natGatewayName, err)
-		return fmt.Errorf("failed to update Service Gateway: %w", err)
-	}
-	klog.Infof("disassociateNatGatewayFromServiceGateway: Successfully removed NAT Gateway %s reference from Service Gateway %s", natGatewayName, serviceGatewayName)
-
-	// Step 2: Get the NAT gateway and remove the service gateway reference
+	// Step 2: clear the NAT-gateway-side reference if it still points back at the
+	// Service Gateway. This runs independently of Step 1 so a retry after a
+	// partial failure still reconciles the NAT gateway.
 	natGateway, err := dt.networkClientFactory.GetNatGatewayClient().Get(ctx, dt.config.ResourceGroup, natGatewayName, nil)
 	if err != nil {
+		if exists, cerr := errutils.CheckResourceExistsFromAzcoreError(err); cerr == nil && !exists {
+			return nil
+		}
 		klog.Errorf("disassociateNatGatewayFromServiceGateway: Failed to get NAT Gateway %s: %v", natGatewayName, err)
 		return fmt.Errorf("failed to get NAT Gateway: %w", err)
 	}
 
-	if natGateway.Properties != nil {
+	if natGateway.Properties != nil && natGateway.Properties.ServiceGateway != nil {
 		natGateway.Properties.ServiceGateway = nil
+		if _, err := dt.networkClientFactory.GetNatGatewayClient().CreateOrUpdate(ctx, dt.config.ResourceGroup, natGatewayName, *natGateway); err != nil {
+			klog.Errorf("disassociateNatGatewayFromServiceGateway: Failed to update NAT Gateway %s to remove Service Gateway reference: %v", natGatewayName, err)
+			return fmt.Errorf("failed to update NAT Gateway: %w", err)
+		}
 	}
 
-	_, err = dt.networkClientFactory.GetNatGatewayClient().CreateOrUpdate(ctx, dt.config.ResourceGroup, natGatewayName, *natGateway)
-	if err != nil {
-		klog.Errorf("disassociateNatGatewayFromServiceGateway: Failed to update NAT Gateway %s to remove Service Gateway reference: %v", natGatewayName, err)
-		return fmt.Errorf("failed to update NAT Gateway: %w", err)
-	}
-
-	klog.Infof("disassociateNatGatewayFromServiceGateway: Successfully disassociated NAT Gateway %s from Service Gateway %s in resource group %s", natGatewayName, serviceGatewayName, dt.config.ResourceGroup)
+	klog.V(2).Infof("disassociateNatGatewayFromServiceGateway: Successfully disassociated NAT Gateway %s from Service Gateway %s in resource group %s", natGatewayName, serviceGatewayName, dt.config.ResourceGroup)
 	return nil
 }
 
 // updateNRPSGWServices updates services in the Service Gateway
 func (dt *DiffTracker) updateNRPSGWServices(ctx context.Context, serviceGatewayName string, updateServicesRequestDTO ServicesDataDTO) error {
-	// Early return if no services to update
-	if len(updateServicesRequestDTO.Services) == 0 {
-		klog.Infof("updateNRPSGWServices(%s): no services to update", serviceGatewayName)
+	if len(updateServicesRequestDTO.Services) == 0 && updateServicesRequestDTO.Action != FullUpdate {
+		klog.V(4).Infof("updateNRPSGWServices(%s): no services to update", serviceGatewayName)
 		return nil
 	}
 
-	klog.Infof("updateNRPSGWServices(%s): start", serviceGatewayName)
+	klog.V(4).Infof("updateNRPSGWServices(%s): start", serviceGatewayName)
 
 	// Convert DTO to ARM SDK request
+	serviceRequests, err := convertServiceDTOsToServiceRequests(updateServicesRequestDTO.Services, dt.config)
+	if err != nil {
+		return fmt.Errorf("updateNRPSGWServices(%s): %w", serviceGatewayName, err)
+	}
 	req := armnetwork.ServiceGatewayUpdateServicesRequest{
 		Action:          convertServicesUpdateActionToARM(updateServicesRequestDTO.Action),
-		ServiceRequests: convertServiceDTOsToServiceRequests(updateServicesRequestDTO.Services, dt.config),
+		ServiceRequests: serviceRequests,
 	}
 
-	err := dt.networkClientFactory.GetServiceGatewayClient().UpdateServices(ctx, dt.config.ResourceGroup, serviceGatewayName, req)
+	err = dt.networkClientFactory.GetServiceGatewayClient().UpdateServices(ctx, dt.config.ResourceGroup, serviceGatewayName, req)
 	if err != nil {
 		klog.Warningf("ServiceGatewayClient.UpdateServices(%s) failed: %v", serviceGatewayName, err)
 		return err
 	}
 
-	klog.V(10).Infof("ServiceGatewayClient.UpdateServices(%s): success", serviceGatewayName)
-	klog.Infof("updateNRPSGWServices(%s): end, error: nil", serviceGatewayName)
+	klog.V(4).Infof("ServiceGatewayClient.UpdateServices(%s): success", serviceGatewayName)
+	klog.V(4).Infof("updateNRPSGWServices(%s): end, error: nil", serviceGatewayName)
 	return nil
 }
 
 // updateNRPSGWAddressLocations updates address locations in the Service Gateway
 func (dt *DiffTracker) updateNRPSGWAddressLocations(ctx context.Context, serviceGatewayName string, locationsDTO LocationsDataDTO) error {
-	klog.Infof("updateNRPSGWAddressLocations(%s): start", serviceGatewayName)
+	klog.V(4).Infof("updateNRPSGWAddressLocations(%s): start", serviceGatewayName)
 
 	// Convert DTO to ARM SDK request
 	req := armnetwork.ServiceGatewayUpdateAddressLocationsRequest{
@@ -268,14 +271,19 @@ func (dt *DiffTracker) updateNRPSGWAddressLocations(ctx context.Context, service
 		return err
 	}
 
-	klog.V(10).Infof("ServiceGatewayClient.UpdateAddressLocations(%s): success", serviceGatewayName)
-	klog.Infof("updateNRPSGWAddressLocations(%s): end, error: nil", serviceGatewayName)
+	klog.V(4).Infof("ServiceGatewayClient.UpdateAddressLocations(%s): success", serviceGatewayName)
+	klog.V(4).Infof("updateNRPSGWAddressLocations(%s): end, error: nil", serviceGatewayName)
 	return nil
 }
 
 // getServiceByUID returns the Service whose UID matches the given uid
 func (dt *DiffTracker) getServiceByUID(ctx context.Context, uid string) (*v1.Service, error) {
-	// list via client (could be expensive; acceptable for initialization)
+	// This lists all Services and scans for a UID match, which is expensive. It is
+	// acceptable for now since it runs once per service operation (plus conflict retries),
+	// not in a hot path.
+	// TODO: maintain a UID -> namespace/name map from the Service informer events so this
+	// becomes an O(1) lookup plus a direct Services(ns).Get(name) (or lister-cache read)
+	// instead of a NamespaceAll list.
 	svcList, err := dt.kubeClient.CoreV1().Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("getServiceByUID: list failed: %w", err)
@@ -289,42 +297,65 @@ func (dt *DiffTracker) getServiceByUID(ctx context.Context, uid string) (*v1.Ser
 }
 
 // updateServiceLoadBalancerStatus updates the K8s Service status with the LoadBalancer IP address.
-// This is called after the PIP is successfully created in ServiceGateway mode to populate
-// the Service.Status.LoadBalancer.Ingress field, which would otherwise be empty since
-// EnsureLoadBalancer returns immediately in async mode.
+// EnsureLoadBalancer returns an empty LoadBalancer status immediately while the difftracker
+// engine provisions the PIP, LB and ServiceGateway registration asynchronously in the
+// background. This function backfills Service.Status.LoadBalancer.Ingress once the PIP is
+// created, since it would otherwise stay empty.
 func (dt *DiffTracker) updateServiceLoadBalancerStatus(ctx context.Context, serviceUID string, ip string) error {
 	if ip == "" {
 		return fmt.Errorf("updateServiceLoadBalancerStatus: ip is empty")
 	}
-
-	svc, err := dt.getServiceByUID(ctx, serviceUID)
-	if err != nil {
-		return fmt.Errorf("updateServiceLoadBalancerStatus: failed to get service: %w", err)
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return fmt.Errorf("updateServiceLoadBalancerStatus: invalid ip %q", ip)
 	}
+	newIsIPv4 := parsedIP.To4() != nil
 
-	// Check if the status already has this IP to avoid unnecessary updates
-	for _, ingress := range svc.Status.LoadBalancer.Ingress {
-		if ingress.IP == ip {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		svc, err := dt.getServiceByUID(ctx, serviceUID)
+		if err != nil {
+			return fmt.Errorf("updateServiceLoadBalancerStatus: failed to get service: %w", err)
+		}
+
+		desired := make([]v1.LoadBalancerIngress, 0, len(svc.Status.LoadBalancer.Ingress)+1)
+		newPresent := false
+		// Rebuild the ingress list, keeping it dual-stack safe: preserve non-IP (hostname-only)
+		// entries and entries of the other IP family untouched, while replacing any stale
+		// same-family IP with the new one. If the new IP is already present we keep it and
+		// avoid appending a duplicate below.
+		for _, ingress := range svc.Status.LoadBalancer.Ingress {
+			if ingress.IP == "" {
+				desired = append(desired, ingress)
+				continue
+			}
+			ingressIP := net.ParseIP(ingress.IP)
+			if ingressIP != nil && (ingressIP.To4() != nil) == newIsIPv4 {
+				if ingress.IP == ip {
+					newPresent = true
+					desired = append(desired, ingress)
+				}
+				continue
+			}
+			desired = append(desired, ingress)
+		}
+		if !newPresent {
+			desired = append(desired, v1.LoadBalancerIngress{IP: ip})
+		}
+
+		if apiequality.Semantic.DeepEqual(svc.Status.LoadBalancer.Ingress, desired) {
 			klog.V(3).Infof("updateServiceLoadBalancerStatus: service %s/%s already has IP %s", svc.Namespace, svc.Name, ip)
 			return nil
 		}
-	}
 
-	// Make a copy so we don't mutate the shared informer cache
-	updated := svc.DeepCopy()
-	updated.Status.LoadBalancer = v1.LoadBalancerStatus{
-		Ingress: []v1.LoadBalancerIngress{
-			{IP: ip},
-		},
-	}
+		updated := svc.DeepCopy()
+		updated.Status.LoadBalancer.Ingress = desired
+		if _, err := servicehelper.PatchService(dt.kubeClient.CoreV1(), svc, updated); err != nil {
+			return fmt.Errorf("updateServiceLoadBalancerStatus: failed to patch service: %w", err)
+		}
 
-	_, err = servicehelper.PatchService(dt.kubeClient.CoreV1(), svc, updated)
-	if err != nil {
-		return fmt.Errorf("updateServiceLoadBalancerStatus: failed to patch service: %w", err)
-	}
-
-	klog.V(2).Infof("updateServiceLoadBalancerStatus: updated service %s/%s with LoadBalancer IP %s", svc.Namespace, svc.Name, ip)
-	return nil
+		klog.V(2).Infof("updateServiceLoadBalancerStatus: updated service %s/%s with LoadBalancer IP %s", svc.Namespace, svc.Name, ip)
+		return nil
+	})
 }
 
 // Helper functions to convert DTOs to ARM SDK types
@@ -336,6 +367,7 @@ func convertServicesUpdateActionToARM(action UpdateAction) *armnetwork.ServiceGa
 	case FullUpdate:
 		return ptr.To(armnetwork.ServiceGatewayUpdateServicesRequestActionFullUpdate)
 	default:
+		klog.Warningf("convertServicesUpdateActionToARM: unknown UpdateAction %q, defaulting to PartialUpdate", action)
 		return ptr.To(armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate)
 	}
 }
@@ -347,32 +379,27 @@ func convertLocationsUpdateActionToARM(action UpdateAction) *armnetwork.ServiceG
 	case FullUpdate:
 		return ptr.To(armnetwork.ServiceGatewayUpdateAddressLocationsRequestActionFullUpdate)
 	default:
+		klog.Warningf("convertLocationsUpdateActionToARM: unknown UpdateAction %q, defaulting to PartialUpdate", action)
 		return ptr.To(armnetwork.ServiceGatewayUpdateAddressLocationsRequestActionPartialUpdate)
 	}
 }
 
-// extractResourceChildName extracts a child resource name from an Azure resource ID
+// extractResourceChildName extracts a child resource name from an Azure resource ID.
+// Returns "" if the requested segment is not present.
 func extractResourceChildName(id, segment string) string {
 	if id == "" {
 		return ""
 	}
 	parts := strings.Split(id, "/")
-	// Look for the explicit segment first
 	for i := 0; i < len(parts)-1; i++ {
 		if strings.EqualFold(parts[i], segment) && parts[i+1] != "" {
 			return parts[i+1]
 		}
 	}
-	// Fallback: last non-empty
-	for i := len(parts) - 1; i >= 0; i-- {
-		if parts[i] != "" {
-			return parts[i]
-		}
-	}
 	return ""
 }
 
-func convertServiceDTOsToServiceRequests(services []ServiceDTO, config Config) []*armnetwork.ServiceGatewayServiceRequest {
+func convertServiceDTOsToServiceRequests(services []ServiceDTO, config Config) ([]*armnetwork.ServiceGatewayServiceRequest, error) {
 	serviceRequests := make([]*armnetwork.ServiceGatewayServiceRequest, 0, len(services))
 
 	// Construct VNet resource ID once for all backend pools
@@ -405,7 +432,12 @@ func convertServiceDTOsToServiceRequests(services []ServiceDTO, config Config) [
 			publicNatGatewayID = nil
 		case Outbound:
 			serviceType = armnetwork.ServiceGatewayServicePropertiesFormatServiceTypeOutbound
-			publicNatGatewayID = &svc.PublicNatGateway.Id
+			if !svc.IsDelete && svc.PublicNatGateway.Id != "" {
+				natID := svc.PublicNatGateway.Id
+				publicNatGatewayID = &natID
+			}
+		default:
+			return nil, fmt.Errorf("convertServiceDTOsToServiceRequests: unknown ServiceType %q for service %q", svc.ServiceType, svc.Service)
 		}
 
 		// Build and append the service request
@@ -421,7 +453,7 @@ func convertServiceDTOsToServiceRequests(services []ServiceDTO, config Config) [
 			},
 		})
 	}
-	return serviceRequests
+	return serviceRequests, nil
 }
 
 func convertLocationDTOsToAddressLocations(locations []LocationDTO) []*armnetwork.ServiceGatewayAddressLocation {
@@ -431,12 +463,17 @@ func convertLocationDTOsToAddressLocations(locations []LocationDTO) []*armnetwor
 			AddressLocation: ptr.To(loc.Location),
 		}
 
-		// Set address update action
+		// Set address update action. Mirror the service/location action converters by
+		// defaulting an unknown (e.g. unset/zero) value to PartialUpdate instead of
+		// leaving it nil, so NRP always receives an explicit action.
 		switch loc.AddressUpdateAction {
 		case PartialUpdate:
 			armLoc.AddressUpdateAction = ptr.To(armnetwork.ServiceGatewayAddressLocationAddressUpdateActionPartialUpdate)
 		case FullUpdate:
 			armLoc.AddressUpdateAction = ptr.To(armnetwork.ServiceGatewayAddressLocationAddressUpdateActionFullUpdate)
+		default:
+			klog.Warningf("convertLocationDTOsToAddressLocations: unknown AddressUpdateAction %v for location %q, defaulting to PartialUpdate", loc.AddressUpdateAction, loc.Location)
+			armLoc.AddressUpdateAction = ptr.To(armnetwork.ServiceGatewayAddressLocationAddressUpdateActionPartialUpdate)
 		}
 
 		// Convert addresses - always initialize the slice to avoid null in JSON
@@ -448,10 +485,8 @@ func convertLocationDTOsToAddressLocations(locations []LocationDTO) []*armnetwor
 
 			// Convert service names - always initialize the slice to avoid null in JSON
 			armAddr.Services = make([]*string, 0, addr.ServiceNames.Len())
-			if addr.ServiceNames != nil && addr.ServiceNames.Len() > 0 {
-				for _, svcName := range addr.ServiceNames.UnsortedList() {
-					armAddr.Services = append(armAddr.Services, ptr.To(svcName))
-				}
+			for _, svcName := range addr.ServiceNames.UnsortedList() {
+				armAddr.Services = append(armAddr.Services, ptr.To(svcName))
 			}
 
 			armLoc.Addresses = append(armLoc.Addresses, armAddr)

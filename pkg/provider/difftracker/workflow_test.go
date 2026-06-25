@@ -61,7 +61,8 @@ func TestCompleteServiceCreationWorkflow(t *testing.T) {
 	}
 
 	serviceUID := string(service.UID)
-	pip, lb, servicesDTO := buildInboundServiceResources(serviceUID, inboundConfig, dtConfig)
+	pip, lb, servicesDTO, err := buildInboundServiceResources(serviceUID, inboundConfig, dtConfig)
+	assert.NoError(t, err)
 
 	// Step 4: Validate Public IP resource
 	assert.NotNil(t, pip.Name)
@@ -148,7 +149,8 @@ func TestWorkflowWithUDPService(t *testing.T) {
 		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
-	_, lb, _ := buildInboundServiceResources(string(service.UID), config, dtConfig)
+	_, lb, _, err := buildInboundServiceResources(string(service.UID), config, dtConfig)
+	assert.NoError(t, err)
 
 	// Verify rules have correct protocols
 	assert.Len(t, lb.Properties.LoadBalancingRules, 2)
@@ -249,7 +251,8 @@ func TestResourceIDsAreConsistent(t *testing.T) {
 		BackendPorts:  []PortMapping{{Port: 8080, Protocol: "TCP"}},
 	}
 
-	pip, lb, _ := buildInboundServiceResources(serviceUID, config, dtConfig)
+	pip, lb, _, err := buildInboundServiceResources(serviceUID, config, dtConfig)
+	assert.NoError(t, err)
 
 	// Validate PIP ID format
 	expectedPIPID := "/subscriptions/sub-abc/resourceGroups/rg-xyz/providers/Microsoft.Network/publicIPAddresses/test-service-123-pip"
@@ -318,14 +321,16 @@ func TestMultipleServicesIndependence(t *testing.T) {
 		FrontendPorts: []PortMapping{{Port: 80, Protocol: "TCP"}},
 		BackendPorts:  []PortMapping{{Port: 8080, Protocol: "TCP"}},
 	}
-	pip1, lb1, dto1 := buildInboundServiceResources("service-1", config1, dtConfig)
+	pip1, lb1, dto1, err := buildInboundServiceResources("service-1", config1, dtConfig)
+	assert.NoError(t, err)
 
 	// Create resources for service 2
 	config2 := &InboundConfig{
 		FrontendPorts: []PortMapping{{Port: 443, Protocol: "TCP"}},
 		BackendPorts:  []PortMapping{{Port: 8443, Protocol: "TCP"}},
 	}
-	pip2, lb2, dto2 := buildInboundServiceResources("service-2", config2, dtConfig)
+	pip2, lb2, dto2, err := buildInboundServiceResources("service-2", config2, dtConfig)
+	assert.NoError(t, err)
 
 	// Verify complete independence
 	assert.NotEqual(t, *pip1.Name, *pip2.Name)
@@ -420,7 +425,8 @@ func TestLBRuleNaming(t *testing.T) {
 		ServiceGatewayID:           "/sub/rg/sgw",
 	}
 
-	_, lb, _ := buildInboundServiceResources("test-svc", config, dtConfig)
+	_, lb, _, err := buildInboundServiceResources("test-svc", config, dtConfig)
+	assert.NoError(t, err)
 
 	assert.Len(t, lb.Properties.LoadBalancingRules, 4)
 
@@ -447,7 +453,8 @@ func TestBackendPoolPopulation(t *testing.T) {
 	}
 
 	serviceUID := "my-service-uid"
-	_, lb, _ := buildInboundServiceResources(serviceUID, config, dtConfig)
+	_, lb, _, err := buildInboundServiceResources(serviceUID, config, dtConfig)
+	assert.NoError(t, err)
 
 	// Backend pool should be named after serviceUID for SLB
 	assert.Len(t, lb.Properties.BackendAddressPools, 1)
@@ -496,7 +503,8 @@ func TestRoundTripServiceToResourcesAndBack(t *testing.T) {
 		ServiceGatewayID:           "/subscriptions/prod-sub/resourceGroups/prod-rg/providers/Microsoft.Network/serviceGateways/prod-sgw",
 	}
 
-	pip, lb, servicesDTO := buildInboundServiceResources(string(originalService.UID), config, dtConfig)
+	pip, lb, servicesDTO, err := buildInboundServiceResources(string(originalService.UID), config, dtConfig)
+	assert.NoError(t, err)
 
 	// Verify we can reconstruct the port mapping from LB rules
 	assert.Len(t, lb.Properties.LoadBalancingRules, 3)
