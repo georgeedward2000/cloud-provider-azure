@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
@@ -27,7 +27,7 @@ func (az *Cloud) attachServiceGatewayToSubnet(ctx context.Context) error {
 		subnet.Properties = &armnetwork.SubnetPropertiesFormat{}
 	}
 	if subnet.Properties.ServiceGateway == nil {
-		subnet.Properties.ServiceGateway = &armnetwork.ServiceGatewaySubnetPropertiesFormat{}
+		subnet.Properties.ServiceGateway = &armnetwork.SubResource{}
 	}
 
 	subnet.Properties.ServiceGateway.ID = to.Ptr(fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/serviceGateways/%s",
@@ -93,7 +93,7 @@ func (az *Cloud) ensureDefaultOutboundServiceExists(ctx context.Context) error {
 			Name: to.Ptr(armnetwork.NatGatewaySKUNameStandardV2)},
 		Location: to.Ptr(az.Location),
 		Properties: &armnetwork.NatGatewayPropertiesFormat{
-			ServiceGateway: &armnetwork.ServiceGateway{
+			ServiceGateway: &armnetwork.SubResource{
 				ID: to.Ptr(az.GetServiceGatewayID()),
 			},
 			PublicIPAddresses: []*armnetwork.SubResource{
@@ -107,7 +107,7 @@ func (az *Cloud) ensureDefaultOutboundServiceExists(ctx context.Context) error {
 	az.createOrUpdateNatGateway(ctx, az.ResourceGroup, natGatewayResource)
 
 	req := armnetwork.ServiceGatewayUpdateServicesRequest{
-		Action:          to.Ptr(armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate),
+		Action:          to.Ptr(armnetwork.ServiceUpdateActionPartialUpdate),
 		ServiceRequests: []*armnetwork.ServiceGatewayServiceRequest{},
 	}
 	req.ServiceRequests = append(req.ServiceRequests, &armnetwork.ServiceGatewayServiceRequest{
@@ -115,7 +115,7 @@ func (az *Cloud) ensureDefaultOutboundServiceExists(ctx context.Context) error {
 		Service: &armnetwork.ServiceGatewayService{
 			Name: &defaultNatGatewayName,
 			Properties: &armnetwork.ServiceGatewayServicePropertiesFormat{
-				ServiceType: to.Ptr(armnetwork.ServiceGatewayServicePropertiesFormatServiceTypeOutbound),
+				ServiceType: to.Ptr(armnetwork.ServiceTypeOutbound),
 				IsDefault:   to.Ptr(true),
 				PublicNatGatewayID: to.Ptr(fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/natGateways/%s",
 					az.SubscriptionID, az.ResourceGroup, defaultNatGatewayName)),

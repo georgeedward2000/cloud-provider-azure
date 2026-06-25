@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"net/netip"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
@@ -105,4 +105,64 @@ func (az *Cloud) listSharedIPPortMapping(
 	logger.V(5).Info("Retain port mapping", "port-mapping", rv)
 
 	return rv, nil
+}
+
+func (az *Cloud) listAvailableSecurityGroupDestinations(_ context.Context) ([]netip.Addr, error) {
+	services, err := az.serviceLister.List(labels.Everything())
+	if err != nil {
+		return nil, fmt.Errorf("list all services: %w", err)
+	}
+
+	nodes, err := az.nodeLister.List(labels.NewSelector())
+	if err != nil {
+		return nil, fmt.Errorf("list all nodes: %w", err)
+	}
+
+	var rv []netip.Addr
+	for _, svc := range services {
+		// Add additional public IPs
+		{
+			ips, err := loadbalancer.AdditionalPublicIPs(svc)
+			if err == nil {
+				rv = append(rv, ips...)
+			}
+		}
+
+		// Add ingress IPs
+		{
+			for _, ing := range svc.Status.LoadBalancer.Ingress {
+				ip, err := netip.ParseAddr(ing.IP)
+				if err == nil {
+					rv = append(rv, ip)
+				}
+			}
+		}
+	}
+
+	// Add backend node IPs
+	{
+		for _, node := range nodes {
+			if !az.isNodeManagedByCloudProvider(node) {
+				continue
+			}
+			for _, addr := range node.Status.Addresses {
+				if addr.Type != v1.NodeInternalIP {
+					continue
+				}
+				ip, err := netip.ParseAddr(addr.Address)
+				if err == nil {
+					rv = append(rv, ip)
+				}
+			}
+		}
+	}
+
+	return rv, nil
+}
+
+func (az *Cloud) isNodeManagedByCloudProvider(node *v1.Node) bool {
+	az.nodeCachesLock.Lock()
+	defer az.nodeCachesLock.Unlock()
+
+	return !az.unmanagedNodes.Has(node.ObjectMeta.Name)
 }

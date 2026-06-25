@@ -24,7 +24,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/tracing"
-	armnetwork "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	armnetwork "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/metrics"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/utils"
@@ -56,16 +56,13 @@ func New(subscriptionID string, credential azcore.TokenCredential, options *arm.
 const GetOperationName = "ServiceGatewaysClient.Get"
 
 // Get gets the ServiceGateway
-func (client *Client) Get(ctx context.Context, resourceGroupName string, servicegatewayName string, expand *string) (result *armnetwork.ServiceGateway, err error) {
-	var ops *armnetwork.ServiceGatewaysClientGetOptions
-	if expand != nil {
-		ops = &armnetwork.ServiceGatewaysClientGetOptions{Expand: expand}
-	}
+func (client *Client) Get(ctx context.Context, resourceGroupName string, servicegatewayName string) (result *armnetwork.ServiceGateway, err error) {
+
 	metricsCtx := metrics.BeginARMRequest(client.subscriptionID, resourceGroupName, "ServiceGateway", "get")
 	defer func() { metricsCtx.Observe(ctx, err) }()
 	ctx, endSpan := runtime.StartSpan(ctx, GetOperationName, client.tracer, nil)
 	defer endSpan(err)
-	resp, err := client.ServiceGatewaysClient.Get(ctx, resourceGroupName, servicegatewayName, ops)
+	resp, err := client.ServiceGatewaysClient.Get(ctx, resourceGroupName, servicegatewayName, nil)
 	if err != nil {
 		return nil, err
 	}

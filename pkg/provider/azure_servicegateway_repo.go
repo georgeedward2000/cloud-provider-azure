@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"k8s.io/klog/v2"
 )
 
 // TODO(enechitoaia): remove after added aks-rp support
 func (az *Cloud) GetServiceGateway(ctx context.Context, serviceGatewayName string) (*armnetwork.ServiceGateway, error) {
-	result, err := az.NetworkClientFactory.GetServiceGatewayClient().Get(ctx, az.ResourceGroup, serviceGatewayName, nil)
+	result, err := az.NetworkClientFactory.GetServiceGatewayClient().Get(ctx, az.ResourceGroup, serviceGatewayName)
 	if err != nil {
 		klog.Infof("GetServiceGateway: error getting Service Gateway %s in resource group %s: %v", serviceGatewayName, az.ResourceGroup, err)
 		return nil, err

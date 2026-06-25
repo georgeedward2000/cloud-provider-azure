@@ -38,7 +38,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -187,7 +187,7 @@ func (dt *DiffTracker) disassociateNatGatewayFromServiceGateway(ctx context.Cont
 	if serviceToBeUpdated != nil && serviceToBeUpdated.Properties != nil && serviceToBeUpdated.Properties.PublicNatGatewayID != nil {
 		serviceToBeUpdated.Properties.PublicNatGatewayID = nil
 		updateServicesRequest := armnetwork.ServiceGatewayUpdateServicesRequest{
-			Action: ptr.To(armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate),
+			Action: ptr.To(armnetwork.ServiceUpdateActionPartialUpdate),
 			ServiceRequests: []*armnetwork.ServiceGatewayServiceRequest{
 				{
 					IsDelete: ptr.To(false),
@@ -360,27 +360,27 @@ func (dt *DiffTracker) updateServiceLoadBalancerStatus(ctx context.Context, serv
 
 // Helper functions to convert DTOs to ARM SDK types
 
-func convertServicesUpdateActionToARM(action UpdateAction) *armnetwork.ServiceGatewayUpdateServicesRequestAction {
+func convertServicesUpdateActionToARM(action UpdateAction) *armnetwork.ServiceUpdateAction {
 	switch action {
 	case PartialUpdate:
-		return ptr.To(armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate)
+		return ptr.To(armnetwork.ServiceUpdateActionPartialUpdate)
 	case FullUpdate:
-		return ptr.To(armnetwork.ServiceGatewayUpdateServicesRequestActionFullUpdate)
+		return ptr.To(armnetwork.ServiceUpdateActionFullUpdate)
 	default:
 		klog.Warningf("convertServicesUpdateActionToARM: unknown UpdateAction %q, defaulting to PartialUpdate", action)
-		return ptr.To(armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate)
+		return ptr.To(armnetwork.ServiceUpdateActionPartialUpdate)
 	}
 }
 
-func convertLocationsUpdateActionToARM(action UpdateAction) *armnetwork.ServiceGatewayUpdateAddressLocationsRequestAction {
+func convertLocationsUpdateActionToARM(action UpdateAction) *armnetwork.UpdateAction {
 	switch action {
 	case PartialUpdate:
-		return ptr.To(armnetwork.ServiceGatewayUpdateAddressLocationsRequestActionPartialUpdate)
+		return ptr.To(armnetwork.UpdateActionPartialUpdate)
 	case FullUpdate:
-		return ptr.To(armnetwork.ServiceGatewayUpdateAddressLocationsRequestActionFullUpdate)
+		return ptr.To(armnetwork.UpdateActionFullUpdate)
 	default:
 		klog.Warningf("convertLocationsUpdateActionToARM: unknown UpdateAction %q, defaulting to PartialUpdate", action)
-		return ptr.To(armnetwork.ServiceGatewayUpdateAddressLocationsRequestActionPartialUpdate)
+		return ptr.To(armnetwork.UpdateActionPartialUpdate)
 	}
 }
 
@@ -424,14 +424,14 @@ func convertServiceDTOsToServiceRequests(services []ServiceDTO, config Config) (
 		}
 
 		// Set service type and NAT gateway based on service type
-		var serviceType armnetwork.ServiceGatewayServicePropertiesFormatServiceType
+		var serviceType armnetwork.ServiceType
 		var publicNatGatewayID *string
 		switch svc.ServiceType {
 		case Inbound:
-			serviceType = armnetwork.ServiceGatewayServicePropertiesFormatServiceTypeInbound
+			serviceType = armnetwork.ServiceTypeInbound
 			publicNatGatewayID = nil
 		case Outbound:
-			serviceType = armnetwork.ServiceGatewayServicePropertiesFormatServiceTypeOutbound
+			serviceType = armnetwork.ServiceTypeOutbound
 			if !svc.IsDelete && svc.PublicNatGateway.Id != "" {
 				natID := svc.PublicNatGateway.Id
 				publicNatGatewayID = &natID
@@ -468,12 +468,12 @@ func convertLocationDTOsToAddressLocations(locations []LocationDTO) []*armnetwor
 		// leaving it nil, so NRP always receives an explicit action.
 		switch loc.AddressUpdateAction {
 		case PartialUpdate:
-			armLoc.AddressUpdateAction = ptr.To(armnetwork.ServiceGatewayAddressLocationAddressUpdateActionPartialUpdate)
+			armLoc.AddressUpdateAction = ptr.To(armnetwork.AddressUpdateActionPartialUpdate)
 		case FullUpdate:
-			armLoc.AddressUpdateAction = ptr.To(armnetwork.ServiceGatewayAddressLocationAddressUpdateActionFullUpdate)
+			armLoc.AddressUpdateAction = ptr.To(armnetwork.AddressUpdateActionFullUpdate)
 		default:
 			klog.Warningf("convertLocationDTOsToAddressLocations: unknown AddressUpdateAction %v for location %q, defaulting to PartialUpdate", loc.AddressUpdateAction, loc.Location)
-			armLoc.AddressUpdateAction = ptr.To(armnetwork.ServiceGatewayAddressLocationAddressUpdateActionPartialUpdate)
+			armLoc.AddressUpdateAction = ptr.To(armnetwork.AddressUpdateActionPartialUpdate)
 		}
 
 		// Convert addresses - always initialize the slice to avoid null in JSON

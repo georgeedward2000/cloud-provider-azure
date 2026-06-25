@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 	"k8s.io/utils/ptr"
@@ -338,17 +338,17 @@ func TestDisassociateNatGatewayFromServiceGateway_Mock(t *testing.T) {
 }
 
 func TestConvertServicesUpdateActionToARM(t *testing.T) {
-	assert.Equal(t, armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate, *convertServicesUpdateActionToARM(PartialUpdate))
-	assert.Equal(t, armnetwork.ServiceGatewayUpdateServicesRequestActionFullUpdate, *convertServicesUpdateActionToARM(FullUpdate))
+	assert.Equal(t, armnetwork.ServiceUpdateActionPartialUpdate, *convertServicesUpdateActionToARM(PartialUpdate))
+	assert.Equal(t, armnetwork.ServiceUpdateActionFullUpdate, *convertServicesUpdateActionToARM(FullUpdate))
 	// Unknown defaults to PartialUpdate.
-	assert.Equal(t, armnetwork.ServiceGatewayUpdateServicesRequestActionPartialUpdate, *convertServicesUpdateActionToARM(UnknownUpdateAction))
+	assert.Equal(t, armnetwork.ServiceUpdateActionPartialUpdate, *convertServicesUpdateActionToARM(UnknownUpdateAction))
 }
 
 func TestConvertLocationsUpdateActionToARM(t *testing.T) {
-	assert.Equal(t, armnetwork.ServiceGatewayUpdateAddressLocationsRequestActionPartialUpdate, *convertLocationsUpdateActionToARM(PartialUpdate))
-	assert.Equal(t, armnetwork.ServiceGatewayUpdateAddressLocationsRequestActionFullUpdate, *convertLocationsUpdateActionToARM(FullUpdate))
+	assert.Equal(t, armnetwork.UpdateActionPartialUpdate, *convertLocationsUpdateActionToARM(PartialUpdate))
+	assert.Equal(t, armnetwork.UpdateActionFullUpdate, *convertLocationsUpdateActionToARM(FullUpdate))
 	// Unknown defaults to PartialUpdate.
-	assert.Equal(t, armnetwork.ServiceGatewayUpdateAddressLocationsRequestActionPartialUpdate, *convertLocationsUpdateActionToARM(UnknownUpdateAction))
+	assert.Equal(t, armnetwork.UpdateActionPartialUpdate, *convertLocationsUpdateActionToARM(UnknownUpdateAction))
 }
 
 func TestConvertLocationDTOsToAddressLocations(t *testing.T) {
@@ -359,7 +359,7 @@ func TestConvertLocationDTOsToAddressLocations(t *testing.T) {
 		assert.Len(t, locs, 1)
 		assert.NotNil(t, locs[0].Addresses)
 		assert.Empty(t, locs[0].Addresses)
-		assert.Equal(t, armnetwork.ServiceGatewayAddressLocationAddressUpdateActionFullUpdate, *locs[0].AddressUpdateAction)
+		assert.Equal(t, armnetwork.AddressUpdateActionFullUpdate, *locs[0].AddressUpdateAction)
 	})
 
 	t.Run("address with empty ServiceNames keeps non-nil empty Services", func(t *testing.T) {
@@ -369,7 +369,7 @@ func TestConvertLocationDTOsToAddressLocations(t *testing.T) {
 			}},
 		})
 		assert.Len(t, locs, 1)
-		assert.Equal(t, armnetwork.ServiceGatewayAddressLocationAddressUpdateActionPartialUpdate, *locs[0].AddressUpdateAction)
+		assert.Equal(t, armnetwork.AddressUpdateActionPartialUpdate, *locs[0].AddressUpdateAction)
 		assert.Len(t, locs[0].Addresses, 1)
 		assert.NotNil(t, locs[0].Addresses[0].Services)
 		assert.Empty(t, locs[0].Addresses[0].Services)
@@ -385,6 +385,6 @@ func TestConvertLocationDTOsToAddressLocations(t *testing.T) {
 		})
 		assert.Len(t, locs, 1)
 		assert.NotNil(t, locs[0].AddressUpdateAction)
-		assert.Equal(t, armnetwork.ServiceGatewayAddressLocationAddressUpdateActionPartialUpdate, *locs[0].AddressUpdateAction)
+		assert.Equal(t, armnetwork.AddressUpdateActionPartialUpdate, *locs[0].AddressUpdateAction)
 	})
 }

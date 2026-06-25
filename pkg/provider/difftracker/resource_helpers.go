@@ -21,7 +21,7 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
@@ -213,7 +213,7 @@ func buildOutboundServiceResources(serviceUID string, config *OutboundConfig, dt
 		},
 		Location: to.Ptr(dtConfig.Location),
 		Properties: &armnetwork.NatGatewayPropertiesFormat{
-			ServiceGateway: &armnetwork.ServiceGateway{
+			ServiceGateway: &armnetwork.SubResource{
 				ID: to.Ptr(dtConfig.ServiceGatewayID),
 			},
 			PublicIPAddresses: []*armnetwork.SubResource{

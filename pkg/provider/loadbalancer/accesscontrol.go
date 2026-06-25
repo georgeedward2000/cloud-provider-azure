@@ -21,7 +21,7 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
@@ -366,6 +366,28 @@ func (ac *AccessControl) CleanSecurityGroup(
 	}
 
 	logger.V(10).Info("Completed cleaning")
+	return nil
+}
+
+// RetainSecurityGroup retains the given destination IP addresses from the SecurityGroup.
+func (ac *AccessControl) RetainSecurityGroup(dstIPv4Addresses, dstIPv6Addresses []netip.Addr) error {
+	logger := ac.logger.WithName("RetainSecurityGroup").
+		WithValues("num-dst-ipv4-addresses", len(dstIPv4Addresses)).
+		WithValues("num-dst-ipv6-addresses", len(dstIPv6Addresses))
+	logger.V(10).Info("Start retaining")
+	defer logger.V(10).Info("Completed retaining")
+
+	var (
+		ipv4Prefixes     = fnutil.Map(func(addr netip.Addr) string { return addr.String() }, dstIPv4Addresses)
+		ipv6Prefixes     = fnutil.Map(func(addr netip.Addr) string { return addr.String() }, dstIPv6Addresses)
+		retainedPrefixes = append(ipv4Prefixes, ipv6Prefixes...)
+	)
+
+	if err := ac.sgHelper.RetainDestinationFromRules(retainedPrefixes); err != nil {
+		logger.Error(err, "Failed to retain destination from rules")
+		return err
+	}
+
 	return nil
 }
 

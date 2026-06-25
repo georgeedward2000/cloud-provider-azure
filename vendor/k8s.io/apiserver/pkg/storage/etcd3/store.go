@@ -186,8 +186,9 @@ func New(c *kubernetes.Client, compactor Compactor, codec runtime.Codec, newFunc
 		newListFunc:    newListFunc,
 		compactor:      compactor,
 	}
-	if utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
-		stats := newStatsCache(pathPrefix, s.getKeys)
+	// Collecting stats requires properly set resourcePrefix to call getKeys.
+	if resourcePrefix != "" && utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
+		stats := newStatsCache(pathPrefix, nil)
 		s.stats = stats
 		w.stats = stats
 	}
@@ -631,10 +632,20 @@ func getNewItemFunc(listObj runtime.Object, v reflect.Value) func() runtime.Obje
 
 func (s *store) Stats(ctx context.Context) (stats storage.Stats, err error) {
 	if s.stats != nil {
-		return s.stats.Stats(ctx)
+		stats, err := s.stats.Stats(ctx)
+		if !errors.Is(err, errStatsDisabled) {
+			return stats, err
+		}
 	}
 	startTime := time.Now()
-	count, err := s.client.Kubernetes.Count(ctx, s.pathPrefix, kubernetes.CountOptions{})
+	prefix, err := s.prepareKey(s.resourcePrefix)
+	if err != nil {
+		return storage.Stats{}, err
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	count, err := s.client.Kubernetes.Count(ctx, prefix, kubernetes.CountOptions{})
 	metrics.RecordEtcdRequest("listWithCount", s.groupResource, err, startTime)
 	if err != nil {
 		return storage.Stats{}, err
@@ -652,7 +663,14 @@ func (s *store) SetKeysFunc(keys storage.KeysFunc) {
 
 func (s *store) getKeys(ctx context.Context) ([]string, error) {
 	startTime := time.Now()
-	resp, err := s.client.KV.Get(ctx, s.pathPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	prefix, err := s.prepareKey(s.resourcePrefix)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	resp, err := s.client.KV.Get(ctx, prefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
 	metrics.RecordEtcdRequest("listOnlyKeys", s.groupResource, err, startTime)
 	if err != nil {
 		return nil, err

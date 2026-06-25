@@ -30,7 +30,7 @@ import (
 	"unicode"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1085,7 +1085,7 @@ func (az *Cloud) getServiceLoadBalancer(
 			}
 			// Service SKU is required for Service Gateway
 			defaultLB.SKU = &armnetwork.LoadBalancerSKU{
-				Name: to.Ptr(armnetwork.LoadBalancerSKUNameService),
+				Name: to.Ptr(armnetwork.LoadBalancerSKUName(consts.LoadBalancerSKUNameService)),
 			}
 		} else if az.UseStandardLoadBalancer() {
 			defaultLB.SKU = &armnetwork.LoadBalancerSKU{
@@ -1136,7 +1136,7 @@ func (az *Cloud) selectLoadBalancer(ctx context.Context, clusterName string, ser
 			// create tmp lb struct to hold metadata for the new load-balancer
 			var loadBalancerSKU *armnetwork.LoadBalancerSKUName
 			if az.ServiceGatewayEnabled {
-				loadBalancerSKU = to.Ptr(armnetwork.LoadBalancerSKUNameService)
+				loadBalancerSKU = to.Ptr(armnetwork.LoadBalancerSKUName(consts.LoadBalancerSKUNameService))
 			} else if az.UseStandardLoadBalancer() {
 				loadBalancerSKU = to.Ptr(armnetwork.LoadBalancerSKUNameStandard)
 			} else {
@@ -3378,6 +3378,7 @@ func (az *Cloud) reconcileSecurityGroup(
 		}
 	}
 
+	lbIPAddresses, _ := iputil.ParseAddresses(lbIPs)
 	var (
 		dstIPv4Addresses, dstIPv6Addresses         []netip.Addr
 		dstIpv4AddressPrefix, dstIpv6AddressPrefix []netip.Prefix
@@ -3389,7 +3390,6 @@ func (az *Cloud) reconcileSecurityGroup(
 	} else {
 		var (
 			disableFloatingIP                                = consts.IsK8sServiceDisableLoadBalancerFloatingIP(service)
-			lbIPAddresses, _                                 = iputil.ParseAddresses(lbIPs)
 			lbIPv4Addresses, lbIPv6Addresses                 = iputil.GroupAddressesByFamily(lbIPAddresses)
 			additionalIPv4Addresses, additionalIPv6Addresses = iputil.GroupAddressesByFamily(additionalIPs)
 			backendIPv4Addresses, backendIPv6Addresses       []netip.Addr
@@ -3439,6 +3439,25 @@ func (az *Cloud) reconcileSecurityGroup(
 		err := accessControl.PatchSecurityGroup(dstIPv4Addresses, dstIPv6Addresses, dstIpv4AddressPrefix, dstIpv6AddressPrefix)
 		if err != nil {
 			logger.Error(err, "Failed to patch security group")
+			return nil, err
+		}
+	}
+
+	{
+		// Retain all destinations that are managed by cloud-provider.
+		managedDestinations, err := az.listAvailableSecurityGroupDestinations(ctx)
+		if err != nil {
+			logger.Error(err, "Failed to list available security group destinations")
+			return nil, err
+		}
+
+		managedDestinations = append(managedDestinations, lbIPAddresses...)
+		managedDestinations = append(managedDestinations, additionalIPs...)
+		logger.Info("Retaining security group", "managed-destinations", managedDestinations)
+
+		ipv4Addresses, ipv6Addresses := iputil.GroupAddressesByFamily(managedDestinations)
+		if err := accessControl.RetainSecurityGroup(ipv4Addresses, ipv6Addresses); err != nil {
+			logger.Error(err, "Failed to retain security group")
 			return nil, err
 		}
 	}

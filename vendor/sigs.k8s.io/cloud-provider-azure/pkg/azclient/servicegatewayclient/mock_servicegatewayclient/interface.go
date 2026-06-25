@@ -30,7 +30,7 @@ import (
 	context "context"
 	reflect "reflect"
 
-	armnetwork "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	armnetwork "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -138,18 +138,18 @@ func (c *MockInterfaceDeleteCall) DoAndReturn(f func(context.Context, string, st
 }
 
 // Get mocks base method.
-func (m *MockInterface) Get(ctx context.Context, resourceGroupName, resourceName string, expand *string) (*armnetwork.ServiceGateway, error) {
+func (m *MockInterface) Get(ctx context.Context, resourceGroupName, resourceName string) (*armnetwork.ServiceGateway, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Get", ctx, resourceGroupName, resourceName, expand)
+	ret := m.ctrl.Call(m, "Get", ctx, resourceGroupName, resourceName)
 	ret0, _ := ret[0].(*armnetwork.ServiceGateway)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // Get indicates an expected call of Get.
-func (mr *MockInterfaceMockRecorder) Get(ctx, resourceGroupName, resourceName, expand any) *MockInterfaceGetCall {
+func (mr *MockInterfaceMockRecorder) Get(ctx, resourceGroupName, resourceName any) *MockInterfaceGetCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Get", reflect.TypeOf((*MockInterface)(nil).Get), ctx, resourceGroupName, resourceName, expand)
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Get", reflect.TypeOf((*MockInterface)(nil).Get), ctx, resourceGroupName, resourceName)
 	return &MockInterfaceGetCall{Call: call}
 }
 
@@ -165,13 +165,13 @@ func (c *MockInterfaceGetCall) Return(result *armnetwork.ServiceGateway, rerr er
 }
 
 // Do rewrite *gomock.Call.Do
-func (c *MockInterfaceGetCall) Do(f func(context.Context, string, string, *string) (*armnetwork.ServiceGateway, error)) *MockInterfaceGetCall {
+func (c *MockInterfaceGetCall) Do(f func(context.Context, string, string) (*armnetwork.ServiceGateway, error)) *MockInterfaceGetCall {
 	c.Call = c.Call.Do(f)
 	return c
 }
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
-func (c *MockInterfaceGetCall) DoAndReturn(f func(context.Context, string, string, *string) (*armnetwork.ServiceGateway, error)) *MockInterfaceGetCall {
+func (c *MockInterfaceGetCall) DoAndReturn(f func(context.Context, string, string) (*armnetwork.ServiceGateway, error)) *MockInterfaceGetCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
@@ -294,17 +294,17 @@ func (c *MockInterfaceListCall) DoAndReturn(f func(context.Context, string) ([]*
 }
 
 // UpdateAddressLocations mocks base method.
-func (m *MockInterface) UpdateAddressLocations(ctx context.Context, resourceGroupName, serviceGatewayName string, req armnetwork.ServiceGatewayUpdateAddressLocationsRequest) error {
+func (m *MockInterface) UpdateAddressLocations(ctx context.Context, resourceGroupName, serviceGatewayName string, parameters armnetwork.ServiceGatewayUpdateAddressLocationsRequest) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UpdateAddressLocations", ctx, resourceGroupName, serviceGatewayName, req)
+	ret := m.ctrl.Call(m, "UpdateAddressLocations", ctx, resourceGroupName, serviceGatewayName, parameters)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // UpdateAddressLocations indicates an expected call of UpdateAddressLocations.
-func (mr *MockInterfaceMockRecorder) UpdateAddressLocations(ctx, resourceGroupName, serviceGatewayName, req any) *MockInterfaceUpdateAddressLocationsCall {
+func (mr *MockInterfaceMockRecorder) UpdateAddressLocations(ctx, resourceGroupName, serviceGatewayName, parameters any) *MockInterfaceUpdateAddressLocationsCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateAddressLocations", reflect.TypeOf((*MockInterface)(nil).UpdateAddressLocations), ctx, resourceGroupName, serviceGatewayName, req)
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateAddressLocations", reflect.TypeOf((*MockInterface)(nil).UpdateAddressLocations), ctx, resourceGroupName, serviceGatewayName, parameters)
 	return &MockInterfaceUpdateAddressLocationsCall{Call: call}
 }
 
@@ -332,17 +332,17 @@ func (c *MockInterfaceUpdateAddressLocationsCall) DoAndReturn(f func(context.Con
 }
 
 // UpdateServices mocks base method.
-func (m *MockInterface) UpdateServices(ctx context.Context, resourceGroupName, serviceGatewayName string, req armnetwork.ServiceGatewayUpdateServicesRequest) error {
+func (m *MockInterface) UpdateServices(ctx context.Context, resourceGroupName, serviceGatewayName string, parameters armnetwork.ServiceGatewayUpdateServicesRequest) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UpdateServices", ctx, resourceGroupName, serviceGatewayName, req)
+	ret := m.ctrl.Call(m, "UpdateServices", ctx, resourceGroupName, serviceGatewayName, parameters)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // UpdateServices indicates an expected call of UpdateServices.
-func (mr *MockInterfaceMockRecorder) UpdateServices(ctx, resourceGroupName, serviceGatewayName, req any) *MockInterfaceUpdateServicesCall {
+func (mr *MockInterfaceMockRecorder) UpdateServices(ctx, resourceGroupName, serviceGatewayName, parameters any) *MockInterfaceUpdateServicesCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateServices", reflect.TypeOf((*MockInterface)(nil).UpdateServices), ctx, resourceGroupName, serviceGatewayName, req)
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateServices", reflect.TypeOf((*MockInterface)(nil).UpdateServices), ctx, resourceGroupName, serviceGatewayName, parameters)
 	return &MockInterfaceUpdateServicesCall{Call: call}
 }
 
@@ -365,6 +365,45 @@ func (c *MockInterfaceUpdateServicesCall) Do(f func(context.Context, string, str
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockInterfaceUpdateServicesCall) DoAndReturn(f func(context.Context, string, string, armnetwork.ServiceGatewayUpdateServicesRequest) error) *MockInterfaceUpdateServicesCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// UpdateTags mocks base method.
+func (m *MockInterface) UpdateTags(ctx context.Context, resourceGroupName, serviceGatewayName string, parameters armnetwork.TagsObject) (*armnetwork.ServiceGateway, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateTags", ctx, resourceGroupName, serviceGatewayName, parameters)
+	ret0, _ := ret[0].(*armnetwork.ServiceGateway)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// UpdateTags indicates an expected call of UpdateTags.
+func (mr *MockInterfaceMockRecorder) UpdateTags(ctx, resourceGroupName, serviceGatewayName, parameters any) *MockInterfaceUpdateTagsCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateTags", reflect.TypeOf((*MockInterface)(nil).UpdateTags), ctx, resourceGroupName, serviceGatewayName, parameters)
+	return &MockInterfaceUpdateTagsCall{Call: call}
+}
+
+// MockInterfaceUpdateTagsCall wrap *gomock.Call
+type MockInterfaceUpdateTagsCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockInterfaceUpdateTagsCall) Return(arg0 *armnetwork.ServiceGateway, arg1 error) *MockInterfaceUpdateTagsCall {
+	c.Call = c.Call.Return(arg0, arg1)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockInterfaceUpdateTagsCall) Do(f func(context.Context, string, string, armnetwork.TagsObject) (*armnetwork.ServiceGateway, error)) *MockInterfaceUpdateTagsCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockInterfaceUpdateTagsCall) DoAndReturn(f func(context.Context, string, string, armnetwork.TagsObject) (*armnetwork.ServiceGateway, error)) *MockInterfaceUpdateTagsCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

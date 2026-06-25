@@ -46,7 +46,6 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/routetableclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/secretclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/securitygroupclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/snapshotclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/sshpublickeyresourceclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient"
@@ -93,7 +92,6 @@ type ClientFactory interface {
 	GetRouteTableClient() routetableclient.Interface
 	GetSecretClient() secretclient.Interface
 	GetSecurityGroupClient() securitygroupclient.Interface
-	GetServiceGatewayClient() servicegatewayclient.Interface
 	GetSnapshotClient() snapshotclient.Interface
 	GetSnapshotClientForSub(subscriptionID string) (snapshotclient.Interface, error)
 	GetSSHPublicKeyResourceClient() sshpublickeyresourceclient.Interface
