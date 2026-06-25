@@ -206,6 +206,7 @@ func GetTestCloudWithContainerLoadBalancer(ctrl *gomock.Controller) (az *Cloud) 
 		SubscriptionID:             az.SubscriptionID,
 		Location:                   az.Location,
 		VNetName:                   az.VnetName,
+		VNetResourceGroup:          az.VnetResourceGroup,
 		ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
 		ServiceGatewayID:           "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ServiceNetworking/serviceGateways/" + consts.DefaultServiceGatewayResourceName,
 	}

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/stretchr/testify/assert"
+	"k8s.io/component-base/metrics/testutil"
 )
 
 // TestResourceStateToString tests the resourceStateToString function
@@ -194,4 +196,24 @@ func TestServiceConfigValidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestUpdatePendingOperationOldestAgeMetric_IncludesUpdateInProgress verifies that the oldest
+// pending-operation age gauge is emitted for the update_in_progress state, so a stuck update is
+// observable to its alert.
+func TestUpdatePendingOperationOldestAgeMetric_IncludesUpdateInProgress(t *testing.T) {
+	RegisterMetrics()
+	dt := newTestDiffTracker()
+	dt.pendingServiceOps["svc"] = &ServiceOperationState{
+		ServiceUID: "svc",
+		Config:     NewInboundServiceConfig("svc", nil),
+		State:      StateUpdateInProgress,
+		CreatedAt:  time.Now().Add(-time.Hour),
+	}
+
+	updatePendingOperationOldestAgeMetric(dt)
+
+	v, err := testutil.GetGaugeMetricValue(pendingOperationOldestAgeSeconds.WithLabelValues("update_in_progress", "inbound"))
+	assert.NoError(t, err)
+	assert.Greater(t, v, 3000.0, "the update_in_progress oldest-age series must be emitted")
 }

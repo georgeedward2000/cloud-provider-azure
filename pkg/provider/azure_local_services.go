@@ -523,9 +523,11 @@ func (az *Cloud) getPodIPToNodeIPMapFromEndpointSlice(es *discovery_v1.EndpointS
 	}
 
 	for _, ep := range es.Endpoints {
-		// Skip endpoints that are not ready (terminating, failing health checks, etc.)
-		// Treat Ready=nil as not ready - the endpoint controller hasn't confirmed readiness yet
-		if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
+		// Skip endpoints that are not ready (terminating, failing health checks, etc.).
+		// Per the EndpointSlice API contract, a nil Ready condition must be interpreted as
+		// "true" (see k8s.io/api/discovery/v1 EndpointConditions.Ready), so only an explicit
+		// Ready=false endpoint is excluded.
+		if !ptr.Deref(ep.Conditions.Ready, true) {
 			klog.V(4).Infof("Skipping endpoint with addresses %v: Ready=%v", ep.Addresses, ep.Conditions.Ready)
 			continue
 		}

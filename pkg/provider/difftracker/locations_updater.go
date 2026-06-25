@@ -2,6 +2,7 @@ package difftracker
 
 import (
 	"context"
+	"math/rand"
 	"sync/atomic"
 	"time"
 
@@ -9,11 +10,21 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
 )
 
+// Bounded backoff bounds for retrying a failed NRP location sync.
+const (
+	locationsRetryBaseDelay = 1 * time.Second
+	locationsRetryMaxDelay  = 30 * time.Second
+)
+
 // LocationsUpdater syncs location and address changes to NRP Service Gateway
 type LocationsUpdater struct {
 	diffTracker *DiffTracker
 	ctx         context.Context
 	cancel      context.CancelFunc
+
+	// failureCount is the number of consecutive failed NRP syncs, used to compute the
+	// retry backoff. Accessed only from the single Run goroutine (process), so no lock.
+	failureCount int
 }
 
 // NewLocationsUpdater creates a new LocationsUpdater
@@ -68,6 +79,17 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 			"num_locations", numLocations,
 			"num_addresses", numAddresses)
 
+		// On failure, schedule a bounded-backoff retry so a transient NRP/ARM error does
+		// not leave the computed diff unsynced until some unrelated future trigger. This
+		// runs BEFORE the in-flight trigger counter is decremented below, so initialization
+		// stays blocked (WaitForInitialSync) until a sync actually succeeds. On success,
+		// reset the backoff. The retry wait is cancellable via the updater context.
+		if isOperationSucceeded {
+			lu.failureCount = 0
+		} else {
+			lu.backoffAndRetry()
+		}
+
 		// Decrement in-flight trigger counter and check initialization completion
 		lu.diffTracker.mu.Lock()
 		shouldCheck := atomic.LoadInt32(&lu.diffTracker.isInitializing) == 1
@@ -106,7 +128,8 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	err := lu.diffTracker.updateNRPSGWAddressLocations(ctx, lu.diffTracker.config.ServiceGatewayResourceName, locationsDTO)
 	if err != nil {
 		klog.Errorf("LocationsUpdater: Failed to update locations in NRP: %v", err)
-		// Return without updating state - will retry on next trigger when new changes occur
+		// Leave isOperationSucceeded=false so the deferred backoffAndRetry re-triggers a
+		// sync; the diff is recomputed fresh on the next pass, so no state is lost.
 		return
 	}
 
@@ -131,4 +154,28 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	lu.diffTracker.CheckPendingPodDeletions(ctx)
 
 	isOperationSucceeded = true
+}
+
+// backoffAndRetry waits a bounded, jittered delay and then re-triggers the LocationsUpdater
+// so a failed NRP/ARM sync is retried instead of stalling until an unrelated future trigger.
+// It must be called from process() BEFORE the in-flight trigger counter is decremented, so
+// initialization stays blocked until a sync actually succeeds. The wait is cancellable via
+// the updater context (shutdown), and a concurrently buffered trigger simply shortcuts it.
+func (lu *LocationsUpdater) backoffAndRetry() {
+	lu.failureCount++
+	delay := locationsRetryBaseDelay << min(lu.failureCount-1, 5)
+	if delay <= 0 || delay > locationsRetryMaxDelay {
+		delay = locationsRetryMaxDelay
+	}
+	// Add up to ~20% jitter to avoid synchronized retries across controllers.
+	delay += time.Duration(rand.Int63n(int64(delay)/5 + 1))
+
+	klog.V(2).Infof("LocationsUpdater: NRP sync failed; retrying in %v (consecutive failure #%d)", delay, lu.failureCount)
+
+	select {
+	case <-lu.ctx.Done():
+		return
+	case <-time.After(delay):
+	}
+	lu.diffTracker.triggerLocationsUpdater()
 }

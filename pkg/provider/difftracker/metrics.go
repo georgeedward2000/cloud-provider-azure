@@ -362,8 +362,11 @@ func updatePendingOperationOldestAgeMetric(dt *DiffTracker) {
 	}
 
 	now := time.Now()
-	// Set values for all state/type combinations, zeroing groups with no entries
-	for state := StateNotStarted; state <= StateDeletionInProgress; state++ {
+	// Set values for all state/type combinations, zeroing groups with no entries.
+	// Bound is StateUpdateInProgress (the last state) so update_in_progress is included;
+	// StateUpdateInProgress > StateDeletionInProgress, so a tighter bound would silently
+	// drop the update_in_progress series and hide a stuck update from its alert.
+	for state := StateNotStarted; state <= StateUpdateInProgress; state++ {
 		for _, serviceType := range []string{"inbound", "outbound"} {
 			k := key{state: state, serviceType: serviceType}
 			stateStr := resourceStateToString(state)

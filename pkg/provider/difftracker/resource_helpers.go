@@ -40,6 +40,30 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 ) {
 	pipName := fmt.Sprintf("%s-pip", serviceUID)
 
+	// Resolve the Public IP version from the Service's IP families. Dual-stack is not
+	// supported for PodIP backend pools, so reject it here; the create path classifies this
+	// build error as terminal (the Service is parked until its spec changes) rather than
+	// silently provisioning a single-family LB. Default to IPv4 when unspecified.
+	pipVersion := armnetwork.IPVersionIPv4
+	if config != nil {
+		if len(config.NamedTargetPorts) > 0 {
+			return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: named targetPort(s) %v are not supported for PodIP backend pools (service %s); use a numeric targetPort", config.NamedTargetPorts, serviceUID)
+		}
+		if len(config.IPFamilies) > 1 {
+			return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: dual-stack services are not supported for PodIP backend pools (service %s, ipFamilies=%v)", serviceUID, config.IPFamilies)
+		}
+		if len(config.IPFamilies) == 1 {
+			switch {
+			case strings.EqualFold(config.IPFamilies[0], string(armnetwork.IPVersionIPv6)):
+				pipVersion = armnetwork.IPVersionIPv6
+			case strings.EqualFold(config.IPFamilies[0], string(armnetwork.IPVersionIPv4)):
+				pipVersion = armnetwork.IPVersionIPv4
+			default:
+				return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: unknown IP family %q for service %s", config.IPFamilies[0], serviceUID)
+			}
+		}
+	}
+
 	// Build Public IP
 	pip = armnetwork.PublicIPAddress{
 		Name: to.Ptr(pipName),
@@ -51,6 +75,7 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 		Location: to.Ptr(dtConfig.Location),
 		Properties: &armnetwork.PublicIPAddressPropertiesFormat{
 			PublicIPAllocationMethod: to.Ptr(armnetwork.IPAllocationMethodStatic),
+			PublicIPAddressVersion:   to.Ptr(pipVersion),
 		},
 	}
 
@@ -286,8 +311,14 @@ func ExtractInboundConfigFromService(service *v1.Service) *InboundConfig {
 				backendPort = port.TargetPort.IntVal
 			}
 		case intstr.String:
-			klog.Warningf("ExtractInboundConfigFromService: named targetPort %q is not supported for service %s/%s; falling back to port %d",
-				port.TargetPort.StrVal, service.Namespace, service.Name, port.Port)
+			// A named targetPort cannot be resolved to a concrete PodIP backend port here.
+			// Record it so buildInboundServiceResources rejects the service with a terminal
+			// error instead of silently sending traffic to the wrong backend port. The
+			// backendPort value below is a placeholder; it is never programmed because the
+			// build fails first.
+			klog.Warningf("ExtractInboundConfigFromService: named targetPort %q is not supported for service %s/%s; the service will be rejected until it uses a numeric targetPort",
+				port.TargetPort.StrVal, service.Namespace, service.Name)
+			config.NamedTargetPorts = append(config.NamedTargetPorts, port.TargetPort.StrVal)
 			backendPort = port.Port
 		}
 
@@ -295,6 +326,16 @@ func ExtractInboundConfigFromService(service *v1.Service) *InboundConfig {
 			Port:     backendPort,
 			Protocol: protocol,
 		})
+	}
+
+	// Capture the Service's IP families so the LB Public IP is created with the correct
+	// version (single-stack) and dual-stack can be rejected at build time. Stored as the
+	// raw v1.IPFamily strings ("IPv4"/"IPv6").
+	if len(service.Spec.IPFamilies) > 0 {
+		config.IPFamilies = make([]string, 0, len(service.Spec.IPFamilies))
+		for _, fam := range service.Spec.IPFamilies {
+			config.IPFamilies = append(config.IPFamilies, string(fam))
+		}
 	}
 
 	return config

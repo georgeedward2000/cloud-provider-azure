@@ -590,3 +590,46 @@ func TestNewIgnoreCaseSetFromSlice_WithItems(t *testing.T) {
 	assert.True(t, set.Has("service3")) // Case insensitive
 	assert.True(t, set.Has("SERVICE3"))
 }
+
+// TestBuildInboundServiceResources_IPFamilies verifies that the Public IP version follows the
+// Service IP family, and that dual-stack (unsupported for PodIP backend pools) is rejected.
+func TestBuildInboundServiceResources_IPFamilies(t *testing.T) {
+	build := func(fams ...v1.IPFamily) (armnetwork.PublicIPAddress, error) {
+		cfg := ExtractInboundConfigFromService(&v1.Service{Spec: v1.ServiceSpec{
+			IPFamilies: fams,
+			Ports:      []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP, TargetPort: intstr.FromInt(80)}},
+		}})
+		pip, _, _, err := buildInboundServiceResources("svc", cfg, testConfig())
+		return pip, err
+	}
+
+	pip4, err := build(v1.IPv4Protocol)
+	assert.NoError(t, err)
+	assert.Equal(t, armnetwork.IPVersionIPv4, *pip4.Properties.PublicIPAddressVersion)
+
+	pip6, err := build(v1.IPv6Protocol)
+	assert.NoError(t, err)
+	assert.Equal(t, armnetwork.IPVersionIPv6, *pip6.Properties.PublicIPAddressVersion)
+
+	_, err = build(v1.IPv4Protocol, v1.IPv6Protocol)
+	assert.Error(t, err, "dual-stack services must be rejected for PodIP backend pools")
+}
+
+// TestExtractInboundConfigFromService_NamedTargetPortRecorded verifies that a named (string)
+// targetPort is recorded so it can be rejected rather than silently mapped to the Service port.
+func TestExtractInboundConfigFromService_NamedTargetPortRecorded(t *testing.T) {
+	cfg := ExtractInboundConfigFromService(&v1.Service{Spec: v1.ServiceSpec{
+		Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP, TargetPort: intstr.FromString("http")}},
+	}})
+	assert.Equal(t, []string{"http"}, cfg.NamedTargetPorts)
+}
+
+// TestBuildInboundServiceResources_NamedTargetPortRejected verifies that a named targetPort,
+// which cannot be resolved to a PodIP backend port, is rejected at build time.
+func TestBuildInboundServiceResources_NamedTargetPortRejected(t *testing.T) {
+	cfg := ExtractInboundConfigFromService(&v1.Service{Spec: v1.ServiceSpec{
+		Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP, TargetPort: intstr.FromString("http")}},
+	}})
+	_, _, _, err := buildInboundServiceResources("svc", cfg, testConfig())
+	assert.Error(t, err, "a named targetPort must be rejected for PodIP backend pools")
+}

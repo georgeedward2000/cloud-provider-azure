@@ -407,9 +407,11 @@ func extractResourceChildName(id, segment string) string {
 func convertServiceDTOsToServiceRequests(services []ServiceDTO, config Config) ([]*armnetwork.ServiceGatewayServiceRequest, error) {
 	serviceRequests := make([]*armnetwork.ServiceGatewayServiceRequest, 0, len(services))
 
-	// Construct VNet resource ID once for all backend pools
+	// Construct VNet resource ID once for all backend pools. BYO-VNet clusters host the VNet
+	// in a separate resource group, so resolve it via VNetResourceGroupOrDefault rather than
+	// assuming the cluster ResourceGroup.
 	vnetID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/virtualNetworks/%s",
-		config.SubscriptionID, config.ResourceGroup, config.VNetName)
+		config.SubscriptionID, config.VNetResourceGroupOrDefault(), config.VNetName)
 
 	for _, svc := range services {
 		// Build backend pools with full details

@@ -517,7 +517,7 @@ func TestGetPodIPToNodeIPMapFromEndpointSlice_ReadinessFiltering(t *testing.T) {
 			expectedResult: map[string]string{},
 		},
 		{
-			name: "Ready=nil endpoints are filtered out",
+			name: "Ready=nil endpoints are included (k8s contract: nil Ready means ready)",
 			endpointSlice: &discovery_v1.EndpointSlice{
 				ObjectMeta:  metav1.ObjectMeta{Name: "eps1", Namespace: "default"},
 				AddressType: discovery_v1.AddressTypeIPv4,
@@ -533,10 +533,10 @@ func TestGetPodIPToNodeIPMapFromEndpointSlice_ReadinessFiltering(t *testing.T) {
 			nodePrivateIPs: map[string]*utilsets.IgnoreCaseSet{
 				"node1": utilsets.NewString("192.168.1.1"),
 			},
-			expectedResult: map[string]string{},
+			expectedResult: map[string]string{"10.0.0.1": "192.168.1.1"},
 		},
 		{
-			name: "Mixed readiness states - only Ready=true included",
+			name: "Mixed readiness states - Ready=true and Ready=nil included, Ready=false excluded",
 			endpointSlice: &discovery_v1.EndpointSlice{
 				ObjectMeta:  metav1.ObjectMeta{Name: "eps1", Namespace: "default"},
 				AddressType: discovery_v1.AddressTypeIPv4,
@@ -571,11 +571,12 @@ func TestGetPodIPToNodeIPMapFromEndpointSlice_ReadinessFiltering(t *testing.T) {
 			},
 			expectedResult: map[string]string{
 				"10.0.0.1": "192.168.1.1",
+				"10.0.0.3": "192.168.1.3",
 				"10.0.0.4": "192.168.1.1",
 			},
 		},
 		{
-			name: "All endpoints not ready - empty result",
+			name: "Only explicit Ready=false excluded; Ready=nil treated as ready",
 			endpointSlice: &discovery_v1.EndpointSlice{
 				ObjectMeta:  metav1.ObjectMeta{Name: "eps1", Namespace: "default"},
 				AddressType: discovery_v1.AddressTypeIPv4,
@@ -597,7 +598,7 @@ func TestGetPodIPToNodeIPMapFromEndpointSlice_ReadinessFiltering(t *testing.T) {
 				"node1": utilsets.NewString("192.168.1.1"),
 				"node2": utilsets.NewString("192.168.1.2"),
 			},
-			expectedResult: map[string]string{},
+			expectedResult: map[string]string{"10.0.0.2": "192.168.1.2"},
 		},
 		{
 			name:           "Nil EndpointSlice returns empty map",

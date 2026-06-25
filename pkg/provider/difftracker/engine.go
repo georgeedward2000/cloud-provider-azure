@@ -18,14 +18,23 @@ func (dt *DiffTracker) triggerLocationsUpdater() {
 	// so we can't acquire it again (even with recursive mutex, it's unnecessary)
 	shouldTrack := atomic.LoadInt32(&dt.isInitializing) == 1
 
-	// Only increment counter if trigger is successfully sent
+	// Increment the in-flight counter BEFORE the send so the trigger token never becomes
+	// observable to the consumer ahead of the increment. Otherwise the consumer could
+	// receive the token, run its decrement + checkInitializationComplete, and observe a
+	// transient negative counter before this increment lands — skipping completion and
+	// hanging WaitForInitialSync forever. On a coalesced (channel-full) send we undo the
+	// increment, since the already-buffered token will drive exactly one decrement.
+	if shouldTrack {
+		atomic.AddInt32(&dt.pendingUpdaterTriggers, 1)
+	}
 	select {
 	case dt.locationsUpdaterTrigger <- true:
-		if shouldTrack {
-			atomic.AddInt32(&dt.pendingUpdaterTriggers, 1)
-		}
+		// Trigger sent; the matching decrement happens in LocationsUpdater.process.
 	default:
-		// Channel full, trigger dropped - don't increment counter
+		// Channel full, trigger coalesced into the pending one - undo the increment.
+		if shouldTrack {
+			atomic.AddInt32(&dt.pendingUpdaterTriggers, -1)
+		}
 	}
 }
 
@@ -36,15 +45,22 @@ func (dt *DiffTracker) triggerServiceUpdater() {
 	// so we can't acquire it again (even with recursive mutex, it's unnecessary)
 	shouldTrack := atomic.LoadInt32(&dt.isInitializing) == 1
 
-	// Only increment counter if trigger is successfully sent
+	// Increment the in-flight counter BEFORE the send (see triggerLocationsUpdater for the
+	// full rationale): the trigger token must not become observable to the consumer ahead
+	// of the increment, or the consumer's decrement + checkInitializationComplete could see
+	// a transient negative counter, skip completion, and hang WaitForInitialSync forever.
+	// On a coalesced (channel-full) send we undo the increment.
+	if shouldTrack {
+		atomic.AddInt32(&dt.pendingUpdaterTriggers, 1)
+	}
 	select {
 	case dt.serviceUpdaterTrigger <- true:
-		if shouldTrack {
-			atomic.AddInt32(&dt.pendingUpdaterTriggers, 1)
-		}
 		klog.V(4).Infof("Engine.triggerServiceUpdater: trigger sent successfully")
 	default:
-		// Channel full, trigger dropped - don't increment counter
+		// Channel full, trigger coalesced into the pending one - undo the increment.
+		if shouldTrack {
+			atomic.AddInt32(&dt.pendingUpdaterTriggers, -1)
+		}
 		klog.Warningf("Engine.triggerServiceUpdater: trigger DROPPED - channel full!")
 	}
 }
@@ -502,12 +518,19 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		return
 	}
 
-	// PRE-EMPT: if a Delete arrived during the in-flight create/update, the state was
-	// changed to StateDeletionPending by DeleteService. Route to the deletion flow
-	// regardless of which operation we were performing or whether it succeeded —
-	// the LB/PIP may exist (success or partial-failure) and must be cleaned up.
-	if opState.State == StateDeletionPending {
-		klog.Warningf("Engine.OnServiceCreationComplete: Service %s in-flight op completed (success=%v) but deletion pending, routing to deletion", serviceUID, success)
+	// PRE-EMPT: if a Delete arrived during the in-flight create/update, DeleteService
+	// changed the state to StateDeletionPending (service still had NRP locations) or
+	// jumped straight to StateDeletionInProgress (no locations yet — the common case for
+	// a service deleted mid-create). In BOTH cases the operation that just completed is
+	// the in-flight CREATE/UPDATE (InFlightConfig != nil), NOT a delete: the LB/PIP/SGW
+	// may have been created and must be cleaned up. Route to the deletion flow instead of
+	// letting a create/update success fall through and be misread as a delete-success
+	// (which would wipe tracking without ever dispatching deleteInboundService → Azure
+	// LB/PIP/SGW leak + Service stuck Terminating). A genuine delete completion has
+	// InFlightConfig == nil and is handled by the isDeletion branch below.
+	if opState.State == StateDeletionPending ||
+		(opState.State == StateDeletionInProgress && opState.InFlightConfig != nil) {
+		klog.Warningf("Engine.OnServiceCreationComplete: Service %s in-flight create/update completed (success=%v) but deletion requested, routing to deletion", serviceUID, success)
 		opState.InFlightConfig = nil
 		// pendingServiceDeletions[serviceUID] is the source of truth and was set by DeleteService.
 		hasLocations := dt.serviceHasLocationsInNRP(serviceUID)
@@ -519,6 +542,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		} else {
 			// Locations still present; LocationsUpdater will clear them and
 			// CheckPendingServiceDeletions will transition opState.State.
+			opState.State = StateDeletionPending
 			dt.triggerLocationsUpdater()
 		}
 		return
@@ -553,16 +577,30 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			dt.checkInitializationCompleteLocked()
 		} else {
 			klog.Errorf("Engine.OnServiceCreationComplete: Service %s update failed: %v", serviceUID, err)
-			_, errCode := extractAzureErrorInfo(err)
-			recordServiceOperation("update", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
-			opState.RetryCount++
-			opState.LastAttempt = time.Now().Format(time.RFC3339)
 			opState.InFlightConfig = nil
-			recordServiceOperationRetry("update", opState.Config.IsInbound, opState.RetryCount)
 
-			klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s update will be retried (attempt %d)", serviceUID, opState.RetryCount)
-			// Stay in StateUpdateInProgress so dispatcher picks it up again.
-			dt.triggerServiceUpdater()
+			if isTerminalError(err) {
+				// Deterministic, spec-driven update failure (e.g. unsupported protocol, port
+				// out of range, dual-stack). Retrying cannot succeed, so park the service
+				// instead of looping forever. Its existing Azure resources keep the
+				// last-applied config; a later UpdateService with a changed spec clears the park.
+				recordServiceOperation("update", opState.Config.IsInbound, startTime, err, "ValidationError", opState.IsOrphan)
+				opState.CreationFailedTerminal = true
+				opState.State = StateNotStarted
+				opState.LastAttempt = time.Now().Format(time.RFC3339)
+				klog.Errorf("Engine.OnServiceCreationComplete: Service %s parked after non-retryable update error; update the Service spec to retry: %v", serviceUID, err)
+				dt.checkInitializationCompleteLocked()
+			} else {
+				_, errCode := extractAzureErrorInfo(err)
+				recordServiceOperation("update", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
+				opState.RetryCount++
+				opState.LastAttempt = time.Now().Format(time.RFC3339)
+				recordServiceOperationRetry("update", opState.Config.IsInbound, opState.RetryCount)
+
+				klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s update will be retried (attempt %d)", serviceUID, opState.RetryCount)
+				// Stay in StateUpdateInProgress so dispatcher picks it up again.
+				dt.triggerServiceUpdater()
+			}
 		}
 		return
 	}
@@ -572,6 +610,25 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		if success {
 			klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s deleted successfully", serviceUID)
 			recordServiceOperation("delete", opState.Config.IsInbound, startTime, nil, "", opState.IsOrphan)
+
+			// If pods arrived while the deletion was in flight (buffered by the
+			// StateDeletionInProgress branch of AddPod), the service must be re-created
+			// rather than fully torn down — otherwise those live pods are stranded without
+			// egress until the next informer resync. The NAT Gateway delete is now complete,
+			// so a fresh create cannot race it. Promotion of the buffered pods happens in the
+			// create-success path.
+			if len(dt.pendingPods[serviceUID]) > 0 {
+				klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s deleted but %d pod(s) arrived during deletion; re-creating", serviceUID, len(dt.pendingPods[serviceUID]))
+				opState.State = StateNotStarted
+				opState.RetryCount = 0
+				opState.InFlightConfig = nil
+				opState.LastAppliedConfig = nil
+				opState.LastAttempt = time.Now().Format(time.RFC3339)
+				delete(dt.pendingServiceDeletions, serviceUID)
+				dt.triggerServiceUpdater()
+				return
+			}
+
 			// Clean up all state
 			delete(dt.pendingServiceOps, serviceUID)
 			delete(dt.pendingEndpoints, serviceUID)
@@ -595,8 +652,9 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 	} else {
 		// Handle creation completion
 		if success {
-			// Note: StateDeletionPending after success is handled by the pre-empt block at
-			// the top of this function, so we know opState.State is still
+			// Note: a delete requested during this in-flight create (StateDeletionPending,
+			// or StateDeletionInProgress with InFlightConfig != nil) is handled by the
+			// pre-empt block at the top of this function, so we know opState.State is still
 			// StateCreationInProgress here.
 
 			klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s created successfully", serviceUID)
@@ -849,9 +907,17 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 
 	case StateDeletionInProgress:
 		// Deletion has already been dispatched (the NAT Gateway delete may be in flight),
-		// so reviving here would race the delete. Drop the add; once deletion completes and
-		// the tracking entry is cleared, a subsequent pod event re-creates the service.
-		klog.Warningf("Engine.AddPod: pod %s arrived for service %s with deletion in progress; not added (service will be recreated after deletion completes)", podKey, serviceUID)
+		// so reviving here would race the delete. Instead of dropping the pod (which would
+		// strand a live pod without egress until the next informer resync, 12-24h), buffer
+		// it: when the deletion completes, OnServiceCreationComplete re-creates the service
+		// and promotePendingPodsLocked replays the buffered pod, so the new pod gets egress.
+		klog.V(2).Infof("Engine.AddPod: pod %s arrived for service %s with deletion in progress; buffering for re-creation after deletion completes", podKey, serviceUID)
+		dt.pendingPods[serviceUID] = append(dt.pendingPods[serviceUID], PendingPodUpdate{
+			PodKey:    podKey,
+			Location:  location,
+			Address:   address,
+			Timestamp: time.Now().Format(time.RFC3339),
+		})
 
 	default:
 		klog.Errorf("Engine.AddPod: Unknown state %v for service %s", opState.State, serviceUID)
@@ -891,6 +957,23 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 	// promotion; the refcount/last-pod/live-state logic below does not apply to it.
 	if dt.cancelBufferedPodLocked(serviceUID, location, address) {
 		klog.V(2).Infof("Engine.DeletePod: cancelled buffered (pre-creation) pod for service %s (location=%s, address=%s)",
+			serviceUID, location, address)
+		// If that was the service's only pod, the NAT Gateway being created (or about to be)
+		// has no reason to exist. Tear it down so it is not leaked as an orphaned, pod-less
+		// gateway that no future event would ever delete.
+		dt.handleEmptyOutboundServiceLocked(serviceUID)
+		return result
+	}
+
+	// A pod can only be a "last pod" (triggering NAT Gateway teardown) if it is actually
+	// present in live state with this egress identity. A stale or duplicate DeletePod —
+	// e.g. the normal informer UpdateFunc(DeletionTimestamp)+DeleteFunc double-delivery, or
+	// a delete for a pod that already moved/was removed — must be a no-op. Without this
+	// guard, isLastPod is computed from the ref-counter of OTHER still-live pods, so a
+	// duplicate delete could falsely mark a still-served service for deletion (phantom
+	// last-pod finalizer + premature NAT Gateway teardown under a live pod).
+	if !dt.outboundPodExistsLocked(serviceUID, location, address) {
+		klog.V(2).Infof("Engine.DeletePod: pod for service %s (location=%s, address=%s) not present in live state (stale/duplicate delete); no-op",
 			serviceUID, location, address)
 		return result
 	}
@@ -993,6 +1076,60 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 	dt.triggerLocationsUpdater()
 
 	return result
+}
+
+// outboundPodExistsLocked reports whether a pod at the given location/address is
+// currently tracked in live K8s state with the given outbound (egress) identity.
+// It is used by DeletePod to distinguish a real removal from a stale/duplicate delete
+// (which must be a no-op). Must be called with dt.mu held.
+func (dt *DiffTracker) outboundPodExistsLocked(serviceUID, location, address string) bool {
+	node, ok := dt.K8sResources.Nodes[location]
+	if !ok {
+		return false
+	}
+	pod, ok := node.Pods[address]
+	if !ok {
+		return false
+	}
+	return pod.PublicOutboundIdentity != "" && strings.EqualFold(pod.PublicOutboundIdentity, serviceUID)
+}
+
+// handleEmptyOutboundServiceLocked tears down an outbound (NAT Gateway) service whose
+// last buffered pod was just cancelled, so a service whose only pod disappeared before
+// promotion does not leak an orphaned, pod-less NAT Gateway. It is a no-op if any buffered
+// or live pods remain. Must be called with dt.mu held.
+func (dt *DiffTracker) handleEmptyOutboundServiceLocked(serviceUID string) {
+	if len(dt.pendingPods[serviceUID]) > 0 {
+		return
+	}
+	if v, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(serviceUID)); ok && v.(int) > 0 {
+		return
+	}
+	opState, exists := dt.pendingServiceOps[serviceUID]
+	if !exists {
+		return
+	}
+	switch opState.State {
+	case StateNotStarted:
+		// Creation has not been dispatched yet (no Azure resource exists); abort it.
+		klog.V(2).Infof("Engine.DeletePod: last buffered pod for service %s removed before creation started; aborting creation", serviceUID)
+		delete(dt.pendingServiceOps, serviceUID)
+		delete(dt.pendingEndpoints, serviceUID)
+		delete(dt.pendingPods, serviceUID)
+		delete(dt.pendingServiceDeletions, serviceUID)
+		dt.checkInitializationCompleteLocked()
+	case StateCreationInProgress:
+		// The NAT Gateway create is in flight. Mark the service for deletion: when the create
+		// completes, OnServiceCreationComplete's pre-empt (StateDeletionInProgress with
+		// InFlightConfig != nil) routes it to a real delete, preventing an orphaned gateway.
+		klog.V(2).Infof("Engine.DeletePod: last buffered pod for service %s removed during creation; scheduling deletion after create completes", serviceUID)
+		opState.State = StateDeletionInProgress
+		dt.pendingServiceDeletions[serviceUID] = &PendingServiceDeletion{
+			ServiceUID: serviceUID,
+			IsInbound:  opState.Config.IsInbound,
+			Timestamp:  time.Now().Format(time.RFC3339),
+		}
+	}
 }
 
 // cancelBufferedPodLocked removes any buffered (not-yet-promoted) pod entries for a

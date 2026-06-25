@@ -126,3 +126,28 @@ func TestUpdateServiceLoadBalancerStatus_ReplacesStaleSameFamily(t *testing.T) {
 	}
 	assert.Equal(t, []string{"10.0.0.1"}, ips)
 }
+
+// TestConvertServiceDTOsToServiceRequests_VNetResourceGroup verifies that the backend-pool VNet
+// reference uses the configured VNet resource group (for BYO-VNet clusters), falling back to the
+// cluster resource group when it is unset.
+func TestConvertServiceDTOsToServiceRequests_VNetResourceGroup(t *testing.T) {
+	dtos := []ServiceDTO{{
+		Service:     "svc",
+		ServiceType: Inbound,
+		LoadBalancerBackendPools: []LoadBalancerBackendPoolDTO{
+			{Id: "/subscriptions/sub/resourceGroups/cluster-rg/providers/Microsoft.Network/loadBalancers/svc/backendAddressPools/svc"},
+		},
+	}}
+	vnetID := func(c Config) string {
+		reqs, err := convertServiceDTOsToServiceRequests(dtos, c)
+		assert.NoError(t, err)
+		return *reqs[0].Service.Properties.LoadBalancerBackendPools[0].Properties.VirtualNetwork.ID
+	}
+
+	assert.Contains(t,
+		vnetID(Config{SubscriptionID: "sub", ResourceGroup: "cluster-rg", VNetName: "vnet", VNetResourceGroup: "network-rg"}),
+		"/resourceGroups/network-rg/", "a configured VNet resource group must be honored")
+	assert.Contains(t,
+		vnetID(Config{SubscriptionID: "sub", ResourceGroup: "cluster-rg", VNetName: "vnet"}),
+		"/resourceGroups/cluster-rg/", "an unset VNet resource group must fall back to the cluster resource group")
+}

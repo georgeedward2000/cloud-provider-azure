@@ -426,7 +426,11 @@ func (s *ServiceUpdater) updateInboundService(serviceUID string, config *Inbound
 	_, lbResource, _, err := buildInboundServiceResources(serviceUID, config, s.diffTracker.config)
 	if err != nil {
 		klog.Errorf("ServiceUpdater: failed to build inbound resources for update correlationID=%s serviceUID=%s error=%v", correlationID, serviceUID, err)
-		s.onComplete(serviceUID, false, fmt.Errorf("failed to build inbound resources: %w", err))
+		// Building resources only fails on deterministic, spec-driven validation errors
+		// (unsupported protocol, port/idle-timeout out of range, dual-stack). Retrying the
+		// same spec cannot help, so mark the failure terminal; the engine parks the service
+		// (its existing Azure resources keep the last-applied config) until its spec changes.
+		s.onComplete(serviceUID, false, newTerminalError(fmt.Errorf("failed to build inbound resources: %w", err)))
 		return
 	}
 

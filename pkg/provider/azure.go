@@ -549,6 +549,7 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 				ResourceGroup:              az.ResourceGroup,
 				Location:                   az.Location,
 				VNetName:                   az.VnetName,
+				VNetResourceGroup:          az.VnetResourceGroup,
 				ServiceGatewayResourceName: sgwName,
 				ServiceGatewayID:           az.GetServiceGatewayID(),
 			}

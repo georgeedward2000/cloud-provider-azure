@@ -103,6 +103,14 @@ type InboundConfig struct {
 	IdleTimeoutMinutes *int32             // nullable
 	SessionPersistence *string            // nullable
 	HealthProbe        *HealthProbeConfig // nullable
+	// IPFamilies mirrors Service.Spec.IPFamilies ("IPv4"/"IPv6"). A single entry selects the
+	// Public IP version; more than one (dual-stack) is unsupported for PodIP backend pools and
+	// is rejected as a terminal error in buildInboundServiceResources.
+	IPFamilies []string
+	// NamedTargetPorts holds any string (named) Service targetPort values. Named target ports
+	// cannot be resolved to a PodIP backend port here, so their presence is rejected as a
+	// terminal error in buildInboundServiceResources rather than silently mis-routing traffic.
+	NamedTargetPorts []string
 }
 
 // OutboundConfig contains NAT Gateway configuration for outbound services
@@ -139,6 +147,24 @@ func (c *InboundConfig) Equals(other *InboundConfig) bool {
 	}
 	if !healthProbeEqual(c.HealthProbe, other.HealthProbe) {
 		return false
+	}
+	if !stringSlicesEqual(c.IPFamilies, other.IPFamilies) {
+		return false
+	}
+	if !stringSlicesEqual(c.NamedTargetPorts, other.NamedTargetPorts) {
+		return false
+	}
+	return true
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
 	}
 	return true
 }

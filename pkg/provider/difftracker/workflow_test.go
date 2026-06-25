@@ -230,9 +230,11 @@ func TestWorkflowWithComplexPortMapping(t *testing.T) {
 	assert.Equal(t, int32(9090), config.FrontendPorts[1].Port)
 	assert.Equal(t, int32(9090), config.BackendPorts[1].Port)
 
-	// Port 3: Should fall back to Port for named targetPort
+	// Port 3: named targetPort records a placeholder backend port (= Port) but is recorded in
+	// NamedTargetPorts so buildInboundServiceResources rejects the service with a terminal error.
 	assert.Equal(t, int32(9091), config.FrontendPorts[2].Port)
 	assert.Equal(t, int32(9091), config.BackendPorts[2].Port)
+	assert.Equal(t, []string{"metrics-port"}, config.NamedTargetPorts)
 }
 
 // TestResourceIDsAreConsistent validates resource IDs are properly formatted

@@ -18,6 +18,7 @@ package difftracker
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -770,4 +771,204 @@ func TestEngineOnServiceCreationComplete_TransientErrorRetries(t *testing.T) {
 	assert.False(t, op.CreationFailedTerminal, "transient error must not park the service")
 	assert.Greater(t, op.RetryCount, 0, "transient error should increment retry count")
 	assert.Len(t, dt.serviceUpdaterTrigger, 1, "transient error should trigger a retry")
+}
+
+// TestEngineOnServiceCreationComplete_DeleteDuringCreateRoutesToDeletion verifies that when a
+// Delete arrives while a create is in flight (and the service has no NRP locations yet, so it
+// is moved straight to StateDeletionInProgress), the create's success completion is routed to a
+// real delete rather than being mistaken for a delete success. Otherwise the freshly created
+// LB/PIP would be leaked and the Service left stuck terminating.
+func TestEngineOnServiceCreationComplete_DeleteDuringCreateRoutesToDeletion(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-delete-during-create"
+	cfg := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	inflight := cfg
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:     uid,
+		Config:         cfg,
+		InFlightConfig: &inflight,
+		State:          StateCreationInProgress,
+	}
+
+	dt.DeleteService(uid, true, false)
+	assert.Equal(t, StateDeletionInProgress, dt.pendingServiceOps[uid].State)
+
+	dt.NRPResources.LoadBalancers.Insert(uid) // the in-flight create produced an LB
+	drainTrigger(dt.serviceUpdaterTrigger)
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	opState, tracked := dt.pendingServiceOps[uid]
+	assert.True(t, tracked, "tracking must not be dropped as a phantom delete success")
+	assert.Equal(t, StateDeletionInProgress, opState.State, "the create success must be routed to a real delete")
+	assert.Len(t, dt.serviceUpdaterTrigger, 1, "a delete must be dispatched")
+}
+
+// TestEngineOnServiceCreationComplete_GenuineDeletionCleansUp verifies that a real delete
+// completion (no in-flight create/update config) still clears all tracking.
+func TestEngineOnServiceCreationComplete_GenuineDeletionCleansUp(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-genuine-delete"
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewInboundServiceConfig(uid, nil),
+		State:      StateDeletionInProgress,
+	}
+	dt.pendingServiceDeletions[uid] = &PendingServiceDeletion{ServiceUID: uid, IsInbound: true}
+
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	_, tracked := dt.pendingServiceOps[uid]
+	assert.False(t, tracked, "a genuine delete success must clear tracking")
+}
+
+// TestEngineDeletePod_StaleDuplicateRemovalIsNoOp verifies that a delete event for a pod that
+// is not in live state (a stale or duplicate informer delivery) is a no-op even when another
+// pod still holds the ref-count at one, instead of being mistaken for the last-pod removal.
+func TestEngineDeletePod_StaleDuplicateRemovalIsNoOp(t *testing.T) {
+	dt := newTestDiffTracker()
+	egressUID := "egress-stale-delete"
+	dt.NRPResources.NATGateways.Insert(egressUID)
+	dt.pendingServiceOps[egressUID] = &ServiceOperationState{
+		ServiceUID: egressUID,
+		Config:     NewOutboundServiceConfig(egressUID, nil),
+		State:      StateCreated,
+	}
+	dt.AddPod(egressUID, "ns/live", "192.168.0.1", "10.0.0.1")
+
+	res := dt.DeletePod(egressUID, "192.168.0.2", "10.0.0.2", "ns", "gone")
+	assert.False(t, res.IsLastPod, "a removal matching no live pod must not be the last-pod case")
+	_, marked := dt.pendingServiceDeletions[egressUID]
+	assert.False(t, marked, "the service must not be marked for deletion while a live pod remains")
+	assert.Equal(t, StateCreated, dt.pendingServiceOps[egressUID].State)
+
+	res = dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.1", "ns", "live")
+	assert.True(t, res.IsLastPod, "the genuine last-pod removal must still tear the service down")
+	_, marked = dt.pendingServiceDeletions[egressUID]
+	assert.True(t, marked)
+}
+
+// TestEngineAddPod_DuringDeletionInProgressBuffersForRecreate verifies that a pod arriving
+// while a NAT Gateway delete is in flight is buffered (not dropped), and that the service is
+// re-created and the pod promoted once the deletion completes, avoiding an egress outage.
+func TestEngineAddPod_DuringDeletionInProgressBuffersForRecreate(t *testing.T) {
+	dt := newTestDiffTracker()
+	egressUID := "egress-recreate"
+	dt.NRPResources.NATGateways.Insert(egressUID)
+	dt.pendingServiceOps[egressUID] = &ServiceOperationState{
+		ServiceUID: egressUID,
+		Config:     NewOutboundServiceConfig(egressUID, nil),
+		State:      StateDeletionInProgress,
+	}
+	dt.pendingServiceDeletions[egressUID] = &PendingServiceDeletion{ServiceUID: egressUID, IsInbound: false}
+
+	dt.AddPod(egressUID, "ns/pod", "192.168.0.1", "10.0.0.9")
+	assert.Len(t, dt.pendingPods[egressUID], 1, "the pod must be buffered for re-creation")
+
+	drainTrigger(dt.serviceUpdaterTrigger)
+	dt.OnServiceCreationComplete(egressUID, true, nil)
+	op, tracked := dt.pendingServiceOps[egressUID]
+	assert.True(t, tracked, "a service with a buffered pod must be re-created, not torn down")
+	assert.Equal(t, StateNotStarted, op.State)
+	assert.Len(t, dt.pendingPods[egressUID], 1)
+	assert.Len(t, dt.serviceUpdaterTrigger, 1)
+
+	op.State = StateCreationInProgress
+	dt.OnServiceCreationComplete(egressUID, true, nil)
+	v, ok := dt.outboundIdentityPodRefCount.Load(egressUID)
+	assert.True(t, ok)
+	assert.Equal(t, 1, v.(int), "the buffered pod must be promoted to live egress after re-creation")
+}
+
+// TestEngineDeletePod_LastBufferedPodSchedulesDeletion verifies that deleting the only buffered
+// (pre-creation) pod while creation is in flight schedules a deletion, so the create's success
+// is routed to a real delete and the NAT Gateway is not leaked as a pod-less orphan.
+func TestEngineDeletePod_LastBufferedPodSchedulesDeletion(t *testing.T) {
+	dt := newTestDiffTracker()
+	egressUID := "egress-buffered-last"
+
+	dt.AddPod(egressUID, "ns/pod", "192.168.0.1", "10.0.0.5")
+	dt.pendingServiceOps[egressUID].State = StateCreationInProgress
+	snap := dt.pendingServiceOps[egressUID].Config
+	dt.pendingServiceOps[egressUID].InFlightConfig = &snap
+
+	dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.5", "ns", "pod")
+	assert.Equal(t, StateDeletionInProgress, dt.pendingServiceOps[egressUID].State,
+		"cancelling the only buffered pod mid-create must schedule deletion")
+
+	drainTrigger(dt.serviceUpdaterTrigger)
+	dt.OnServiceCreationComplete(egressUID, true, nil)
+	assert.Equal(t, StateDeletionInProgress, dt.pendingServiceOps[egressUID].State)
+	assert.Len(t, dt.serviceUpdaterTrigger, 1)
+}
+
+// TestEngineDeletePod_LastBufferedPodBeforeCreateAbortsService verifies that deleting the only
+// buffered pod before creation is dispatched aborts the service entirely (no Azure resource was
+// ever created).
+func TestEngineDeletePod_LastBufferedPodBeforeCreateAbortsService(t *testing.T) {
+	dt := newTestDiffTracker()
+	egressUID := "egress-buffered-abort"
+
+	dt.AddPod(egressUID, "ns/pod", "192.168.0.1", "10.0.0.6")
+	dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.6", "ns", "pod")
+
+	_, tracked := dt.pendingServiceOps[egressUID]
+	assert.False(t, tracked, "cancelling the only buffered pod before creation must abort the service")
+}
+
+// TestEngineOnServiceCreationComplete_UpdateTerminalErrorParks verifies that a deterministic
+// (non-retryable) failure during an update parks the service rather than retrying forever.
+func TestEngineOnServiceCreationComplete_UpdateTerminalErrorParks(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-update-terminal"
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:      StateUpdateInProgress,
+	}
+
+	dt.OnServiceCreationComplete(uid, false, newTerminalError(errors.New("unsupported protocol SCTP")))
+
+	op := dt.pendingServiceOps[uid]
+	assert.True(t, op.CreationFailedTerminal, "a deterministic update failure must park the service")
+	assert.Equal(t, StateNotStarted, op.State)
+	assert.Len(t, dt.serviceUpdaterTrigger, 0, "a parked service must not trigger a retry")
+}
+
+// TestEngineInitializationCompletesWithConcurrentTriggers exercises the in-flight trigger
+// accounting that gates WaitForInitialSync: a trigger fired during initialization must be
+// counted before its token is observable, so a consumer that decrements and checks for
+// completion concurrently can never observe a transient negative count and strand init.
+func TestEngineInitializationCompletesWithConcurrentTriggers(t *testing.T) {
+	const rounds = 20000
+	for i := 0; i < rounds; i++ {
+		dt := newTestDiffTracker()
+		dt.initCompletionChecker = make(chan struct{})
+		atomic.StoreInt32(&dt.isInitializing, 1)
+
+		done := make(chan struct{})
+		go func() {
+			<-dt.locationsUpdaterTrigger
+			atomic.AddInt32(&dt.pendingUpdaterTriggers, -1)
+			dt.checkInitializationComplete()
+			close(done)
+		}()
+
+		dt.triggerLocationsUpdater()
+		<-done
+
+		select {
+		case <-dt.initCompletionChecker:
+		default:
+			t.Fatalf("round %d: initialization did not complete (in-flight counter=%d)",
+				i, atomic.LoadInt32(&dt.pendingUpdaterTriggers))
+		}
+	}
+}
+
+// drainTrigger empties a cap-1 updater trigger channel so a test can assert whether a
+// subsequent operation enqueues a fresh trigger.
+func drainTrigger(ch chan bool) {
+	for len(ch) > 0 {
+		<-ch
+	}
 }
