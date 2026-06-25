@@ -41,7 +41,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/retry"
 	servicehelper "k8s.io/cloud-provider/service/helpers"
 	"k8s.io/klog/v2"
@@ -293,7 +295,10 @@ func (dt *DiffTracker) getServiceByUID(ctx context.Context, uid string) (*v1.Ser
 			return svc.DeepCopy(), nil
 		}
 	}
-	return nil, fmt.Errorf("service with uid %s not found", uid)
+	// Genuinely not found (the list succeeded). Return a typed NotFound so callers can
+	// distinguish "service is gone" (safe to treat the operation as complete) from a
+	// transient list failure above (which must be retried).
+	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "services"}, uid)
 }
 
 // updateServiceLoadBalancerStatus updates the K8s Service status with the LoadBalancer IP address.

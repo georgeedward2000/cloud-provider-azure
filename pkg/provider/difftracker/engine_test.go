@@ -17,6 +17,7 @@ limitations under the License.
 package difftracker
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -40,6 +41,7 @@ func newTestDiffTracker() *DiffTracker {
 		pendingEndpoints:        make(map[string][]PendingEndpointUpdate),
 		pendingPods:             make(map[string][]PendingPodUpdate),
 		pendingServiceDeletions: make(map[string]*PendingServiceDeletion),
+		pendingPodDeletions:     make(map[string]*PendingPodDeletion),
 		serviceUpdaterTrigger:   make(chan bool, 1),
 		locationsUpdaterTrigger: make(chan bool, 1),
 	}
@@ -629,3 +631,143 @@ func TestEngineOnServiceCreationComplete_UpdateDriftReschedules(t *testing.T) {
 type assertErr string
 
 func (a assertErr) Error() string { return string(a) }
+
+// TestEngineUpdateEndpoints_RemovalDuringCreationIsReplayed verifies that an endpoint
+// removed while a service is still being created is not resurrected once creation
+// completes. Endpoint events are buffered during StateCreationInProgress and replayed
+// on completion; the replay must apply both additions and removals (not a union of the
+// "new" snapshots), otherwise a removed pod IP would leak into the synced state.
+func TestEngineUpdateEndpoints_RemovalDuringCreationIsReplayed(t *testing.T) {
+	dt := newTestDiffTracker()
+	serviceUID := "svc-endpoints-create"
+	node := "node1"
+	keep, removed := "10.0.0.1", "10.0.0.2"
+
+	dt.AddService(NewInboundServiceConfig(serviceUID, nil))
+
+	// While creating: both endpoints appear, then one is removed.
+	dt.UpdateEndpoints(serviceUID, nil, map[string]string{keep: node, removed: node})
+	dt.UpdateEndpoints(serviceUID, map[string]string{keep: node, removed: node}, map[string]string{keep: node})
+
+	dt.OnServiceCreationComplete(serviceUID, true, nil)
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	n, ok := dt.K8sResources.Nodes[node]
+	assert.True(t, ok, "node should exist after promotion")
+	_, hasKeep := n.Pods[keep]
+	_, hasRemoved := n.Pods[removed]
+	assert.True(t, hasKeep, "surviving endpoint should be present after creation completes")
+	assert.False(t, hasRemoved, "endpoint removed during creation must not be present after creation completes")
+}
+
+// TestEngineAddPod_DeletedDuringCreationNotResurrected verifies that an egress pod
+// deleted while its service is still being created is not resurrected when creation
+// completes. Such a pod lives only in the pending buffer (no ref-count entry yet), so
+// DeletePod must cancel the buffered add.
+func TestEngineAddPod_DeletedDuringCreationNotResurrected(t *testing.T) {
+	dt := newTestDiffTracker()
+	egressUID := "egress-create-delete"
+	location, address := "192.168.0.1", "10.0.0.5"
+
+	dt.AddPod(egressUID, "ns/pod", location, address) // buffers + creates StateNotStarted op
+	dt.DeletePod(egressUID, location, address, "ns", "pod")
+	dt.OnServiceCreationComplete(egressUID, true, nil)
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	if n, ok := dt.K8sResources.Nodes[location]; ok {
+		_, live := n.Pods[address]
+		assert.False(t, live, "pod deleted during creation must not be resurrected after promotion")
+	}
+	if v, ok := dt.outboundIdentityPodRefCount.Load(egressUID); ok {
+		assert.Equal(t, 0, v.(int), "ref-count must not drift after cancelled buffered pod")
+	}
+}
+
+// TestEngineAddPod_DuringDeletionPendingRevivesService verifies that a pod arriving
+// while an egress service is pending deletion (e.g. the sole pod changing its IP, which
+// the informer delivers as remove-then-add) revives the service instead of being dropped,
+// avoiding an outbound outage when the NAT Gateway would otherwise be deleted.
+func TestEngineAddPod_DuringDeletionPendingRevivesService(t *testing.T) {
+	dt := newTestDiffTracker()
+	egressUID := "egress-revive"
+	location := "192.168.0.1"
+	dt.NRPResources.NATGateways.Insert(egressUID)
+	dt.pendingServiceOps[egressUID] = &ServiceOperationState{
+		ServiceUID: egressUID,
+		Config:     NewOutboundServiceConfig(egressUID, nil),
+		State:      StateCreated,
+	}
+
+	dt.AddPod(egressUID, "ns/pod", location, "10.0.0.10")
+	res := dt.DeletePod(egressUID, location, "10.0.0.10", "ns", "pod")
+	assert.True(t, res.IsLastPod, "removing the sole pod should be the last-pod case")
+	assert.Equal(t, StateDeletionPending, dt.pendingServiceOps[egressUID].State)
+
+	// New pod (same pod, new IP) arrives while the service is pending deletion.
+	dt.AddPod(egressUID, "ns/pod", location, "10.0.0.11")
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	assert.Equal(t, StateCreated, dt.pendingServiceOps[egressUID].State, "service should be revived")
+	_, stillPending := dt.pendingServiceDeletions[egressUID]
+	assert.False(t, stillPending, "pending deletion should be cancelled on revive")
+	n, ok := dt.K8sResources.Nodes[location]
+	assert.True(t, ok)
+	_, live := n.Pods["10.0.0.11"]
+	assert.True(t, live, "the new pod should be live after revive (no egress outage)")
+	v, ok := dt.outboundIdentityPodRefCount.Load(egressUID)
+	assert.True(t, ok)
+	assert.Equal(t, 1, v.(int), "ref-count should be 1 after revive")
+}
+
+// TestEngineOnServiceCreationComplete_TerminalErrorParksAndRecovers verifies that a
+// deterministic (non-retryable) creation failure parks the service rather than retrying
+// forever, that a transient failure still retries, and that fixing the Service spec via
+// UpdateService clears the park and re-attempts creation.
+func TestEngineOnServiceCreationComplete_TerminalErrorParksAndRecovers(t *testing.T) {
+	dt := newTestDiffTracker()
+	serviceUID := "svc-terminal"
+	badConfig := NewInboundServiceConfig(serviceUID, &InboundConfig{
+		FrontendPorts: []PortMapping{{Port: 65535, Protocol: "TCP"}},
+	})
+	dt.pendingServiceOps[serviceUID] = &ServiceOperationState{
+		ServiceUID: serviceUID,
+		Config:     badConfig,
+		State:      StateCreationInProgress,
+	}
+
+	dt.OnServiceCreationComplete(serviceUID, false, newTerminalError(errors.New("frontend port 65535 out of range")))
+
+	op := dt.pendingServiceOps[serviceUID]
+	assert.True(t, op.CreationFailedTerminal, "deterministic error should park the service")
+	assert.Len(t, dt.serviceUpdaterTrigger, 0, "parked service must not trigger a retry")
+
+	// Fixing the spec re-attempts creation.
+	goodConfig := NewInboundServiceConfig(serviceUID, &InboundConfig{
+		FrontendPorts: []PortMapping{{Port: 80, Protocol: "TCP"}},
+	})
+	dt.UpdateService(goodConfig)
+	assert.False(t, dt.pendingServiceOps[serviceUID].CreationFailedTerminal, "spec fix should clear the park")
+	assert.Len(t, dt.serviceUpdaterTrigger, 1, "spec fix should trigger a fresh creation attempt")
+}
+
+// TestEngineOnServiceCreationComplete_TransientErrorRetries verifies a transient failure
+// is still retried (not parked).
+func TestEngineOnServiceCreationComplete_TransientErrorRetries(t *testing.T) {
+	dt := newTestDiffTracker()
+	serviceUID := "svc-transient"
+	dt.pendingServiceOps[serviceUID] = &ServiceOperationState{
+		ServiceUID: serviceUID,
+		Config:     NewInboundServiceConfig(serviceUID, nil),
+		State:      StateCreationInProgress,
+	}
+
+	dt.OnServiceCreationComplete(serviceUID, false, errors.New("throttled, try again"))
+
+	op := dt.pendingServiceOps[serviceUID]
+	assert.False(t, op.CreationFailedTerminal, "transient error must not park the service")
+	assert.Greater(t, op.RetryCount, 0, "transient error should increment retry count")
+	assert.Len(t, dt.serviceUpdaterTrigger, 1, "transient error should trigger a retry")
+}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 )
 
@@ -52,6 +53,23 @@ func NewServiceUpdater(ctx context.Context, diffTracker *DiffTracker, onComplete
 	}
 }
 
+// terminalError marks a creation failure as non-retryable (a deterministic error
+// such as an invalid Service spec). The engine parks such services instead of
+// retrying them forever.
+type terminalError struct{ err error }
+
+func (e *terminalError) Error() string { return e.err.Error() }
+func (e *terminalError) Unwrap() error { return e.err }
+
+// newTerminalError wraps err so isTerminalError reports true.
+func newTerminalError(err error) error { return &terminalError{err: err} }
+
+// isTerminalError reports whether err (or anything it wraps) is a terminalError.
+func isTerminalError(err error) bool {
+	var t *terminalError
+	return errors.As(err, &t)
+}
+
 // Run starts the ServiceUpdater main loop
 func (s *ServiceUpdater) Run() {
 	klog.Infof("ServiceUpdater: starting main loop")
@@ -92,13 +110,16 @@ func (s *ServiceUpdater) Stop() {
 //
 // The trigger send is non-blocking; the channel buffer dedupes consecutive
 // triggers, and an empty pendingServiceOps scan is a cheap O(N) no-op.
+//
+// It must route through triggerServiceUpdater (not a raw channel send) so that,
+// during initialization, the in-flight trigger counter is incremented to match the
+// decrement performed by the processBatch this requeue will cause. A raw send would
+// leave that decrement unmatched, driving pendingUpdaterTriggers negative and making
+// WaitForInitialSync hang forever. Post-init, triggerServiceUpdater does not increment,
+// so steady-state behavior is unchanged.
 func (s *ServiceUpdater) requeueIfMoreWork(uid string) {
-	select {
-	case s.diffTracker.serviceUpdaterTrigger <- true:
-		klog.V(5).Infof("ServiceUpdater: requeueIfMoreWork queued follow-up trigger after %s", uid)
-	default:
-		// Channel buffer full; an upcoming dispatch will already scan this UID.
-	}
+	klog.V(5).Infof("ServiceUpdater: requeueIfMoreWork queuing follow-up trigger after %s", uid)
+	s.diffTracker.triggerServiceUpdater()
 }
 
 // processBatch scans pendingServiceOps and spawns goroutines for services that need processing
@@ -128,6 +149,14 @@ func (s *ServiceUpdater) processBatch() {
 		// Collect work based on state
 		switch opState.State {
 		case StateNotStarted:
+			if opState.CreationFailedTerminal {
+				// Parked after a non-retryable creation error; do not re-dispatch.
+				s.mu.Lock()
+				delete(s.activeOps, serviceUID)
+				s.mu.Unlock()
+				klog.V(4).Infof("ServiceUpdater: service %s parked after non-retryable creation error, skipping", serviceUID)
+				continue
+			}
 			// Transition to CreationInProgress
 			opState.State = StateCreationInProgress
 			configSnapshot := opState.Config
@@ -302,7 +331,10 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 	pipResource, lbResource, servicesDTO, err := buildInboundServiceResources(serviceUID, config, s.diffTracker.config)
 	if err != nil {
 		klog.Errorf("ServiceUpdater: failed to build inbound resources correlationID=%s serviceUID=%s error=%v", correlationID, serviceUID, err)
-		s.onComplete(serviceUID, false, fmt.Errorf("failed to build inbound resources: %w", err))
+		// Building resources only fails on deterministic, spec-driven validation errors
+		// (unsupported protocol, port/idle-timeout out of range). Retrying cannot help, so
+		// mark the failure terminal; the engine parks the service until its spec changes.
+		s.onComplete(serviceUID, false, newTerminalError(fmt.Errorf("failed to build inbound resources: %w", err)))
 		return
 	}
 
@@ -539,18 +571,32 @@ func (s *ServiceUpdater) deleteInboundService(serviceUID string, correlationID s
 			Removals:  newIgnoreCaseSetFromSlice([]string{serviceUID}),
 		})
 
-		// Step 6: Remove finalizer from K8s service to allow deletion
+		// Step 6: Remove finalizer from K8s service to allow deletion.
+		// The finalizer is the contract that keeps the Service object alive until our
+		// Azure cleanup is done. We must NOT report overall success until the finalizer
+		// is actually removed (or the Service is already gone): reporting success clears
+		// the engine's tracking and NRP entry, after which a retried DeleteService is a
+		// no-op (see DeleteService guard) and the finalizer is stranded until the next
+		// CCM restart (recoverStuckFinalizers). All Azure steps above are idempotent
+		// (404 is treated as success), so failing here simply retries the whole delete.
 		svc, err := s.diffTracker.getServiceByUID(ctx, serviceUID)
 		if err != nil {
-			klog.V(3).Infof("ServiceUpdater: service %s not found for finalizer removal (may be already deleted): %v", serviceUID, err)
-			// Service already gone - no finalizer to remove
+			if apierrors.IsNotFound(err) {
+				// Service object is already gone - nothing left to finalize.
+				klog.V(3).Infof("ServiceUpdater: service %s already deleted, no finalizer to remove", serviceUID)
+			} else {
+				// Transient lookup failure - retry the deletion rather than assume success.
+				klog.Errorf("ServiceUpdater: failed to look up service %s for finalizer removal, will retry deletion: %v", serviceUID, err)
+				s.onComplete(serviceUID, false, fmt.Errorf("failed to look up service for finalizer removal: %w", err))
+				return
+			}
 		} else {
 			if err := s.diffTracker.removeServiceGatewayFinalizer(ctx, svc); err != nil {
-				klog.Warningf("ServiceUpdater: failed to remove finalizer from service %s: %v", serviceUID, err)
-				// Don't fail the deletion - Azure resources are cleaned up
-			} else {
-				klog.V(3).Infof("ServiceUpdater: removed finalizer from service %s", serviceUID)
+				klog.Errorf("ServiceUpdater: failed to remove finalizer from service %s, will retry deletion: %v", serviceUID, err)
+				s.onComplete(serviceUID, false, fmt.Errorf("failed to remove ServiceGateway finalizer: %w", err))
+				return
 			}
+			klog.V(3).Infof("ServiceUpdater: removed finalizer from service %s", serviceUID)
 		}
 
 		s.onComplete(serviceUID, true, nil)

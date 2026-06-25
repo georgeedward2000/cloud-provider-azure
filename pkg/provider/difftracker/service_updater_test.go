@@ -17,11 +17,26 @@ limitations under the License.
 package difftracker
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
+
+// newTestServiceUpdater builds a ServiceUpdater wired to dt for unit tests that exercise
+// dispatcher logic without Azure clients (no goroutines are spawned for the cases tested).
+func newTestServiceUpdater(dt *DiffTracker) *ServiceUpdater {
+	return &ServiceUpdater{
+		diffTracker: dt,
+		onComplete:  func(string, bool, error) {},
+		trigger:     dt.serviceUpdaterTrigger,
+		ctx:         context.Background(),
+		semaphore:   make(chan struct{}, 10),
+		activeOps:   make(map[string]bool),
+	}
+}
 
 // TestServiceUpdaterInitialization tests ServiceUpdater creation
 func TestServiceUpdaterInitialization(t *testing.T) {
@@ -114,4 +129,46 @@ func TestServiceUpdaterActiveOpsTracking(t *testing.T) {
 	// Skip: ServiceUpdater requires DiffTracker with Azure clients which needs extensive mocking
 	// Active operations tracking is verified through integration tests
 	t.Skip("ServiceUpdater requires Azure client mocking - deferred to integration tests")
+}
+
+// TestServiceUpdaterRequeueKeepsInitTriggerCounterBalanced verifies that the follow-up
+// trigger emitted by requeueIfMoreWork is accounted for in the initialization in-flight
+// counter. During initialization, every processBatch decrements pendingUpdaterTriggers,
+// so a requeue that did not increment it would drive the counter negative and prevent
+// WaitForInitialSync from ever completing.
+func TestServiceUpdaterRequeueKeepsInitTriggerCounterBalanced(t *testing.T) {
+	dt := newTestDiffTracker()
+	atomic.StoreInt32(&dt.isInitializing, 1)
+	dt.initCompletionChecker = make(chan struct{}) // production sets this in startInitialization
+	su := newTestServiceUpdater(dt)
+
+	atomic.StoreInt32(&dt.pendingUpdaterTriggers, 0)
+	su.requeueIfMoreWork("svc")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&dt.pendingUpdaterTriggers),
+		"requeue during initialization should increment the in-flight trigger counter")
+
+	<-dt.serviceUpdaterTrigger // worker consumes the follow-up trigger
+	su.processBatch()
+	assert.Equal(t, int32(0), atomic.LoadInt32(&dt.pendingUpdaterTriggers),
+		"requeue + processBatch should net zero (no counter poisoning)")
+}
+
+// TestServiceUpdaterProcessBatchSkipsParkedService verifies that a service parked after a
+// non-retryable creation error (CreationFailedTerminal) is not re-dispatched, preventing
+// an infinite retry loop on deterministic (invalid-spec) failures.
+func TestServiceUpdaterProcessBatchSkipsParkedService(t *testing.T) {
+	dt := newTestDiffTracker()
+	dt.pendingServiceOps["svc"] = &ServiceOperationState{
+		ServiceUID:             "svc",
+		Config:                 NewInboundServiceConfig("svc", nil),
+		State:                  StateNotStarted,
+		CreationFailedTerminal: true,
+	}
+	su := newTestServiceUpdater(dt)
+
+	su.processBatch()
+
+	assert.Equal(t, StateNotStarted, dt.pendingServiceOps["svc"].State,
+		"parked service must not be transitioned/dispatched")
+	assert.Len(t, dt.serviceUpdaterTrigger, 0, "parked service must not enqueue further work")
 }

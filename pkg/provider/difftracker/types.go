@@ -314,6 +314,12 @@ type ServiceOperationState struct {
 	RetryCount        int
 	LastAttempt       string // timestamp as string for serialization
 
+	// CreationFailedTerminal is set when creation failed with a non-retryable
+	// (deterministic) error such as an invalid Service spec (unsupported protocol,
+	// port out of range). The dispatcher skips such entries instead of retrying
+	// forever; a later UpdateService with a changed spec clears it.
+	CreationFailedTerminal bool
+
 	// CreatedAt is when this operation was first enqueued. Never overwritten on retry.
 	// Used by the oldest-age metric to detect stuck operations.
 	CreatedAt time.Time
@@ -332,8 +338,9 @@ type ServiceOperationState struct {
 
 // PendingEndpointUpdate represents endpoints waiting for their service to be created
 type PendingEndpointUpdate struct {
-	PodIPToNodeIP map[string]string // podIP -> nodeIP
-	Timestamp     string            // When buffered
+	OldPodIPToNodeIP map[string]string // podIP -> nodeIP removed by this event
+	PodIPToNodeIP    map[string]string // podIP -> nodeIP added/present by this event
+	Timestamp        string            // When buffered
 }
 
 // PendingServiceDeletion tracks a service waiting for locations to clear before deletion
