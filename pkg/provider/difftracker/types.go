@@ -360,6 +360,10 @@ type ServiceOperationState struct {
 	// a NAT Gateway creation (outbound services only).
 	TriggeringPodNamespace string
 	TriggeringPodName      string
+
+	// RecreateAfterDeletion is set when an UpdateService re-create arrives while the
+	// service is being deleted; the deletion-success path replays it as a fresh create.
+	RecreateAfterDeletion bool
 }
 
 // PendingEndpointUpdate represents endpoints waiting for their service to be created

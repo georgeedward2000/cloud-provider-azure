@@ -412,7 +412,7 @@ func (dt *DiffTracker) isAddressInNRPLocked(serviceUID, location, address string
 // This is called after the NAT Gateway has been successfully deleted.
 // It uses the collect-unlock-process-relock pattern to avoid holding the mutex during API calls.
 // Implements retry with exponential backoff for resilience against transient failures.
-func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID string) {
+func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID string) error {
 	// Phase 1: Collect last-pod entries to process (with lock)
 	dt.mu.Lock()
 
@@ -442,7 +442,7 @@ func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID s
 	dt.mu.Unlock()
 
 	if len(toProcess) == 0 {
-		return
+		return nil
 	}
 
 	// Phase 2: Remove finalizers without holding lock (API calls with retry)
@@ -500,4 +500,11 @@ func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID s
 		klog.V(2).Infof("RemoveLastPodFinalizers: removed finalizers from %d last-pod entries for service %s (%d failed, %d remaining)",
 			len(processed), serviceUID, len(failed), remaining)
 	}
+
+	// Surface retry-exhaustion so the caller keeps the delete op tracked and
+	// retries instead of reporting success while a pod finalizer is still set.
+	if len(failed) > 0 {
+		return fmt.Errorf("RemoveLastPodFinalizers: %d last-pod finalizer(s) for service %s could not be removed after retries: %v", len(failed), serviceUID, failed)
+	}
+	return nil
 }

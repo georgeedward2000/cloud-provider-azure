@@ -109,6 +109,10 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 
 	if len(locationData.Locations) == 0 {
 		klog.V(4).Infof("LocationsUpdater: No changes to sync")
+		// Even with no location diff, recovered pending service/pod deletions must
+		// still be processed so their finalizers are not left pending.
+		lu.diffTracker.CheckPendingServiceDeletions()
+		lu.diffTracker.CheckPendingPodDeletions(ctx)
 		isOperationSucceeded = true
 		return
 	}

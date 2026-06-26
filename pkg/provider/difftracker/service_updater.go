@@ -672,8 +672,14 @@ func (s *ServiceUpdater) deleteOutboundService(serviceUID string, correlationID 
 			Removals:  newIgnoreCaseSetFromSlice([]string{serviceUID}),
 		})
 
-		// Step 6: Remove finalizers from last-pod entries now that NAT Gateway is deleted
-		s.diffTracker.RemoveLastPodFinalizers(ctx, serviceUID)
+		// Remove finalizers from last-pod entries now that the NAT Gateway is deleted.
+		// If that exhausts retries, report the delete as failed so it retries (the NAT/PIP
+		// deletes above are idempotent on 404) instead of stranding the pod finalizer.
+		if err := s.diffTracker.RemoveLastPodFinalizers(ctx, serviceUID); err != nil {
+			klog.Warningf("ServiceUpdater: deleteOutboundService last-pod finalizer cleanup failed, will retry correlationID=%s serviceUID=%s error=%v", correlationID, serviceUID, err)
+			s.onComplete(serviceUID, false, err)
+			return
+		}
 
 		s.onComplete(serviceUID, true, nil)
 	}

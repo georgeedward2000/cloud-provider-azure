@@ -517,7 +517,7 @@ func TestEngineDeleteService_DuringUpdate(t *testing.T) {
 
 	opState := dt.pendingServiceOps[uid]
 	assert.Equal(t, StateDeletionPending, opState.State, "should transition to DeletionPending")
-	assert.Nil(t, opState.InFlightConfig, "InFlightConfig should be cleared")
+	assert.NotNil(t, opState.InFlightConfig, "InFlightConfig must be preserved so OnServiceCreationComplete pre-empt routes to deletion")
 
 	_, queued := dt.pendingServiceDeletions[uid]
 	assert.True(t, queued, "service should be queued in pendingServiceDeletions")

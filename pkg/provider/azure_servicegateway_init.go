@@ -15,9 +15,18 @@ import (
 // TODO(enechitoaia): remove after added aks-rp support
 func (az *Cloud) attachServiceGatewayToSubnet(ctx context.Context) error {
 	klog.Infof("Attaching Service Gateway %s to subnet in VNet %s", consts.DefaultServiceGatewayResourceName, az.VnetName)
-	subnetName := "aks-subnet"
+	subnetName := az.SubnetName
+	if subnetName == "" {
+		subnetName = "aks-subnet"
+	}
+	// The subnet may live in a resource group separate from the cluster RG (BYO-VNet),
+	// so prefer the configured VnetResourceGroup and fall back to ResourceGroup.
+	vnetResourceGroup := az.VnetResourceGroup
+	if vnetResourceGroup == "" {
+		vnetResourceGroup = az.ResourceGroup
+	}
 
-	subnet, err := az.NetworkClientFactory.GetSubnetClient().Get(ctx, az.ResourceGroup, az.VnetName, subnetName, nil)
+	subnet, err := az.NetworkClientFactory.GetSubnetClient().Get(ctx, vnetResourceGroup, az.VnetName, subnetName, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get subnet: %w", err)
 	}
@@ -33,7 +42,7 @@ func (az *Cloud) attachServiceGatewayToSubnet(ctx context.Context) error {
 	subnet.Properties.ServiceGateway.ID = to.Ptr(fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/serviceGateways/%s",
 		az.SubscriptionID, az.ResourceGroup, consts.DefaultServiceGatewayResourceName))
 
-	_, err = az.NetworkClientFactory.GetSubnetClient().CreateOrUpdate(ctx, az.ResourceGroup, az.VnetName, subnetName, *subnet)
+	_, err = az.NetworkClientFactory.GetSubnetClient().CreateOrUpdate(ctx, vnetResourceGroup, az.VnetName, subnetName, *subnet)
 	if err != nil {
 		return fmt.Errorf("failed to attach Service Gateway to subnet: %w", err)
 	}
