@@ -1,12 +1,23 @@
 package difftracker
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
 func TestNewIgnoreCaseSetFromSlice_Duplicates(t *testing.T) {
@@ -319,4 +330,159 @@ func createTestService(name string, ports []servicePort) *v1.Service {
 			Ports: v1Ports,
 		},
 	}
+}
+
+// newK8sStateForSeeders returns an empty K8sState suitable for the processK8s* seeders.
+func newK8sStateForSeeders(trackedServices ...string) K8sState {
+	return K8sState{
+		Services: utilsets.NewString(trackedServices...),
+		Egresses: utilsets.NewString(),
+		Nodes:    make(map[string]Node),
+	}
+}
+
+// newServiceOwnedEndpointSlice builds an EndpointSlice owned by the given Service UID;
+// extractServiceUIDFromEndpointSlice resolves ownership via the Service OwnerReference.
+func newServiceOwnedEndpointSlice(name, namespace, svcUID string, addrType discoveryv1.AddressType, endpoints []discoveryv1.Endpoint) *discoveryv1.EndpointSlice {
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{Kind: "Service", Name: name, UID: types.UID(svcUID)},
+			},
+		},
+		AddressType: addrType,
+		Endpoints:   endpoints,
+	}
+}
+
+// newEgressPod builds an egress-labeled pod for the processK8sEgresses seeder.
+func newEgressPod(name, namespace, egressVal, nodeName, podIP string, phase v1.PodPhase) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{consts.PodLabelServiceEgressGateway: egressVal},
+		},
+		Spec:   v1.PodSpec{NodeName: nodeName},
+		Status: v1.PodStatus{Phase: phase, PodIP: podIP},
+	}
+}
+
+// podIPTracked reports whether any node in K8s state tracks a pod at the given IP.
+func podIPTracked(k8s *K8sState, podIP string) bool {
+	for _, node := range k8s.Nodes {
+		if _, ok := node.Pods[podIP]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// TestProcessK8sEndpoints_SkipsNotReadyEndpoints verifies the cold-start seeder excludes
+// EndpointSlice endpoints whose Conditions.Ready==false (a nil Ready is treated as ready),
+// matching the runtime informer filter in azure_local_services.go. Without this, a CCM restart
+// would import not-ready pod IPs as LoadBalancer backends that the runtime diff can never remove.
+func TestProcessK8sEndpoints_SkipsNotReadyEndpoints(t *testing.T) {
+	const (
+		svcUID     = "svc-unready"
+		nodeName   = "node-1"
+		nodeIP     = "10.0.0.5"
+		readyIP    = "10.244.0.10"
+		notReadyIP = "10.244.0.11"
+	)
+
+	k8s := newK8sStateForSeeders(svcUID)
+	nodeNameToIPMap := map[string]string{nodeName: nodeIP}
+
+	eps := newServiceOwnedEndpointSlice("eps-1", "default", svcUID, discoveryv1.AddressTypeIPv4, []discoveryv1.Endpoint{
+		{
+			Addresses:  []string{readyIP},
+			NodeName:   ptr.To(nodeName),
+			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+		},
+		{
+			Addresses:  []string{notReadyIP},
+			NodeName:   ptr.To(nodeName),
+			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(false)},
+		},
+	})
+	kube := fake.NewSimpleClientset(eps)
+
+	_, err := processK8sEndpoints(context.Background(), kube, &k8s, nodeNameToIPMap)
+	assert.NoError(t, err)
+
+	assert.True(t, podIPTracked(&k8s, readyIP),
+		"a ready endpoint must be imported into K8s state at init")
+	assert.False(t, podIPTracked(&k8s, notReadyIP),
+		"an endpoint with Conditions.Ready==false must not be imported into K8s state at init")
+}
+
+// TestInitOutboundRefCount_NotNegativeOnServiceUIDEgressLabelCollision verifies the outbound
+// ref-counter is seeded solely from real egress pods (in New()) and never goes negative when an
+// inbound LoadBalancer service UID happens to equal a pod egress label. A negative seed would
+// trip DeletePod's `counter <= 0` guard and strand the pod (and its NAT gateway).
+func TestInitOutboundRefCount_NotNegativeOnServiceUIDEgressLabelCollision(t *testing.T) {
+	const (
+		collideID = "collide-id" // serves as BOTH the inbound svc UID and the egress label
+		nodeName  = "node-1"
+		nodeIP    = "10.0.0.21"
+		podIP     = "10.244.3.3"
+	)
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "svc-collide",
+			Namespace: "default",
+			UID:       types.UID(collideID),
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+	pod := newEgressPod("pod-collide", "default", collideID, nodeName, podIP, v1.PodRunning)
+	kube := fake.NewSimpleClientset(svc, pod)
+
+	k8s := newK8sStateForSeeders()
+	nodeNameToIPMap := map[string]string{nodeName: nodeIP}
+
+	// Build the cold-start K8s state: inbound LB service + colliding egress pod.
+	_, _, err := processK8sServices(context.Background(), kube, &k8s)
+	assert.NoError(t, err)
+	_, err = processK8sEgresses(context.Background(), kube, &k8s, nodeNameToIPMap)
+	assert.NoError(t, err)
+
+	// New() seeds outboundIdentityPodRefCount from the egress pods now present in k8s state.
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	nrp := NRPState{
+		LoadBalancers: utilsets.NewString(),
+		NATGateways:   utilsets.NewString(),
+		Locations:     map[string]NRPLocation{},
+	}
+	cfg := Config{
+		SubscriptionID:             "sub",
+		ResourceGroup:              "rg",
+		Location:                   "loc",
+		ServiceGatewayResourceName: "sgw",
+		ServiceGatewayID:           "/sgw/id",
+		VNetName:                   "vnet",
+	}
+	dt, err := New(logr.Discard(), k8s, nrp, cfg, mock_azclient.NewMockClientFactory(ctrl), kube)
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+
+	v, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(collideID))
+	assert.True(t, ok, "the colliding egress identity must be seeded")
+	assert.GreaterOrEqual(t, v.(int), 0,
+		"an inbound-UID/egress-label collision must not seed a negative outbound ref-count (got %v)", v)
+	assert.Equal(t, 1, v.(int),
+		"the outbound ref-count must equal the egress pod count (1)")
+
+	// A correct (non-negative) counter must allow DeletePod to complete.
+	res := dt.DeletePod(collideID, nodeIP, podIP, "default", "pod-collide")
+	assert.True(t, res.IsLastPod,
+		"with exactly one live egress pod the ref-count must be 1 (last pod)")
+	assert.False(t, podIPTracked(&dt.K8sResources, podIP),
+		"DeletePod must remove the egress pod")
 }
