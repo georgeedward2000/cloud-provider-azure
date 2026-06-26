@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient/mock_servicegatewayclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient/mock_subnetclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
@@ -31,6 +32,7 @@ func newProviderDiffTracker(t *testing.T, az *Cloud, kubeClient kubernetes.Inter
 	t.Helper()
 
 	dt, err := difftracker.New(
+		log.Noop(),
 		difftracker.K8sState{
 			Services: utilsets.NewString(),
 			Egresses: utilsets.NewString(),

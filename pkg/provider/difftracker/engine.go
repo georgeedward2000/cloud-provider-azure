@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"k8s.io/klog/v2"
 )
 
 // triggerLocationsUpdater sends a non-blocking trigger to the LocationsUpdater.
@@ -55,13 +54,13 @@ func (dt *DiffTracker) triggerServiceUpdater() {
 	}
 	select {
 	case dt.serviceUpdaterTrigger <- true:
-		klog.V(4).Infof("Engine.triggerServiceUpdater: trigger sent successfully")
+		dt.logger.V(5).Info("Sent service updater trigger")
 	default:
 		// Channel full, trigger coalesced into the pending one - undo the increment.
 		if shouldTrack {
 			atomic.AddInt32(&dt.pendingUpdaterTriggers, -1)
 		}
-		klog.Warningf("Engine.triggerServiceUpdater: trigger DROPPED - channel full!")
+		dt.logger.V(4).Info("Dropped service updater trigger because channel is full")
 	}
 }
 
@@ -80,24 +79,24 @@ func (dt *DiffTracker) AddService(config ServiceConfig) {
 	// Validate configuration
 	if err := config.Validate(); err != nil {
 		dt.mu.Unlock()
-		klog.Errorf("Engine.AddService: invalid config: %v", err)
+		dt.logger.V(4).Info("Could not add service with invalid config", "err", err)
 		return
 	}
 
 	serviceUID := config.UID
-	klog.V(4).Infof("Engine.AddService: serviceUID=%s, isInbound=%v", serviceUID, config.IsInbound)
+	dt.logger.V(5).Info("Added service request", "service", serviceUID, "isInbound", config.IsInbound)
 
 	// Check if service already exists in NRP
 	if config.IsInbound {
 		if dt.NRPResources.LoadBalancers.Has(serviceUID) {
 			dt.mu.Unlock()
-			klog.V(2).Infof("Engine.AddService: Load Balancer %s already exists in NRP", serviceUID)
+			dt.logger.V(5).Info("Skipped existing LoadBalancer", "service", serviceUID)
 			return
 		}
 	} else {
 		if dt.NRPResources.NATGateways.Has(serviceUID) {
 			dt.mu.Unlock()
-			klog.V(2).Infof("Engine.AddService: NAT Gateway %s already exists in NRP", serviceUID)
+			dt.logger.V(5).Info("Skipped existing NATGateway", "service", serviceUID)
 			return
 		}
 	}
@@ -107,12 +106,12 @@ func (dt *DiffTracker) AddService(config ServiceConfig) {
 	if exists {
 		state := opState.State
 		dt.mu.Unlock()
-		klog.V(2).Infof("Engine.AddService: Service %s already tracked with state %v", serviceUID, state)
+		dt.logger.V(5).Info("Skipped tracked service", "service", serviceUID, "state", state)
 		return
 	}
 
 	// Service doesn't exist - need to create it
-	klog.V(2).Infof("Engine.AddService: Service %s doesn't exist, triggering creation", serviceUID)
+	dt.logger.V(5).Info("Triggered service creation", "service", serviceUID)
 
 	// Add service operation to pending list
 	dt.pendingServiceOps[serviceUID] = &ServiceOperationState{
@@ -140,11 +139,11 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 	defer dt.mu.Unlock()
 
 	if serviceUID == "" {
-		klog.Error("Engine.UpdateEndpoints: serviceUID cannot be empty")
+		dt.logger.V(4).Info("Could not update endpoints without service")
 		return
 	}
 
-	klog.V(4).Infof("Engine.UpdateEndpoints: serviceUID=%s, old=%d, new=%d", serviceUID, len(oldPodIPToNodeIP), len(newPodIPToNodeIP))
+	dt.logger.V(5).Info("Updated endpoints request", "service", serviceUID, "oldCount", len(oldPodIPToNodeIP), "newCount", len(newPodIPToNodeIP))
 
 	// Check if service operation is tracked
 	opState, exists := dt.pendingServiceOps[serviceUID]
@@ -152,14 +151,14 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 	if !exists {
 		// Check if service exists in NRP (created outside Engine)
 		if dt.NRPResources.LoadBalancers.Has(serviceUID) {
-			klog.V(2).Infof("Engine.UpdateEndpoints: Service %s exists in NRP, updating endpoints immediately", serviceUID)
+			dt.logger.V(5).Info("Updated endpoints for existing service", "service", serviceUID)
 			errs := dt.updateK8sEndpointsLocked(UpdateK8sEndpointsInputType{
 				InboundIdentity: serviceUID,
 				OldAddresses:    oldPodIPToNodeIP,
 				NewAddresses:    newPodIPToNodeIP,
 			})
 			if len(errs) > 0 {
-				klog.Errorf("Engine.UpdateEndpoints: Failed to update endpoints for service %s: %v", serviceUID, errs)
+				dt.logger.V(4).Info("Could not update endpoints", "err", errs, "service", serviceUID)
 				// Still trigger LocationsUpdater even if some endpoints failed
 			}
 			// Trigger LocationsUpdater to sync the changes
@@ -168,7 +167,7 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 		}
 
 		// Service doesn't exist and not tracked - this shouldn't happen
-		klog.Warningf("Engine.UpdateEndpoints: Service %s not found in NRP or pending operations, buffering endpoints anyway", serviceUID)
+		dt.logger.V(4).Info("Buffered endpoints for untracked service", "service", serviceUID)
 		dt.pendingEndpoints[serviceUID] = append(dt.pendingEndpoints[serviceUID], PendingEndpointUpdate{
 			OldPodIPToNodeIP: oldPodIPToNodeIP,
 			PodIPToNodeIP:    newPodIPToNodeIP,
@@ -183,7 +182,7 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 		// Service is being created or waiting to be created - buffer the endpoints.
 		// Store both old and new so the intervening removals are replayed on promotion
 		// (otherwise an add-then-remove during creation would leak the removed IP).
-		klog.V(2).Infof("Engine.UpdateEndpoints: Service %s is being created (state=%v), buffering %d endpoints", serviceUID, opState.State, len(newPodIPToNodeIP))
+		dt.logger.V(5).Info("Buffered endpoints while service is being created", "service", serviceUID, "state", opState.State, "count", len(newPodIPToNodeIP))
 		dt.pendingEndpoints[serviceUID] = append(dt.pendingEndpoints[serviceUID], PendingEndpointUpdate{
 			OldPodIPToNodeIP: oldPodIPToNodeIP,
 			PodIPToNodeIP:    newPodIPToNodeIP,
@@ -194,14 +193,14 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 		// Service is ready - update endpoints immediately. During an in-flight LB update
 		// (port change) the LB and SGW Service entry are stable; pod-IP endpoint sync
 		// must continue without interruption.
-		klog.V(2).Infof("Engine.UpdateEndpoints: Service %s is ready (state=%v), updating endpoints immediately (old=%d, new=%d)", serviceUID, opState.State, len(oldPodIPToNodeIP), len(newPodIPToNodeIP))
+		dt.logger.V(5).Info("Updated endpoints for ready service", "service", serviceUID, "state", opState.State, "oldCount", len(oldPodIPToNodeIP), "newCount", len(newPodIPToNodeIP))
 		errs := dt.updateK8sEndpointsLocked(UpdateK8sEndpointsInputType{
 			InboundIdentity: serviceUID,
 			OldAddresses:    oldPodIPToNodeIP,
 			NewAddresses:    newPodIPToNodeIP,
 		})
 		if len(errs) > 0 {
-			klog.Errorf("Engine.UpdateEndpoints: Failed to update endpoints for service %s: %v", serviceUID, errs)
+			dt.logger.V(4).Info("Could not update endpoints", "err", errs, "service", serviceUID)
 			// Still trigger LocationsUpdater even if some endpoints failed
 		}
 		// Trigger LocationsUpdater to sync the changes
@@ -210,23 +209,23 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 	case StateDeletionPending:
 		// Service is pending deletion - process removals only. NewAddresses is dropped so
 		// a service being torn down cannot re-insert pod refs that delete-success never scrubs.
-		klog.V(2).Infof("Engine.UpdateEndpoints: Service %s is pending deletion, processing endpoint removals to clear locations (old=%d, new ignored=%d)", serviceUID, len(oldPodIPToNodeIP), len(newPodIPToNodeIP))
+		dt.logger.V(5).Info("Processed endpoint removals for service pending deletion", "service", serviceUID, "oldCount", len(oldPodIPToNodeIP), "ignoredNewCount", len(newPodIPToNodeIP))
 		errs := dt.updateK8sEndpointsLocked(UpdateK8sEndpointsInputType{
 			InboundIdentity: serviceUID,
 			OldAddresses:    oldPodIPToNodeIP,
 			NewAddresses:    nil,
 		})
 		if len(errs) > 0 {
-			klog.Errorf("Engine.UpdateEndpoints: Failed to update endpoints for service %s: %v", serviceUID, errs)
+			dt.logger.V(4).Info("Could not update endpoints", "err", errs, "service", serviceUID)
 		}
 		dt.triggerLocationsUpdater()
 
 	case StateDeletionInProgress:
 		// Service deletion already in progress - ignore endpoint updates
-		klog.V(4).Infof("Engine.UpdateEndpoints: Service %s deletion in progress, ignoring endpoint update", serviceUID)
+		dt.logger.V(5).Info("Ignored endpoint update while service deletion is in progress", "service", serviceUID)
 
 	default:
-		klog.Errorf("Engine.UpdateEndpoints: Unknown state %v for service %s", opState.State, serviceUID)
+		dt.logger.V(4).Info("Found unknown service operation state while updating endpoints", "state", opState.State, "service", serviceUID)
 	}
 }
 
@@ -252,12 +251,12 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 	}()
 
 	if err := config.Validate(); err != nil {
-		klog.Errorf("Engine.UpdateService: invalid config: %v", err)
+		dt.logger.V(4).Info("Could not update service with invalid config", "err", err)
 		return
 	}
 
 	if !config.IsInbound {
-		klog.V(2).Infof("Engine.UpdateService: outbound service updates not supported, ignoring serviceUID=%s", config.UID)
+		dt.logger.V(5).Info("Ignored unsupported outbound service update", "service", config.UID)
 		return
 	}
 
@@ -271,7 +270,7 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 	if !exists && !existsInNRP {
 		// Service is unknown to the engine - treat as a creation.
 		dt.mu.Unlock()
-		klog.V(2).Infof("Engine.UpdateService: service %s not tracked and not in NRP, delegating to AddService", serviceUID)
+		dt.logger.V(5).Info("Delegated untracked service update to add", "service", serviceUID)
 		dt.AddService(config)
 		return
 	}
@@ -279,7 +278,7 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 	if !exists && existsInNRP {
 		// LB exists in NRP (e.g., recovered after CCM restart) but no engine tracking entry.
 		// Create one in StateCreated so the update path can take over.
-		klog.V(2).Infof("Engine.UpdateService: service %s exists in NRP but not tracked, creating tracking entry for update", serviceUID)
+		dt.logger.V(5).Info("Created tracking entry for existing service update", "service", serviceUID)
 		opState = &ServiceOperationState{
 			ServiceUID:    serviceUID,
 			Config:        config,
@@ -311,10 +310,10 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 			// the spec actually changed; a resync with the same invalid spec stays parked.
 			if configsEqualForUpdate(&opState.Config, &config) {
 				dt.mu.Unlock()
-				klog.V(4).Infof("Engine.UpdateService: service %s still parked (spec unchanged after terminal failure)", serviceUID)
+				dt.logger.V(5).Info("Skipped parked service with unchanged spec", "service", serviceUID)
 				return
 			}
-			klog.V(2).Infof("Engine.UpdateService: service %s spec changed after terminal failure, re-attempting creation", serviceUID)
+			dt.logger.V(5).Info("Reattempted service creation after terminal failure and spec change", "service", serviceUID)
 			opState.Config = config
 			opState.CreationFailedTerminal = false
 			opState.RetryCount = 0
@@ -324,7 +323,7 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 			dt.triggerServiceUpdater()
 			return
 		}
-		klog.V(2).Infof("Engine.UpdateService: service %s in state=%v, overwriting desired config", serviceUID, opState.State)
+		dt.logger.V(5).Info("Overwrote desired service config", "service", serviceUID, "state", opState.State)
 		opState.Config = config
 		dt.mu.Unlock()
 
@@ -333,10 +332,10 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 			opState.LastAppliedConfig.IsInbound == config.IsInbound &&
 			opState.LastAppliedConfig.InboundConfig.Equals(config.InboundConfig) {
 			dt.mu.Unlock()
-			klog.V(4).Infof("Engine.UpdateService: service %s config unchanged, skipping update", serviceUID)
+			dt.logger.V(5).Info("Skipped unchanged service config", "service", serviceUID)
 			return
 		}
-		klog.V(2).Infof("Engine.UpdateService: service %s config changed, scheduling update", serviceUID)
+		dt.logger.V(5).Info("Scheduled service update", "service", serviceUID)
 		opState.Config = config
 		opState.State = StateUpdateInProgress
 		opState.RetryCount = 0
@@ -348,7 +347,7 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 		// An updater is (or will be) processing this service. Overwrite with the latest desired
 		// config. If equal to the in-flight config, OnServiceCreationComplete will be a no-op;
 		// if different, OnServiceCreationComplete will detect the diff and reschedule.
-		klog.V(2).Infof("Engine.UpdateService: service %s already updating, overwriting desired config", serviceUID)
+		dt.logger.V(5).Info("Overwrote desired config while service is updating", "service", serviceUID)
 		opState.Config = config
 		dt.mu.Unlock()
 
@@ -359,12 +358,12 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 		opState.Config = config
 		opState.RecreateAfterDeletion = true
 		dt.mu.Unlock()
-		klog.V(2).Infof("Engine.UpdateService: service %s is being deleted; buffering recreate intent for replay after deletion", serviceUID)
+		dt.logger.V(5).Info("Buffered service recreate intent during deletion", "service", serviceUID)
 
 	default:
 		state := opState.State
 		dt.mu.Unlock()
-		klog.Errorf("Engine.UpdateService: unknown state %v for service %s", state, serviceUID)
+		dt.logger.V(4).Info("Found unknown service operation state while updating service", "state", state, "service", serviceUID)
 	}
 }
 
@@ -383,11 +382,11 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 
 	if serviceUID == "" {
 		dt.mu.Unlock()
-		klog.Error("Engine.DeleteService: serviceUID cannot be empty")
+		dt.logger.V(4).Info("Could not delete service without service")
 		return
 	}
 
-	klog.V(4).Infof("Engine.DeleteService: serviceUID=%s, isInbound=%v, isOrphan=%v", serviceUID, isInbound, isOrphan)
+	dt.logger.V(5).Info("Deleted service request", "service", serviceUID, "isInbound", isInbound, "isOrphan", isOrphan)
 
 	// Check if service exists in pending operations
 	opState, exists := dt.pendingServiceOps[serviceUID]
@@ -404,16 +403,16 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 
 			if !existsInNRP {
 				dt.mu.Unlock()
-				klog.V(2).Infof("Engine.DeleteService: Service %s doesn't exist in NRP or pending operations, nothing to delete", serviceUID)
+				dt.logger.V(5).Info("Skipped missing service deletion", "service", serviceUID)
 				return
 			}
 		}
 
 		// Service exists in NRP (or is orphan) but not tracked - create tracking entry
 		if isOrphan {
-			klog.V(2).Infof("Engine.DeleteService: Orphaned service %s, marking for deletion", serviceUID)
+			dt.logger.V(5).Info("Marked orphaned service for deletion", "service", serviceUID)
 		} else {
-			klog.V(2).Infof("Engine.DeleteService: Service %s exists in NRP, marking for deletion", serviceUID)
+			dt.logger.V(5).Info("Marked existing service for deletion", "service", serviceUID)
 		}
 		var config ServiceConfig
 		if isInbound {
@@ -435,33 +434,33 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 		// Service is tracked - update state based on current state
 		switch opState.State {
 		case StateNotStarted:
-			klog.V(2).Infof("Engine.DeleteService: Service %s not yet started, marking for deletion", serviceUID)
+			dt.logger.V(5).Info("Marked not-started service for deletion", "service", serviceUID)
 			opState.State = StateDeletionPending
 
 		case StateCreationInProgress:
-			klog.Warningf("Engine.DeleteService: Service %s is being created but deletion requested, marking for deletion", serviceUID)
+			dt.logger.V(5).Info("Marked service for deletion while creation is in progress", "service", serviceUID)
 			opState.State = StateDeletionPending
 
 		case StateCreated:
-			klog.V(2).Infof("Engine.DeleteService: Service %s is ready, marking for deletion", serviceUID)
+			dt.logger.V(5).Info("Marked ready service for deletion", "service", serviceUID)
 			opState.State = StateDeletionPending
 
 		case StateUpdateInProgress:
 			// An update is in flight; deletion wins. Preserve InFlightConfig so the
 			// OnServiceCreationComplete pre-empt can recognize the in-flight update's
 			// completion and route it to deletion (it clears InFlightConfig itself).
-			klog.Warningf("Engine.DeleteService: Service %s is being updated, marking for deletion", serviceUID)
+			dt.logger.V(5).Info("Marked service for deletion while update is in progress", "service", serviceUID)
 			opState.State = StateDeletionPending
 
 		case StateDeletionPending, StateDeletionInProgress:
 			dt.mu.Unlock()
-			klog.V(2).Infof("Engine.DeleteService: Service %s is already being deleted", serviceUID)
+			dt.logger.V(5).Info("Skipped service already being deleted", "service", serviceUID)
 			return
 
 		default:
 			state := opState.State
 			dt.mu.Unlock()
-			klog.Errorf("Engine.DeleteService: Unknown state %v for service %s", state, serviceUID)
+			dt.logger.V(4).Info("Found unknown service operation state while deleting service", "state", state, "service", serviceUID)
 			return
 		}
 	}
@@ -486,7 +485,7 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 	hasLocations := dt.serviceHasLocationsInNRP(serviceUID)
 	shouldTriggerServiceUpdater := false
 	if !hasLocations {
-		klog.V(2).Infof("Engine.DeleteService: Service %s has no locations, ready for immediate deletion", serviceUID)
+		dt.logger.V(5).Info("Marked service ready for immediate deletion", "service", serviceUID)
 		// Get the state pointer (may be newly created or from earlier in this function)
 		if opState, exists := dt.pendingServiceOps[serviceUID]; exists {
 			opState.State = StateDeletionInProgress
@@ -521,7 +520,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 
 	opState, exists := dt.pendingServiceOps[serviceUID]
 	if !exists {
-		klog.Warningf("Engine.OnServiceCreationComplete: Service %s not found in pending operations", serviceUID)
+		dt.logger.V(4).Info("Could not complete service operation because pending operation was not found", "service", serviceUID)
 		return
 	}
 
@@ -544,7 +543,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 	// InFlightConfig == nil and is handled by the isDeletion branch below.
 	if opState.State == StateDeletionPending ||
 		(opState.State == StateDeletionInProgress && opState.InFlightConfig != nil) {
-		klog.Warningf("Engine.OnServiceCreationComplete: Service %s in-flight create/update completed (success=%v) but deletion requested, routing to deletion", serviceUID, success)
+		dt.logger.V(4).Info("Routed completed in-flight service operation to deletion", "service", serviceUID, "success", success)
 		opState.InFlightConfig = nil
 		// pendingServiceDeletions[serviceUID] is the source of truth and was set by DeleteService.
 		hasLocations := dt.serviceHasLocationsInNRP(serviceUID)
@@ -568,7 +567,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 
 	if isUpdate {
 		if success {
-			klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s updated successfully", serviceUID)
+			dt.logger.V(2).Info("Updated service", "service", serviceUID)
 			recordServiceOperation("update", opState.Config.IsInbound, startTime, nil, "", opState.IsOrphan)
 			// Persist the config that was actually applied (snapshot at dispatch time).
 			if opState.InFlightConfig != nil {
@@ -579,7 +578,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 
 			// If the desired Config drifted while the update was in flight, reschedule.
 			if opState.InFlightConfig != nil && !configsEqualForUpdate(opState.InFlightConfig, &opState.Config) {
-				klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s desired config drifted during update, rescheduling", serviceUID)
+				dt.logger.V(5).Info("Rescheduled service update after desired config drifted", "service", serviceUID)
 				opState.State = StateUpdateInProgress
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
 				opState.InFlightConfig = nil
@@ -590,7 +589,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			}
 			dt.checkInitializationCompleteLocked()
 		} else {
-			klog.Errorf("Engine.OnServiceCreationComplete: Service %s update failed: %v", serviceUID, err)
+			dt.logger.V(4).Info("Could not update service", "err", err, "service", serviceUID)
 			opState.InFlightConfig = nil
 
 			if isTerminalError(err) {
@@ -602,7 +601,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 				opState.CreationFailedTerminal = true
 				opState.State = StateNotStarted
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
-				klog.Errorf("Engine.OnServiceCreationComplete: Service %s parked after non-retryable update error; update the Service spec to retry: %v", serviceUID, err)
+				dt.logger.V(4).Info("Parked service after non-retryable update error", "err", err, "service", serviceUID)
 				dt.checkInitializationCompleteLocked()
 			} else {
 				_, errCode := extractAzureErrorInfo(err)
@@ -611,7 +610,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
 				recordServiceOperationRetry("update", opState.Config.IsInbound, opState.RetryCount)
 
-				klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s update will be retried (attempt %d)", serviceUID, opState.RetryCount)
+				dt.logger.V(4).Info("Scheduled service update retry", "service", serviceUID, "attempt", opState.RetryCount)
 				// Stay in StateUpdateInProgress so dispatcher picks it up again.
 				dt.triggerServiceUpdater()
 			}
@@ -622,7 +621,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 	if isDeletion {
 		// Handle deletion completion
 		if success {
-			klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s deleted successfully", serviceUID)
+			dt.logger.V(2).Info("Deleted service", "service", serviceUID)
 			recordServiceOperation("delete", opState.Config.IsInbound, startTime, nil, "", opState.IsOrphan)
 
 			// If pods arrived while the deletion was in flight (buffered by the
@@ -632,7 +631,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			// delete is now complete, so a fresh create cannot race it; buffered pods are
 			// promoted in the create-success path.
 			if opState.RecreateAfterDeletion || len(dt.pendingPods[serviceUID]) > 0 {
-				klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s deleted but a recreate is pending (recreateAfterDeletion=%v, bufferedPods=%d); re-creating", serviceUID, opState.RecreateAfterDeletion, len(dt.pendingPods[serviceUID]))
+				dt.logger.V(5).Info("Recreated service after deletion", "service", serviceUID, "recreateAfterDeletion", opState.RecreateAfterDeletion, "bufferedPods", len(dt.pendingPods[serviceUID]))
 				opState.State = StateNotStarted
 				opState.RetryCount = 0
 				opState.InFlightConfig = nil
@@ -653,14 +652,14 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			// Check if initialization is complete after service deletion
 			dt.checkInitializationCompleteLocked()
 		} else {
-			klog.Errorf("Engine.OnServiceCreationComplete: Service %s deletion failed: %v", serviceUID, err)
+			dt.logger.V(4).Info("Could not delete service", "err", err, "service", serviceUID)
 			_, errCode := extractAzureErrorInfo(err)
 			recordServiceOperation("delete", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
 			opState.RetryCount++
 			opState.LastAttempt = time.Now().Format(time.RFC3339)
 			recordServiceOperationRetry("delete", opState.Config.IsInbound, opState.RetryCount)
 
-			klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s deletion will be retried (attempt %d)", serviceUID, opState.RetryCount)
+			dt.logger.V(4).Info("Scheduled service deletion retry", "service", serviceUID, "attempt", opState.RetryCount)
 			// Trigger ServiceUpdater for retry
 			dt.triggerServiceUpdater()
 		}
@@ -672,7 +671,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			// pre-empt block at the top of this function, so we know opState.State is still
 			// StateCreationInProgress here.
 
-			klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s created successfully", serviceUID)
+			dt.logger.V(2).Info("Created service", "service", serviceUID)
 			recordServiceOperation("create", opState.Config.IsInbound, startTime, nil, "", opState.IsOrphan)
 			opState.State = StateCreated
 			opState.RetryCount = 0
@@ -687,7 +686,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 
 			// If a config update arrived while creation was in flight, schedule an update now.
 			if opState.InFlightConfig != nil && !configsEqualForUpdate(opState.InFlightConfig, &opState.Config) {
-				klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s desired config drifted during creation, scheduling update", serviceUID)
+				dt.logger.V(5).Info("Scheduled service update after desired config drifted during creation", "service", serviceUID)
 				opState.State = StateUpdateInProgress
 				dt.triggerServiceUpdater()
 			}
@@ -704,7 +703,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			dt.checkInitializationCompleteLocked()
 
 		} else {
-			klog.Errorf("Engine.OnServiceCreationComplete: Service %s creation failed: %v", serviceUID, err)
+			dt.logger.V(4).Info("Could not create service", "err", err, "service", serviceUID)
 
 			if isTerminalError(err) {
 				// Deterministic, spec-driven failure (e.g. unsupported protocol, port out
@@ -714,7 +713,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 				opState.CreationFailedTerminal = true
 				opState.State = StateNotStarted
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
-				klog.Errorf("Engine.OnServiceCreationComplete: Service %s parked after non-retryable error; update the Service spec to retry: %v", serviceUID, err)
+				dt.logger.V(4).Info("Parked service after non-retryable creation error", "err", err, "service", serviceUID)
 				dt.checkInitializationCompleteLocked()
 			} else {
 				_, errCode := extractAzureErrorInfo(err)
@@ -723,7 +722,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
 				recordServiceOperationRetry("create", opState.Config.IsInbound, opState.RetryCount)
 
-				klog.V(2).Infof("Engine.OnServiceCreationComplete: Service %s creation will be retried (attempt %d)", serviceUID, opState.RetryCount)
+				dt.logger.V(4).Info("Scheduled service creation retry", "service", serviceUID, "attempt", opState.RetryCount)
 				// Reset to NotStarted for retry
 				opState.State = StateNotStarted
 				// Trigger ServiceUpdater for retry
@@ -741,8 +740,7 @@ func (dt *DiffTracker) promotePendingEndpointsLocked(serviceUID string) {
 		return
 	}
 
-	klog.V(2).Infof("Engine.promotePendingEndpointsLocked: Promoting %d pending endpoint updates for service %s",
-		len(pendingEndpoints), serviceUID)
+	dt.logger.V(5).Info("Promoted pending endpoint updates", "count", len(pendingEndpoints), "service", serviceUID)
 
 	// Replay each buffered update in arrival order, applying both its removals and
 	// additions, so the live state mirrors what a sequence of live events would have
@@ -761,8 +759,7 @@ func (dt *DiffTracker) promotePendingEndpointsLocked(serviceUID string) {
 		}
 	}
 	if len(firstErr) > 0 {
-		klog.Errorf("Engine.promotePendingEndpointsLocked: Failed to update endpoints for service %s: %v",
-			serviceUID, firstErr)
+		dt.logger.V(4).Info("Could not update promoted endpoints", "err", firstErr, "service", serviceUID)
 		// Continue to clear buffer and trigger LocationsUpdater for partial success
 	}
 
@@ -779,12 +776,11 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 	defer dt.mu.Unlock()
 
 	if serviceUID == "" || location == "" || address == "" {
-		klog.Errorf("Engine.AddPod: invalid parameters - serviceUID=%s, location=%s, address=%s", serviceUID, location, address)
+		dt.logger.V(4).Info("Could not add pod with invalid parameters", "service", serviceUID, "location", location, "address", address)
 		return
 	}
 
-	klog.V(4).Infof("Engine.AddPod: serviceUID=%s, podKey=%s, location=%s, address=%s",
-		serviceUID, podKey, location, address)
+	dt.logger.V(5).Info("Added pod request", "service", serviceUID, "pod", podKey, "location", location, "address", address)
 
 	// Check if service operation is tracked
 	opState, exists := dt.pendingServiceOps[serviceUID]
@@ -793,7 +789,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 
 		// Check if service exists in NRP first (handles restart scenario and is more authoritative)
 		if dt.NRPResources.NATGateways.Has(serviceUID) {
-			klog.V(2).Infof("Engine.AddPod: Service %s exists in NRP, adding pod %s immediately", serviceUID, podKey)
+			dt.logger.V(5).Info("Added pod for existing service", "service", serviceUID, "pod", podKey)
 			err := dt.updateK8sPodLocked(UpdatePodInputType{
 				PodOperation:           Add,
 				PublicOutboundIdentity: serviceUID,
@@ -801,7 +797,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 				Address:                address,
 			})
 			if err != nil {
-				klog.Errorf("Engine.AddPod: Failed to add pod %s: %v", podKey, err)
+				dt.logger.V(4).Info("Could not add pod", "err", err, "pod", podKey)
 				// Still trigger LocationsUpdater even if pod add failed
 			}
 			// Trigger LocationsUpdater to sync the change
@@ -809,7 +805,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 			return
 		}
 		// Service doesn't exist - need to create it first
-		klog.V(2).Infof("Engine.AddPod: Service %s doesn't exist, creating it and buffering pod %s", serviceUID, podKey)
+		dt.logger.V(5).Info("Buffered pod and triggered service creation", "service", serviceUID, "pod", podKey)
 
 		// Create service operation
 		podParts := strings.SplitN(podKey, "/", 2)
@@ -847,7 +843,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 	switch opState.State {
 	case StateNotStarted, StateCreationInProgress:
 		// Service is being created or waiting to be created - buffer the pod
-		klog.V(2).Infof("Engine.AddPod: Service %s is being created (state=%v), buffering pod %s", serviceUID, opState.State, podKey)
+		dt.logger.V(5).Info("Buffered pod while service is being created", "service", serviceUID, "state", opState.State, "pod", podKey)
 		dt.pendingPods[serviceUID] = append(dt.pendingPods[serviceUID], PendingPodUpdate{
 			PodKey:    podKey,
 			Location:  location,
@@ -857,7 +853,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 
 	case StateCreated:
 		// Service is ready - add pod immediately
-		klog.V(2).Infof("Engine.AddPod: Service %s is ready, adding pod %s immediately", serviceUID, podKey)
+		dt.logger.V(5).Info("Added pod for ready service", "service", serviceUID, "pod", podKey)
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
 			PodOperation:           Add,
 			PublicOutboundIdentity: serviceUID,
@@ -865,7 +861,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 			Address:                address,
 		})
 		if err != nil {
-			klog.Errorf("Engine.AddPod: Failed to add pod %s: %v", podKey, err)
+			dt.logger.V(4).Info("Could not add pod", "err", err, "pod", podKey)
 			// Still trigger LocationsUpdater even if pod add failed
 		}
 
@@ -877,7 +873,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 		// (see updateInboundService dispatch); they should not produce a sustained
 		// StateUpdateInProgress for NAT Gateway services. Treat the same as StateCreated
 		// for safety in case the outbound update path is implemented later.
-		klog.V(2).Infof("Engine.AddPod: Service %s is updating, adding pod %s immediately", serviceUID, podKey)
+		dt.logger.V(5).Info("Added pod while service is updating", "service", serviceUID, "pod", podKey)
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
 			PodOperation:           Add,
 			PublicOutboundIdentity: serviceUID,
@@ -885,7 +881,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 			Address:                address,
 		})
 		if err != nil {
-			klog.Errorf("Engine.AddPod: Failed to add pod %s during update: %v", podKey, err)
+			dt.logger.V(4).Info("Could not add pod during update", "err", err, "pod", podKey)
 		}
 		dt.triggerLocationsUpdater()
 
@@ -895,7 +891,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 		// deletion has not been dispatched yet (that happens in StateDeletionInProgress).
 		// Dropping this add would leave the new pod without egress once the NAT Gateway is
 		// deleted, so cancel the pending deletion and revive the service instead.
-		klog.V(2).Infof("Engine.AddPod: pod %s arrived for service %s pending deletion; cancelling deletion and reviving", podKey, serviceUID)
+		dt.logger.V(5).Info("Revived service pending deletion for pod", "pod", podKey, "service", serviceUID)
 		opState.State = StateCreated
 		delete(dt.pendingServiceDeletions, serviceUID)
 		// The pod being re-added is alive: drop its own last-pod deletion record so its
@@ -916,7 +912,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 			Location:               location,
 			Address:                address,
 		}); err != nil {
-			klog.Errorf("Engine.AddPod: failed to revive pod %s for service %s: %v", podKey, serviceUID, err)
+			dt.logger.V(4).Info("Could not revive pod for service", "err", err, "pod", podKey, "service", serviceUID)
 		}
 		dt.triggerLocationsUpdater()
 
@@ -926,7 +922,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 		// strand a live pod without egress until the next informer resync, 12-24h), buffer
 		// it: when the deletion completes, OnServiceCreationComplete re-creates the service
 		// and promotePendingPodsLocked replays the buffered pod, so the new pod gets egress.
-		klog.V(2).Infof("Engine.AddPod: pod %s arrived for service %s with deletion in progress; buffering for re-creation after deletion completes", podKey, serviceUID)
+		dt.logger.V(5).Info("Buffered pod while service deletion is in progress", "pod", podKey, "service", serviceUID)
 		dt.pendingPods[serviceUID] = append(dt.pendingPods[serviceUID], PendingPodUpdate{
 			PodKey:    podKey,
 			Location:  location,
@@ -935,7 +931,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 		})
 
 	default:
-		klog.Errorf("Engine.AddPod: Unknown state %v for service %s", opState.State, serviceUID)
+		dt.logger.V(4).Info("Found unknown service operation state while adding pod", "state", opState.State, "service", serviceUID)
 	}
 }
 
@@ -960,19 +956,17 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 	result := DeletePodResult{IsLastPod: false}
 
 	if serviceUID == "" || location == "" || address == "" {
-		klog.Errorf("Engine.DeletePod: invalid parameters - serviceUID=%s, location=%s, address=%s", serviceUID, location, address)
+		dt.logger.V(4).Info("Could not delete pod with invalid parameters", "service", serviceUID, "location", location, "address", address)
 		return result
 	}
 
-	klog.V(4).Infof("Engine.DeletePod: serviceUID=%s, location=%s, address=%s, namespace=%s, name=%s",
-		serviceUID, location, address, namespace, name)
+	dt.logger.V(5).Info("Deleted pod request", "service", serviceUID, "location", location, "address", address, "namespace", namespace, "name", name)
 
 	// If the pod is still buffered for an in-flight service creation, it never reached
 	// live state or the ref-counter. Cancel the buffered add so it is not resurrected on
 	// promotion; the refcount/last-pod/live-state logic below does not apply to it.
 	if dt.cancelBufferedPodLocked(serviceUID, location, address) {
-		klog.V(2).Infof("Engine.DeletePod: cancelled buffered (pre-creation) pod for service %s (location=%s, address=%s)",
-			serviceUID, location, address)
+		dt.logger.V(5).Info("Cancelled buffered pod before service creation", "service", serviceUID, "location", location, "address", address)
 		// If that was the service's only pod, the NAT Gateway being created (or about to be)
 		// has no reason to exist. Tear it down so it is not leaked as an orphaned, pod-less
 		// gateway that no future event would ever delete.
@@ -988,15 +982,14 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 	// duplicate delete could falsely mark a still-served service for deletion (phantom
 	// last-pod finalizer + premature NAT Gateway teardown under a live pod).
 	if !dt.outboundPodExistsLocked(serviceUID, location, address) {
-		klog.V(2).Infof("Engine.DeletePod: pod for service %s (location=%s, address=%s) not present in live state (stale/duplicate delete); no-op",
-			serviceUID, location, address)
+		dt.logger.V(5).Info("Skipped stale pod delete", "service", serviceUID, "location", location, "address", address)
 		return result
 	}
 
 	// Check counter BEFORE removing pod to determine if this is the last pod
 	val, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(serviceUID))
 	if !ok {
-		klog.Warningf("Engine.DeletePod: Service %s not found in outboundIdentityPodRefCount", serviceUID)
+		dt.logger.V(4).Info("Could not find service pod ref-count", "service", serviceUID)
 		// Still try to remove pod from DiffTracker
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
 			PodOperation:           Remove,
@@ -1005,7 +998,7 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 			Address:                address,
 		})
 		if err != nil {
-			klog.Errorf("Engine.DeletePod: Failed to remove pod: %v", err)
+			dt.logger.V(4).Info("Could not remove pod", "err", err)
 		}
 		// Trigger LocationsUpdater to sync the change
 		dt.triggerLocationsUpdater()
@@ -1014,7 +1007,7 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 
 	counter := val.(int)
 	if counter <= 0 {
-		klog.Errorf("Engine.DeletePod: Service %s has invalid counter: %d", serviceUID, counter)
+		dt.logger.V(4).Info("Found invalid service pod counter", "service", serviceUID, "count", counter)
 		return result
 	}
 
@@ -1032,7 +1025,7 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 	})
 
 	if err != nil {
-		klog.Errorf("Engine.DeletePod: Failed to remove pod: %v", err)
+		dt.logger.V(4).Info("Could not remove pod", "err", err)
 		return result
 	}
 
@@ -1041,7 +1034,7 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 	if isLastPod {
 		// This was the last pod - mark service for deletion
 		// Note: outboundIdentityPodRefCount already updated by UpdateK8sPod
-		klog.V(2).Infof("Engine.DeletePod: Last pod removed for service %s, marking for deletion", serviceUID)
+		dt.logger.V(5).Info("Marked service for deletion after last pod was removed", "service", serviceUID)
 
 		// Check if service is tracked
 		opState, exists := dt.pendingServiceOps[serviceUID]
@@ -1083,7 +1076,7 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 			IsLastPod:  true,
 			Timestamp:  time.Now().Format(time.RFC3339),
 		}
-		klog.V(3).Infof("Engine.DeletePod: Added pending last pod deletion for %s", podKey)
+		dt.logger.V(5).Info("Added pending last pod deletion", "pod", podKey)
 	}
 	// Note: Counter is managed by UpdateK8sPod for both last pod and non-last pod cases
 
@@ -1127,7 +1120,7 @@ func (dt *DiffTracker) handleEmptyOutboundServiceLocked(serviceUID string) {
 	switch opState.State {
 	case StateNotStarted:
 		// Creation has not been dispatched yet (no Azure resource exists); abort it.
-		klog.V(2).Infof("Engine.DeletePod: last buffered pod for service %s removed before creation started; aborting creation", serviceUID)
+		dt.logger.V(5).Info("Aborted service creation after last buffered pod was removed", "service", serviceUID)
 		delete(dt.pendingServiceOps, serviceUID)
 		delete(dt.pendingEndpoints, serviceUID)
 		delete(dt.pendingPods, serviceUID)
@@ -1137,7 +1130,7 @@ func (dt *DiffTracker) handleEmptyOutboundServiceLocked(serviceUID string) {
 		// The NAT Gateway create is in flight. Mark the service for deletion: when the create
 		// completes, OnServiceCreationComplete's pre-empt (StateDeletionInProgress with
 		// InFlightConfig != nil) routes it to a real delete, preventing an orphaned gateway.
-		klog.V(2).Infof("Engine.DeletePod: last buffered pod for service %s removed during creation; scheduling deletion after create completes", serviceUID)
+		dt.logger.V(5).Info("Scheduled service deletion after last buffered pod was removed during creation", "service", serviceUID)
 		opState.State = StateDeletionInProgress
 		dt.pendingServiceDeletions[serviceUID] = &PendingServiceDeletion{
 			ServiceUID: serviceUID,
@@ -1186,12 +1179,10 @@ func (dt *DiffTracker) promotePendingPodsLocked(serviceUID string) {
 		return
 	}
 
-	klog.V(2).Infof("Engine.promotePendingPodsLocked: Promoting %d pending pods for service %s",
-		len(pendingPods), serviceUID)
+	dt.logger.V(5).Info("Promoted pending pods", "count", len(pendingPods), "service", serviceUID)
 
 	for _, pod := range pendingPods {
-		klog.V(4).Infof("Engine.promotePendingPodsLocked: Adding pod %s (location=%s, address=%s)",
-			pod.PodKey, pod.Location, pod.Address)
+		dt.logger.V(5).Info("Added promoted pod", "pod", pod.PodKey, "location", pod.Location, "address", pod.Address)
 
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
 			PodOperation:           Add,
@@ -1200,7 +1191,7 @@ func (dt *DiffTracker) promotePendingPodsLocked(serviceUID string) {
 			Address:                pod.Address,
 		})
 		if err != nil {
-			klog.Errorf("Engine.promotePendingPodsLocked: Failed to add pod %s: %v", pod.PodKey, err)
+			dt.logger.V(4).Info("Could not add promoted pod", "err", err, "pod", pod.PodKey)
 			continue
 		}
 	}
@@ -1239,33 +1230,29 @@ func (dt *DiffTracker) CheckPendingServiceDeletions() {
 		return
 	}
 
-	klog.V(4).Infof("Engine.CheckPendingServiceDeletions: Checking %d pending deletions", len(dt.pendingServiceDeletions))
+	dt.logger.V(4).Info("Checked pending service deletions", "count", len(dt.pendingServiceDeletions))
 
 	// Iterate through all pending deletions
 	for serviceUID, pendingDeletion := range dt.pendingServiceDeletions {
-		klog.V(4).Infof("Engine.CheckPendingServiceDeletions: Checking service %s (isInbound=%v)",
-			serviceUID, pendingDeletion.IsInbound)
+		dt.logger.V(5).Info("Checked pending service deletion", "service", serviceUID, "isInbound", pendingDeletion.IsInbound)
 
 		// Check if service still has locations in NRP
 		hasLocations := dt.serviceHasLocationsInNRP(serviceUID)
 		if hasLocations {
-			klog.V(4).Infof("Engine.CheckPendingServiceDeletions: Service %s still has locations in NRP, waiting",
-				serviceUID)
+			dt.logger.V(5).Info("Waited for service locations to clear before deletion", "service", serviceUID)
 			blockedCount++
 			continue
 		}
 
 		// Locations cleared - proceed with deletion
-		klog.V(2).Infof("Engine.CheckPendingServiceDeletions: Service %s has no locations, triggering deletion",
-			serviceUID)
+		dt.logger.V(5).Info("Triggered service deletion after locations cleared", "service", serviceUID)
 
 		// Update service state to DeletionInProgress
 		if opState, exists := dt.pendingServiceOps[serviceUID]; exists {
 			opState.State = StateDeletionInProgress
 		} else {
 			// Service not in pendingServiceOps - create entry
-			klog.Warningf("Engine.CheckPendingServiceDeletions: Service %s in pendingServiceDeletions but not in pendingServiceOps, creating entry",
-				serviceUID)
+			dt.logger.V(4).Info("Created missing pending service operation for deletion", "service", serviceUID)
 			var config ServiceConfig
 			if pendingDeletion.IsInbound {
 				config = NewInboundServiceConfig(serviceUID, nil)
@@ -1309,15 +1296,14 @@ func (dt *DiffTracker) WaitForInitialSync(ctx context.Context) error {
 		return fmt.Errorf("WaitForInitialSync called before initialization started")
 	}
 
-	klog.Infof("Engine.WaitForInitialSync: waiting for initialization to complete")
+	dt.logger.V(2).Info("Waited for initialization to complete")
 
 	select {
 	case <-ch:
-		klog.Infof("Engine.WaitForInitialSync: initialization completed successfully")
+		dt.logger.V(2).Info("Completed initialization")
 		return nil
 	case <-ctx.Done():
-		klog.Warningf("Engine.WaitForInitialSync: context cancelled: %v", ctx.Err())
-		return ctx.Err()
+		return fmt.Errorf("waiting for initial sync: %w", ctx.Err())
 	}
 }
 
@@ -1354,8 +1340,7 @@ func (dt *DiffTracker) checkInitializationCompleteLocked() {
 	pendingPodDeletions := len(dt.pendingPodDeletions)
 
 	if pendingOps == 0 && inFlightTriggers == 0 && pendingPodDeletions == 0 {
-		klog.Infof("Engine.checkInitializationComplete: all operations complete (pendingOps=%d, inFlightTriggers=%d, pendingPodDeletions=%d), signaling completion",
-			pendingOps, inFlightTriggers, pendingPodDeletions)
+		dt.logger.V(2).Info("Signaled initialization completion", "pendingOps", pendingOps, "inFlightTriggers", inFlightTriggers, "pendingPodDeletions", pendingPodDeletions)
 
 		// Mark initialization as done (idempotent using sync.Once)
 		dt.initCompletionOnce.Do(func() {
@@ -1363,8 +1348,7 @@ func (dt *DiffTracker) checkInitializationCompleteLocked() {
 			close(dt.initCompletionChecker)
 		})
 	} else {
-		klog.V(4).Infof("Engine.checkInitializationComplete: still initializing (pendingOps=%d, inFlightTriggers=%d, pendingPodDeletions=%d)",
-			pendingOps, inFlightTriggers, pendingPodDeletions)
+		dt.logger.V(4).Info("Still initializing", "pendingOps", pendingOps, "inFlightTriggers", inFlightTriggers, "pendingPodDeletions", pendingPodDeletions)
 	}
 }
 

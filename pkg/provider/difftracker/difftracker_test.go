@@ -9,6 +9,7 @@ import (
 	"go.uber.org/mock/gomock"
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -1163,7 +1164,7 @@ func TestInitializeDiffTracker(t *testing.T) {
 	defer ctrl.Finish()
 	mockFactory := mock_azclient.NewMockClientFactory(ctrl)
 	mockKubeClient := fake.NewSimpleClientset()
-	diffTracker, err := New(K8sResources, NRPResources, config, mockFactory, mockKubeClient)
+	diffTracker, err := New(log.Noop(), K8sResources, NRPResources, config, mockFactory, mockKubeClient)
 	assert.NoError(t, err)
 	syncOperations := diffTracker.GetSyncOperations()
 	// It follows a call to ServiceGateway API and if it is successful we can proceed with syncing difftracker.NRP
@@ -1672,7 +1673,7 @@ func TestNewSeedsOutboundRefCount(t *testing.T) {
 		"10.0.1.1": {InboundIdentities: sets.NewString(), PublicOutboundIdentity: "Egress2"},
 	}}
 
-	dt, err := New(k8s, emptyNRPState(), validTestConfig(), mockFactory, mockKubeClient)
+	dt, err := New(log.Noop(), k8s, emptyNRPState(), validTestConfig(), mockFactory, mockKubeClient)
 	assert.NoError(t, err)
 
 	val, ok := dt.outboundIdentityPodRefCount.Load("egress1")

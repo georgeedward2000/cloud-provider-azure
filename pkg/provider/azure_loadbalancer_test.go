@@ -51,6 +51,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipaddressclient/mock_publicipaddressclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachinescalesetclient/mock_virtualmachinescalesetclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/privatelinkservice"
@@ -848,7 +849,7 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 				Locations:     make(map[string]difftracker.NRPLocation),
 			}
 			var err error
-			az.diffTracker, err = difftracker.New(k8s, nrp, difftracker.Config{
+			az.diffTracker, err = difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
 				SubscriptionID:             az.SubscriptionID,
 				ResourceGroup:              az.ResourceGroup,
 				Location:                   az.Location,
@@ -952,7 +953,7 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 				Locations:     make(map[string]difftracker.NRPLocation),
 			}
 			var err error
-			az.diffTracker, err = difftracker.New(k8s, nrp, difftracker.Config{
+			az.diffTracker, err = difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
 				SubscriptionID:             az.SubscriptionID,
 				ResourceGroup:              az.ResourceGroup,
 				Location:                   az.Location,

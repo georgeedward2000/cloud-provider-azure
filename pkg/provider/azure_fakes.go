@@ -45,6 +45,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachinescalesetvmclient/mock_virtualmachinescalesetvmclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualnetworklinkclient/mock_virtualnetworklinkclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/privatelinkservice"
@@ -212,6 +213,7 @@ func GetTestCloudWithContainerLoadBalancer(ctrl *gomock.Controller) (az *Cloud) 
 	}
 	var err error
 	az.diffTracker, err = difftracker.New(
+		log.Noop(),
 		difftracker.K8sState{
 			Services: utilsets.NewString(),
 			Egresses: utilsets.NewString(),

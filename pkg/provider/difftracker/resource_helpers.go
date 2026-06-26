@@ -24,9 +24,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -156,11 +156,11 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 				Properties: ruleProps,
 			})
 
-			klog.V(4).Infof("buildInboundServiceResources: created LB rule %s: frontend=%d backend=%d protocol=%s for service %s",
-				ruleName, frontendPort.Port, backendPort, frontendPort.Protocol, serviceUID)
+			log.Background().WithName("difftracker").V(5).Info("Created LB rule",
+				"rule", ruleName, "frontendPort", frontendPort.Port, "backendPort", backendPort, "protocol", frontendPort.Protocol, "service", serviceUID)
 		}
 	} else {
-		klog.V(2).Infof("buildInboundServiceResources: no port configuration provided for service %s, creating LB without rules", serviceUID)
+		log.Background().WithName("difftracker").V(5).Info("No port configuration provided, creating LB without rules", "service", serviceUID)
 	}
 
 	lb = armnetwork.LoadBalancer{
@@ -316,8 +316,8 @@ func ExtractInboundConfigFromService(service *v1.Service) *InboundConfig {
 			// error instead of silently sending traffic to the wrong backend port. The
 			// backendPort value below is a placeholder; it is never programmed because the
 			// build fails first.
-			klog.Warningf("ExtractInboundConfigFromService: named targetPort %q is not supported for service %s/%s; the service will be rejected until it uses a numeric targetPort",
-				port.TargetPort.StrVal, service.Namespace, service.Name)
+			log.Background().WithName("difftracker").V(4).Info("Named targetPort is not supported, service will be rejected until it uses a numeric targetPort",
+				"targetPort", port.TargetPort.StrVal, "namespace", service.Namespace, "service", service.Name)
 			config.NamedTargetPorts = append(config.NamedTargetPorts, port.TargetPort.StrVal)
 			backendPort = port.Port
 		}

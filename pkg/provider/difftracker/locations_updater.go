@@ -6,7 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"k8s.io/klog/v2"
+	"github.com/go-logr/logr"
+
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
 )
 
@@ -25,6 +26,8 @@ type LocationsUpdater struct {
 	// failureCount is the number of consecutive failed NRP syncs, used to compute the
 	// retry backoff. Accessed only from the single Run goroutine (process), so no lock.
 	failureCount int
+
+	logger logr.Logger
 }
 
 // NewLocationsUpdater creates a new LocationsUpdater
@@ -40,21 +43,22 @@ func NewLocationsUpdater(ctx context.Context, diffTracker *DiffTracker) *Locatio
 		diffTracker: diffTracker,
 		ctx:         childCtx,
 		cancel:      cancel,
+		logger:      diffTracker.logger.WithName("LocationsUpdater"),
 	}
 }
 
 // Run is the main loop that processes location update requests
 func (lu *LocationsUpdater) Run() {
-	klog.Infof("LocationsUpdater: Starting")
+	lu.logger.V(2).Info("Started LocationsUpdater")
 
 	for {
 		select {
 		case <-lu.ctx.Done():
-			klog.Infof("LocationsUpdater: Context cancelled, stopping")
+			lu.logger.V(2).Info("Context cancelled, stopping LocationsUpdater")
 			return
 
 		case <-lu.diffTracker.locationsUpdaterTrigger:
-			klog.V(4).Infof("LocationsUpdater: Triggered by channel")
+			lu.logger.V(4).Info("Triggered LocationsUpdater")
 			lu.process(lu.ctx)
 		}
 	}
@@ -62,9 +66,9 @@ func (lu *LocationsUpdater) Run() {
 
 // Stop gracefully shuts down the LocationsUpdater
 func (lu *LocationsUpdater) Stop() {
-	klog.Infof("LocationsUpdater: stopping")
+	lu.logger.V(2).Info("Stopping LocationsUpdater")
 	lu.cancel()
-	klog.Infof("LocationsUpdater: stopped")
+	lu.logger.V(2).Info("Stopped LocationsUpdater")
 }
 
 // process computes location/address diff and syncs to NRP
@@ -100,15 +104,13 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 			lu.diffTracker.checkInitializationComplete()
 		}
 	}()
-
 	startTime := time.Now()
-	klog.V(2).Infof("LocationsUpdater: Starting location sync")
 
 	// Get locations and addresses diff from DiffTracker
 	locationData := lu.diffTracker.GetSyncLocationsAddresses()
 
 	if len(locationData.Locations) == 0 {
-		klog.V(4).Infof("LocationsUpdater: No changes to sync")
+		lu.logger.V(4).Info("No location changes to sync")
 		// Even with no location diff, recovered pending service/pod deletions must
 		// still be processed so their finalizers are not left pending.
 		lu.diffTracker.CheckPendingServiceDeletions()
@@ -116,7 +118,7 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 		if lu.initPodFinalizersStillPending() {
 			// During init, retry instead of reporting success: CheckPendingPodDeletions
 			// swallows transient errors, and init completion requires pendingPodDeletions==0.
-			klog.Warningf("LocationsUpdater: init pod-finalizer removal incomplete; retrying")
+			lu.logger.V(4).Info("Pod finalizer removal incomplete, retrying")
 			return
 		}
 		isOperationSucceeded = true
@@ -129,22 +131,20 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 		numAddresses += len(loc.Addresses)
 	}
 
-	klog.V(2).Infof("LocationsUpdater: Syncing %d locations with %d total addresses", numLocations, numAddresses)
-
 	// Convert to DTO format for NRP API
 	locationsDTO := MapLocationDataToDTO(locationData)
 
 	// Call NRP Service Gateway API to update locations/addresses
 	err := lu.diffTracker.updateNRPSGWAddressLocations(ctx, lu.diffTracker.config.ServiceGatewayResourceName, locationsDTO)
 	if err != nil {
-		klog.Errorf("LocationsUpdater: Failed to update locations in NRP: %v", err)
+		lu.logger.V(4).Info("Could not sync locations to NRP", "err", err, "attempt", lu.failureCount+1)
 		// Leave isOperationSucceeded=false so the deferred backoffAndRetry re-triggers a
 		// sync; the diff is recomputed fresh on the next pass, so no state is lost.
 		return
 	}
 
 	duration := time.Since(startTime)
-	klog.V(2).Infof("LocationsUpdater: Successfully synced locations to NRP in %v", duration)
+	lu.logger.V(2).Info("Synced locations to NRP", "locations", numLocations, "addresses", numAddresses, "duration", duration)
 
 	// Update location and address metrics
 	updateLocationsAndAddressesMetric(numLocations, numAddresses)
@@ -166,7 +166,7 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	if lu.initPodFinalizersStillPending() {
 		// During init, a transient finalizer-removal failure must retry rather than
 		// report success, which would hang WaitForInitialSync.
-		klog.Warningf("LocationsUpdater: init pod-finalizer removal incomplete after sync; retrying")
+		lu.logger.V(4).Info("Pod finalizer removal incomplete after sync, retrying")
 		return
 	}
 
@@ -201,7 +201,7 @@ func (lu *LocationsUpdater) backoffAndRetry() {
 	// Add up to ~20% jitter to avoid synchronized retries across controllers.
 	delay += time.Duration(rand.Int63n(int64(delay)/5 + 1))
 
-	klog.V(2).Infof("LocationsUpdater: NRP sync failed; retrying in %v (consecutive failure #%d)", delay, lu.failureCount)
+	lu.logger.V(4).Info("Scheduled NRP location sync retry", "delay", delay, "attempt", lu.failureCount)
 
 	select {
 	case <-lu.ctx.Done():

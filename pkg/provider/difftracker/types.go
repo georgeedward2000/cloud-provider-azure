@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
@@ -426,6 +427,10 @@ type DiffTracker struct {
 	// Updater references (started during initialization, kept running)
 	serviceUpdater   *ServiceUpdater
 	locationsUpdater *LocationsUpdater
+
+	// logger is the component logger, backed by klog via pkg/log. It is supplied
+	// to New and enriched with WithName("difftracker").
+	logger logr.Logger
 }
 
 // --------------------------------------------------------------------------------

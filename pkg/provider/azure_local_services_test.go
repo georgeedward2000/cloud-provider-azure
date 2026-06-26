@@ -40,6 +40,7 @@ import (
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/backendaddresspoolclient/mock_backendaddresspoolclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
@@ -834,7 +835,7 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 			}
 
 			var err error
-			cloud.diffTracker, err = difftracker.New(k8s, nrp, difftracker.Config{
+			cloud.diffTracker, err = difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
 				SubscriptionID:             cloud.SubscriptionID,
 				ResourceGroup:              cloud.ResourceGroup,
 				Location:                   cloud.Location,

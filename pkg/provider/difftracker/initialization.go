@@ -12,13 +12,15 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
+	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/klog/v2"
+
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
@@ -51,6 +53,7 @@ func InitializeFromCluster(
 	networkClientFactory azclient.ClientFactory,
 	kubeClient kubernetes.Interface,
 ) (*DiffTracker, error) {
+	logger := log.FromContextOrBackground(ctx)
 	initStartTime := time.Now()
 	mc := metrics.NewMetricContext("services", "InitializeFromCluster", config.ResourceGroup, config.SubscriptionID, config.ServiceGatewayResourceName)
 	isOperationSucceeded := false
@@ -58,7 +61,7 @@ func InitializeFromCluster(
 		mc.ObserveOperationWithResult(isOperationSucceeded)
 	}()
 
-	klog.Infof("InitializeFromCluster: starting initialization of diff tracker")
+	logger.V(2).Info("Started DiffTracker initialization")
 
 	// Validate inputs
 	if err := validateInitializationInputs(kubeClient, networkClientFactory); err != nil {
@@ -79,7 +82,7 @@ func InitializeFromCluster(
 	}
 
 	// Initialize DiffTracker with computed state
-	diffTracker, err := initializeDiffTrackerWithState(k8s, nrp, config, networkClientFactory, kubeClient, localServiceNameToNRPServiceMap)
+	diffTracker, err := initializeDiffTrackerWithState(log.FromContextOrBackground(ctx), k8s, nrp, config, networkClientFactory, kubeClient, localServiceNameToNRPServiceMap)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize DiffTracker: %w", err)
 	}
@@ -101,10 +104,10 @@ func InitializeFromCluster(
 	// Note: Counter is NOT updated during initialization sync - only during runtime via updateK8sPodLocked
 
 	// Log state before computing sync operations
-	klog.Infof("InitializeFromCluster: K8s Services (%d): %v", diffTracker.K8sResources.Services.Len(), diffTracker.K8sResources.Services.UnsortedList())
-	klog.Infof("InitializeFromCluster: NRP LoadBalancers (%d): %v", diffTracker.NRPResources.LoadBalancers.Len(), diffTracker.NRPResources.LoadBalancers.UnsortedList())
-	klog.Infof("InitializeFromCluster: K8s Egresses (%d): %v", diffTracker.K8sResources.Egresses.Len(), diffTracker.K8sResources.Egresses.UnsortedList())
-	klog.Infof("InitializeFromCluster: NRP NATGateways (%d): %v", diffTracker.NRPResources.NATGateways.Len(), diffTracker.NRPResources.NATGateways.UnsortedList())
+	logger.V(5).Info("Listed K8s services", "services", diffTracker.K8sResources.Services.Len(), "serviceUIDs", diffTracker.K8sResources.Services.UnsortedList())
+	logger.V(5).Info("Listed NRP load balancers", "loadBalancers", diffTracker.NRPResources.LoadBalancers.Len(), "loadBalancerNames", diffTracker.NRPResources.LoadBalancers.UnsortedList())
+	logger.V(5).Info("Listed K8s egresses", "egresses", diffTracker.K8sResources.Egresses.Len(), "egressNames", diffTracker.K8sResources.Egresses.UnsortedList())
+	logger.V(5).Info("Listed NRP NAT gateways", "natGateways", diffTracker.NRPResources.NATGateways.Len(), "natGatewayNames", diffTracker.NRPResources.NATGateways.UnsortedList())
 
 	// Get sync operations
 	syncOperations := diffTracker.GetSyncOperations()
@@ -116,7 +119,6 @@ func InitializeFromCluster(
 	}
 
 	// Reconcile services (create/delete LBs and NAT Gateways in Azure)
-	klog.Infof("InitializeFromCluster: reconciling services")
 	diffTracker.reconcileServices(syncOperations, serviceUIDToService)
 
 	// Schedule deletion of orphaned Azure resources via ServiceUpdater.
@@ -145,8 +147,7 @@ func InitializeFromCluster(
 	diffTracker.mu.Unlock()
 
 	if hasDeletions || hasOnlyExistingServices || hasRecoveredItems {
-		klog.Infof("InitializeFromCluster: triggering initial location sync (deletions=%v, onlyExisting=%v, recoveredItems=%v)",
-			hasDeletions, hasOnlyExistingServices, hasRecoveredItems)
+		logger.V(2).Info("Triggered initial location sync", "deletions", hasDeletions, "onlyExisting", hasOnlyExistingServices, "recoveredItems", hasRecoveredItems)
 		diffTracker.triggerLocationsUpdater()
 	}
 
@@ -155,13 +156,11 @@ func InitializeFromCluster(
 	//   - pendingServiceOps (ServiceUpdater work - includes orphan deletions)
 	//   - pendingUpdaterTriggers (LocationsUpdater work)
 	// Note: bufferedEndpoints/bufferedPods are always empty during initialization
-	klog.Infof("InitializeFromCluster: waiting for all async operations to complete")
 	if err := diffTracker.WaitForInitialSync(ctx); err != nil {
-		klog.Errorf("InitializeFromCluster: WaitForInitialSync failed: %v", err)
 		cleanupOnError(diffTracker)
-		return nil, fmt.Errorf("initialization sync failed: %w", err)
+		return nil, fmt.Errorf("waiting for initial sync: %w", err)
 	}
-	klog.Infof("InitializeFromCluster: all async operations completed")
+	logger.V(2).Info("Completed initialization operations")
 
 	// Recover External IPs for services that were mid-provisioning when CCM crashed.
 	// This handles the case where Azure resources (PIP, LB) were created but CCM crashed
@@ -176,7 +175,7 @@ func InitializeFromCluster(
 	diffTracker.InitialSyncDone = true
 	isOperationSucceeded = true
 	recordInitializationDuration(initStartTime)
-	klog.Infof("InitializeFromCluster: completed successfully")
+	logger.V(2).Info("Completed DiffTracker initialization")
 
 	return diffTracker, nil
 }
@@ -238,11 +237,12 @@ func buildK8sState(
 
 // buildNodeNameToIPMap creates a mapping from node names to their internal IPs
 func buildNodeNameToIPMap(ctx context.Context, kubeClient kubernetes.Interface) (map[string]string, error) {
+	logger := log.FromContextOrBackground(ctx)
 	nodeList, err := kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list nodes: %w", err)
 	}
-	klog.Infof("buildNodeNameToIPMap: found %d nodes", len(nodeList.Items))
+	logger.V(2).Info("Listed Kubernetes nodes", "nodes", len(nodeList.Items))
 
 	nodeNameToIPMap := make(map[string]string, len(nodeList.Items))
 	for i := range nodeList.Items {
@@ -254,7 +254,7 @@ func buildNodeNameToIPMap(ctx context.Context, kubeClient kubernetes.Interface) 
 			}
 		}
 	}
-	klog.V(4).Infof("buildNodeNameToIPMap: built map with %d entries", len(nodeNameToIPMap))
+	logger.V(4).Info("Built node IP map", "nodes", len(nodeNameToIPMap))
 	return nodeNameToIPMap, nil
 }
 
@@ -289,7 +289,7 @@ func recoverStuckFinalizers(
 	egressPods *v1.PodList,
 	endpointSlices *discoveryv1.EndpointSliceList,
 ) {
-	klog.Infof("recoverStuckFinalizers: scanning for resources stuck with finalizers")
+	logger := log.FromContextOrBackground(ctx)
 
 	servicesRecovered := 0
 	podsRecovered := 0
@@ -313,7 +313,7 @@ func recoverStuckFinalizers(
 	// 2. Azure resource DOES NOT exist in NRP → we directly remove finalizer (nothing to clean up)
 	servicesDirectCleaned := 0
 	if services == nil {
-		klog.Errorf("recoverStuckFinalizers: services list is nil, skipping service recovery")
+		logger.V(4).Info("Skipped service finalizer recovery because service list was nil")
 	} else {
 		for i := range services.Items {
 			svc := &services.Items[i]
@@ -338,17 +338,14 @@ func recoverStuckFinalizers(
 
 			if hasAzureResource {
 				// Azure resource exists - diff mechanism will handle deletion
-				klog.Infof("recoverStuckFinalizers: found stuck service %s/%s (uid=%s), will be handled by diff mechanism",
-					svc.Namespace, svc.Name, uid)
+				logger.V(2).Info("Found stuck service finalizer", "namespace", svc.Namespace, "service", svc.Name, "uid", uid)
 				servicesRecovered++
 				recordFinalizerRecovered()
 			} else {
 				// No Azure resource - directly remove finalizer since there's nothing to clean up
-				klog.Warningf("recoverStuckFinalizers: service %s/%s (uid=%s) has finalizer but no Azure resource in NRP, removing finalizer directly",
-					svc.Namespace, svc.Name, uid)
+				logger.V(4).Info("Removed service finalizer without Azure resource", "namespace", svc.Namespace, "service", svc.Name, "uid", uid)
 				if err := dt.removeServiceGatewayFinalizer(ctx, svc); err != nil {
-					klog.Errorf("recoverStuckFinalizers: failed to remove finalizer from service %s/%s: %v",
-						svc.Namespace, svc.Name, err)
+					logger.V(4).Info("Could not remove service finalizer", "namespace", svc.Namespace, "service", svc.Name, "err", err)
 				} else {
 					servicesDirectCleaned++
 					recordFinalizerRecovered()
@@ -359,7 +356,7 @@ func recoverStuckFinalizers(
 
 	// Recover stuck pods (egress pods with our finalizer + DeletionTimestamp)
 	if egressPods == nil {
-		klog.Errorf("recoverStuckFinalizers: egressPods list is nil, skipping pod recovery")
+		logger.V(4).Info("Skipped pod finalizer recovery because pod list was nil")
 	} else {
 		for i := range egressPods.Items {
 			pod := &egressPods.Items[i]
@@ -376,11 +373,9 @@ func recoverStuckFinalizers(
 			egressLabel := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
 			if egressLabel == "" {
 				// No egress label = nothing to track, just remove finalizer directly
-				klog.Warningf("recoverStuckFinalizers: pod %s/%s has finalizer but missing egress label, removing finalizer directly",
-					pod.Namespace, pod.Name)
+				logger.V(4).Info("Removed pod finalizer with missing egress label", "namespace", pod.Namespace, "pod", pod.Name)
 				if err := dt.removePodFinalizer(ctx, pod); err != nil {
-					klog.Errorf("recoverStuckFinalizers: failed to remove finalizer from pod %s/%s: %v",
-						pod.Namespace, pod.Name, err)
+					logger.V(4).Info("Could not remove pod finalizer", "namespace", pod.Namespace, "pod", pod.Name, "err", err)
 				} else {
 					podsDirectCleaned++
 				}
@@ -398,19 +393,16 @@ func recoverStuckFinalizers(
 			// (DeletePod rejects empty location/address). Directly remove finalizer since
 			// there's nothing to sync out of NRP anyway.
 			if podIP == "" || nodeIP == "" {
-				klog.Warningf("recoverStuckFinalizers: pod %s/%s has finalizer but missing addresses (podIP=%s, nodeIP=%s), removing finalizer directly",
-					pod.Namespace, pod.Name, podIP, nodeIP)
+				logger.V(4).Info("Removed pod finalizer with missing addresses", "namespace", pod.Namespace, "pod", pod.Name, "podIP", podIP, "nodeIP", nodeIP)
 				if err := dt.removePodFinalizer(ctx, pod); err != nil {
-					klog.Errorf("recoverStuckFinalizers: failed to remove finalizer from pod %s/%s: %v",
-						pod.Namespace, pod.Name, err)
+					logger.V(4).Info("Could not remove pod finalizer", "namespace", pod.Namespace, "pod", pod.Name, "err", err)
 				} else {
 					podsDirectCleaned++
 				}
 				continue
 			}
 
-			klog.Infof("recoverStuckFinalizers: recovering stuck pod %s/%s (egress=%s, location=%s, address=%s)",
-				pod.Namespace, pod.Name, egressLabel, nodeIP, podIP)
+			logger.V(2).Info("Recovered stuck pod finalizer", "namespace", pod.Namespace, "pod", pod.Name, "egress", egressLabel, "location", nodeIP, "address", podIP)
 			recordFinalizerRecovered()
 
 			// Collect for batch insertion (Issue 2.4: avoid lock contention)
@@ -459,10 +451,9 @@ func recoverStuckFinalizers(
 	// fires after startInitialization() completes.
 
 	if servicesRecovered > 0 || servicesDirectCleaned > 0 || podsRecovered > 0 || podsDirectCleaned > 0 {
-		klog.Infof("recoverStuckFinalizers: found %d stuck services (handled by diff), direct-cleaned %d services, recovered %d pods, direct-cleaned %d pods",
-			servicesRecovered, servicesDirectCleaned, podsRecovered, podsDirectCleaned)
+		logger.V(2).Info("Recovered stuck finalizers", "services", servicesRecovered, "directCleanedServices", servicesDirectCleaned, "pods", podsRecovered, "directCleanedPods", podsDirectCleaned)
 	} else {
-		klog.Infof("recoverStuckFinalizers: no stuck resources found")
+		logger.V(2).Info("Found no stuck finalizers")
 	}
 }
 
@@ -475,6 +466,7 @@ func processK8sServices(
 	k8s *K8sState,
 	localServiceNameToNRPServiceMap map[string]int,
 ) (*v1.ServiceList, map[string]*v1.Service, error) {
+	logger := log.FromContextOrBackground(ctx)
 	services, err := kubeClient.CoreV1().Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to list services: %w", err)
@@ -486,7 +478,7 @@ func processK8sServices(
 			// Skip services that are being deleted - they shouldn't count in K8s state
 			// Their deletion will be handled by recoverStuckFinalizers or the diff mechanism
 			if service.DeletionTimestamp != nil {
-				klog.V(4).Infof("processK8sServices: skipping service %s/%s with DeletionTimestamp", service.Namespace, service.Name)
+				logger.V(5).Info("Skipped deleting service", "namespace", service.Namespace, "service", service.Name)
 				continue
 			}
 			uid := strings.ToLower(string(service.UID))
@@ -496,7 +488,7 @@ func processK8sServices(
 			serviceUIDToService[uid] = &services.Items[i]
 		}
 	}
-	klog.Infof("processK8sServices: found %d LoadBalancer services", k8s.Services.Len())
+	logger.V(2).Info("Processed Kubernetes LoadBalancer services", "services", k8s.Services.Len())
 	return services, serviceUIDToService, nil
 }
 
@@ -509,6 +501,7 @@ func processK8sEndpoints(
 	k8s *K8sState,
 	nodeNameToIPMap map[string]string,
 ) (*discoveryv1.EndpointSliceList, error) {
+	logger := log.FromContextOrBackground(ctx)
 	endpointSliceList, err := kubeClient.DiscoveryV1().EndpointSlices(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list endpointslices: %w", err)
@@ -519,8 +512,7 @@ func processK8sEndpoints(
 		// Skip EndpointSlices that are being deleted - their addresses shouldn't be in K8s state
 		// Their cleanup is handled by recoverStuckFinalizers
 		if endpointSlice.DeletionTimestamp != nil {
-			klog.V(4).Infof("processK8sEndpoints: skipping EndpointSlice %s/%s with DeletionTimestamp",
-				endpointSlice.Namespace, endpointSlice.Name)
+			logger.V(5).Info("Skipped deleting EndpointSlice", "namespace", endpointSlice.Namespace, "endpointSlice", endpointSlice.Name)
 			continue
 		}
 
@@ -536,7 +528,7 @@ func processK8sEndpoints(
 
 			nodeIP, exists := nodeNameToIPMap[*endpoint.NodeName]
 			if !exists {
-				klog.V(4).Infof("processK8sEndpoints: could not find IP for node %s", *endpoint.NodeName)
+				logger.V(5).Info("Could not find node IP", "node", *endpoint.NodeName)
 				continue
 			}
 
@@ -547,8 +539,7 @@ func processK8sEndpoints(
 		}
 		processedCount++
 	}
-	klog.Infof("processK8sEndpoints: processed %d endpointslices (total %d, skipped deleting)",
-		processedCount, len(endpointSliceList.Items))
+	logger.V(2).Info("Processed Kubernetes EndpointSlices", "processed", processedCount, "total", len(endpointSliceList.Items))
 	return endpointSliceList, nil
 }
 
@@ -563,6 +554,7 @@ func processK8sEgresses(
 	nodeNameToIPMap map[string]string,
 	localServiceNameToNRPServiceMap map[string]int,
 ) (*v1.PodList, error) {
+	logger := log.FromContextOrBackground(ctx)
 	egressPods, err := kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		LabelSelector: consts.PodLabelServiceEgressGateway,
 	})
@@ -574,14 +566,13 @@ func processK8sEgresses(
 		// Skip pods that are being deleted - they shouldn't count toward the service
 		// Their addresses will be synced out by recoverStuckFinalizers or during normal deletion
 		if pod.DeletionTimestamp != nil {
-			klog.V(4).Infof("processK8sEgresses: skipping pod %s/%s with DeletionTimestamp", pod.Namespace, pod.Name)
+			logger.V(5).Info("Skipped deleting pod", "namespace", pod.Namespace, "pod", pod.Name)
 			continue
 		}
 
 		egressVal := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
 		if egressVal == "" || pod.Status.PodIP == "" || pod.Spec.NodeName == "" {
-			klog.Infof("processK8sEgresses: skipping pod %s/%s (label=%q, podIP=%q, nodeName=%q)",
-				pod.Namespace, pod.Name, egressVal, pod.Status.PodIP, pod.Spec.NodeName)
+			logger.V(5).Info("Skipped invalid egress pod", "namespace", pod.Namespace, "pod", pod.Name, "label", egressVal, "podIP", pod.Status.PodIP, "node", pod.Spec.NodeName)
 			continue
 		}
 
@@ -589,7 +580,7 @@ func processK8sEgresses(
 
 		nodeIP, exists := nodeNameToIPMap[pod.Spec.NodeName]
 		if !exists {
-			klog.V(4).Infof("processK8sEgresses: could not find IP for node %s", pod.Spec.NodeName)
+			logger.V(5).Info("Could not find node IP", "node", pod.Spec.NodeName)
 			continue
 		}
 
@@ -597,7 +588,7 @@ func processK8sEgresses(
 		addOutboundIdentityToPod(k8s, nodeIP, pod.Status.PodIP, egressVal)
 		localServiceNameToNRPServiceMap[egressVal] = localServiceNameToNRPServiceMap[egressVal] + 1
 	}
-	klog.Infof("processK8sEgresses: found %d egress services", k8s.Egresses.Len())
+	logger.V(2).Info("Processed Kubernetes egress services", "egresses", k8s.Egresses.Len())
 	return egressPods, nil
 }
 
@@ -610,6 +601,7 @@ func buildNRPState(
 	config Config,
 	networkClientFactory azclient.ClientFactory,
 ) (NRPState, *utilsets.IgnoreCaseSet, *utilsets.IgnoreCaseSet, []*armnetwork.PublicIPAddress, map[string]string, error) {
+	logger := log.FromContextOrBackground(ctx)
 	nrp := NRPState{
 		LoadBalancers: utilsets.NewString(),
 		NATGateways:   utilsets.NewString(),
@@ -642,7 +634,7 @@ func buildNRPState(
 	azurePIPs, pipNameToIP, err := fetchAzurePublicIPs(ctx, config, networkClientFactory)
 	if err != nil {
 		// Non-fatal: External IP recovery and orphan cleanup will just skip if this fails
-		klog.Warningf("buildNRPState: failed to fetch Public IPs: %v", err)
+		logger.V(4).Info("Could not fetch Public IPs", "err", err)
 		azurePIPs = nil
 		pipNameToIP = make(map[string]string)
 	}
@@ -657,6 +649,7 @@ func fetchServiceGatewayServices(
 	networkClientFactory azclient.ClientFactory,
 	nrp *NRPState,
 ) error {
+	logger := log.FromContextOrBackground(ctx)
 	sgwClient := networkClientFactory.GetServiceGatewayClient()
 	servicesDTO, err := sgwClient.GetServices(ctx, config.ResourceGroup, config.ServiceGatewayResourceName)
 	if err != nil {
@@ -665,7 +658,7 @@ func fetchServiceGatewayServices(
 
 	for _, service := range servicesDTO {
 		if service == nil || service.Properties == nil || service.Properties.ServiceType == nil || service.Name == nil {
-			klog.V(4).Infof("fetchServiceGatewayServices: skipping service entry with nil fields")
+			logger.V(5).Info("Skipped invalid ServiceGateway service")
 			continue
 		}
 
@@ -681,14 +674,13 @@ func fetchServiceGatewayServices(
 			// then deletes the NAT GW + PIP and recreates them. Case-insensitive
 			// because Azure may normalize naming differently across endpoints.
 			if strings.EqualFold(*service.Name, "default-natgw") {
-				klog.V(2).Infof("fetchServiceGatewayServices: skipping RP-owned default outbound service %q", *service.Name)
+				logger.V(4).Info("Skipped RP-owned default outbound service", "service", *service.Name)
 				continue
 			}
 			nrp.NATGateways.Insert(*service.Name)
 		}
 	}
-	klog.Infof("fetchServiceGatewayServices: fetched %d services (%d LBs, %d NATs)",
-		len(servicesDTO), nrp.LoadBalancers.Len(), nrp.NATGateways.Len())
+	logger.V(2).Info("Fetched ServiceGateway services", "services", len(servicesDTO), "loadBalancers", nrp.LoadBalancers.Len(), "natGateways", nrp.NATGateways.Len())
 	return nil
 }
 
@@ -699,23 +691,24 @@ func fetchServiceGatewayLocations(
 	networkClientFactory azclient.ClientFactory,
 	nrp *NRPState,
 ) error {
+	logger := log.FromContextOrBackground(ctx)
 	sgwClient := networkClientFactory.GetServiceGatewayClient()
 	locationsDTO, err := sgwClient.GetAddressLocations(ctx, config.ResourceGroup, config.ServiceGatewayResourceName)
 	if err != nil {
 		return fmt.Errorf("failed to get locations from ServiceGateway API: %w", err)
 	}
-	klog.Infof("fetchServiceGatewayLocations: fetched %d locations", len(locationsDTO))
+	logger.V(2).Info("Fetched ServiceGateway locations", "locations", len(locationsDTO))
 
 	for _, location := range locationsDTO {
 		if location == nil || location.AddressLocation == nil || *location.AddressLocation == "" {
-			klog.V(4).Infof("fetchServiceGatewayLocations: skipping invalid location entry")
+			logger.V(5).Info("Skipped invalid ServiceGateway location")
 			continue
 		}
 
 		addresses := parseLocationAddresses(location)
 		nrp.Locations[*location.AddressLocation] = NRPLocation{Addresses: addresses}
 	}
-	klog.Infof("fetchServiceGatewayLocations: processed %d locations", len(nrp.Locations))
+	logger.V(2).Info("Processed ServiceGateway locations", "locations", len(nrp.Locations))
 	return nil
 }
 
@@ -725,6 +718,7 @@ func fetchAzureLoadBalancers(
 	config Config,
 	networkClientFactory azclient.ClientFactory,
 ) (*utilsets.IgnoreCaseSet, error) {
+	logger := log.FromContextOrBackground(ctx)
 	lbclient := networkClientFactory.GetLoadBalancerClient()
 	lbs, err := lbclient.List(ctx, config.ResourceGroup)
 	if err != nil {
@@ -737,7 +731,7 @@ func fetchAzureLoadBalancers(
 			currentLBs.Insert(strings.ToLower(*lb.Name))
 		}
 	}
-	klog.Infof("fetchAzureLoadBalancers: found %d LoadBalancers", currentLBs.Len())
+	logger.V(2).Info("Fetched Azure load balancers", "loadBalancers", currentLBs.Len())
 	return currentLBs, nil
 }
 
@@ -747,6 +741,7 @@ func fetchAzureNATGateways(
 	config Config,
 	networkClientFactory azclient.ClientFactory,
 ) (*utilsets.IgnoreCaseSet, error) {
+	logger := log.FromContextOrBackground(ctx)
 	ngclient := networkClientFactory.GetNatGatewayClient()
 	ngs, err := ngclient.List(ctx, config.ResourceGroup)
 	if err != nil {
@@ -759,7 +754,7 @@ func fetchAzureNATGateways(
 			currentNATs.Insert(strings.ToLower(*ng.Name))
 		}
 	}
-	klog.Infof("fetchAzureNATGateways: found %d NAT Gateways", currentNATs.Len())
+	logger.V(2).Info("Fetched Azure NAT gateways", "natGateways", currentNATs.Len())
 	return currentNATs, nil
 }
 
@@ -773,6 +768,7 @@ func fetchAzurePublicIPs(
 	config Config,
 	networkClientFactory azclient.ClientFactory,
 ) ([]*armnetwork.PublicIPAddress, map[string]string, error) {
+	logger := log.FromContextOrBackground(ctx)
 	pipClient := networkClientFactory.GetPublicIPAddressClient()
 	pips, err := pipClient.List(ctx, config.ResourceGroup)
 	if err != nil {
@@ -785,12 +781,13 @@ func fetchAzurePublicIPs(
 			pipNameToIP[strings.ToLower(*pip.Name)] = *pip.Properties.IPAddress
 		}
 	}
-	klog.Infof("fetchAzurePublicIPs: found %d Public IPs, %d with allocated addresses", len(pips), len(pipNameToIP))
+	logger.V(2).Info("Fetched Azure Public IPs", "publicIPs", len(pips), "allocatedAddresses", len(pipNameToIP))
 	return pips, pipNameToIP, nil
 }
 
 // initializeDiffTrackerWithState creates a DiffTracker and populates initial state
 func initializeDiffTrackerWithState(
+	logger logr.Logger,
 	k8s K8sState,
 	nrp NRPState,
 	config Config,
@@ -798,7 +795,7 @@ func initializeDiffTrackerWithState(
 	kubeClient kubernetes.Interface,
 	localServiceNameToNRPServiceMap map[string]int,
 ) (*DiffTracker, error) {
-	diffTracker, err := New(k8s, nrp, config, networkClientFactory, kubeClient)
+	diffTracker, err := New(logger, k8s, nrp, config, networkClientFactory, kubeClient)
 	if err != nil {
 		return nil, err
 	}
@@ -809,22 +806,19 @@ func initializeDiffTrackerWithState(
 
 // logSyncOperations logs the sync operations summary
 func logSyncOperations(syncOps *SyncDiffTrackerReturnType) {
-	klog.Infof("Sync operations - LB additions: %d, LB removals: %d, NAT additions: %d, NAT removals: %d, locations: %d",
-		syncOps.LoadBalancerUpdates.Additions.Len(),
-		syncOps.LoadBalancerUpdates.Removals.Len(),
-		syncOps.NATGatewayUpdates.Additions.Len(),
-		syncOps.NATGatewayUpdates.Removals.Len(),
-		len(syncOps.LocationData.Locations))
+	logger := log.Background().WithName("difftracker")
+	logger.V(2).Info("Computed sync operations", "loadBalancerAdditions", syncOps.LoadBalancerUpdates.Additions.Len(), "loadBalancerRemovals", syncOps.LoadBalancerUpdates.Removals.Len(), "natGatewayAdditions", syncOps.NATGatewayUpdates.Additions.Len(), "natGatewayRemovals", syncOps.NATGatewayUpdates.Removals.Len(), "locations", len(syncOps.LocationData.Locations))
 }
 
 // startInitialization sets up initialization mode and starts updaters
 func startInitialization(ctx context.Context, diffTracker *DiffTracker) error {
+	logger := log.FromContextOrBackground(ctx)
 	diffTracker.mu.Lock()
 	atomic.StoreInt32(&diffTracker.isInitializing, 1)
 	diffTracker.initCompletionChecker = make(chan struct{})
 	diffTracker.mu.Unlock()
 
-	klog.Infof("startInitialization: starting ServiceUpdater and LocationsUpdater")
+	logger.V(2).Info("Started ServiceUpdater and LocationsUpdater")
 	diffTracker.serviceUpdater = NewServiceUpdater(ctx, diffTracker, diffTracker.OnServiceCreationComplete, diffTracker.GetServiceUpdaterTrigger())
 	diffTracker.locationsUpdater = NewLocationsUpdater(ctx, diffTracker)
 	go diffTracker.serviceUpdater.Run()
@@ -847,7 +841,7 @@ func performReconciliation(
 	endpointSliceList *discoveryv1.EndpointSliceList,
 	k8sNodes map[string]Node,
 ) error {
-	klog.Infof("performReconciliation: starting reconciliation using Engine flows")
+	logger.Infof("performReconciliation: starting reconciliation using Engine flows")
 
 	// Reconcile services (deletions first, then additions)
 	diffTracker.reconcileServices(syncOps, serviceUIDToService)
@@ -900,7 +894,7 @@ func cleanupOnError(diffTracker *DiffTracker) {
 //
 // This function fixes step 4-7 by looking up IPs from the pre-fetched PIP map.
 func recoverServiceExternalIPs(ctx context.Context, diffTracker *DiffTracker, serviceUIDToService map[string]*v1.Service, pipNameToIP map[string]string) {
-	klog.Infof("recoverServiceExternalIPs: checking for services with missing External IPs")
+	logger := log.FromContextOrBackground(ctx)
 
 	recoveredCount := 0
 	checkedCount := 0
@@ -921,40 +915,34 @@ func recoverServiceExternalIPs(ctx context.Context, diffTracker *DiffTracker, se
 
 		// Check if service already has an External IP
 		if len(svc.Status.LoadBalancer.Ingress) > 0 && svc.Status.LoadBalancer.Ingress[0].IP != "" {
-			klog.V(4).Infof("recoverServiceExternalIPs: service %s/%s already has IP %s",
-				svc.Namespace, svc.Name, svc.Status.LoadBalancer.Ingress[0].IP)
+			logger.V(5).Info("Skipped service with existing External IP", "namespace", svc.Namespace, "service", svc.Name, "ip", svc.Status.LoadBalancer.Ingress[0].IP)
 			continue
 		}
 
 		// Service exists in NRP but has no External IP in K8s - need to recover
-		klog.Infof("recoverServiceExternalIPs: service %s/%s (UID=%s) exists in NRP but has no External IP, attempting recovery",
-			svc.Namespace, svc.Name, serviceUID)
+		logger.V(2).Info("Found service missing External IP", "namespace", svc.Namespace, "service", svc.Name, "uid", serviceUID)
 
 		// Look up IP from pre-fetched PIP map (no API call needed)
 		pipName := fmt.Sprintf("%s-pip", serviceUID)
 		ipAddress, exists := pipNameToIP[strings.ToLower(pipName)]
 		if !exists || ipAddress == "" {
-			klog.Warningf("recoverServiceExternalIPs: PIP %s not found or has no IP for service %s",
-				pipName, serviceUID)
+			logger.V(4).Info("Could not recover service External IP", "publicIP", pipName, "serviceUID", serviceUID)
 			continue
 		}
 
-		klog.Infof("recoverServiceExternalIPs: found IP %s for service %s, updating K8s status",
-			ipAddress, serviceUID)
+		logger.V(5).Info("Found service External IP", "ip", ipAddress, "serviceUID", serviceUID)
 
 		// Update K8s Service status with the External IP
 		if err := diffTracker.updateServiceLoadBalancerStatus(ctx, serviceUID, ipAddress); err != nil {
-			klog.Errorf("recoverServiceExternalIPs: failed to update status for service %s/%s with IP %s: %v",
-				svc.Namespace, svc.Name, ipAddress, err)
+			logger.V(4).Info("Could not update service LoadBalancer status", "namespace", svc.Namespace, "service", svc.Name, "ip", ipAddress, "err", err)
 			continue
 		}
 
 		recoveredCount++
-		klog.Infof("recoverServiceExternalIPs: successfully recovered External IP %s for service %s/%s",
-			ipAddress, svc.Namespace, svc.Name)
+		logger.V(2).Info("Recovered service External IP", "ip", ipAddress, "namespace", svc.Namespace, "service", svc.Name)
 	}
 
-	klog.Infof("recoverServiceExternalIPs: checked %d services, recovered %d External IPs", checkedCount, recoveredCount)
+	logger.V(2).Info("Checked services for External IP recovery", "checked", checkedCount, "recovered", recoveredCount)
 }
 
 // scheduleOrphanedResourceDeletions schedules deletion of orphaned Azure resources via ServiceUpdater.
@@ -966,7 +954,7 @@ func recoverServiceExternalIPs(ctx context.Context, diffTracker *DiffTracker, se
 // If a resource exists in K8s, reconcileServices will handle it - don't delete it!
 // This uses the Engine's DeleteService flow with isOrphan=true to bypass the NRP existence check.
 func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzure, currentNATsInAzure *utilsets.IgnoreCaseSet) {
-	klog.Infof("scheduleOrphanedResourceDeletions: checking for orphaned Azure resources")
+	logger := log.Background().WithName("difftracker")
 
 	var orphanedLBs, orphanedNATs []string
 
@@ -977,12 +965,12 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 		for _, lbName := range currentLBsInAzure.UnsortedList() {
 			// Only consider UUID-named LBs (our managed LBs have UUID names)
 			if !isValidServiceUUID(lbName) {
-				klog.V(4).Infof("scheduleOrphanedResourceDeletions: skipping non-UUID LB %s", lbName)
+				logger.V(5).Info("Skipped non-UUID load balancer", "loadBalancer", lbName)
 				continue
 			}
 			// If LB is desired in K8s, reconcileServices will handle it - NOT orphaned
 			if diffTracker.K8sResources.Services.Has(lbName) {
-				klog.V(4).Infof("scheduleOrphanedResourceDeletions: LB %s exists in K8s, not orphaned", lbName)
+				logger.V(5).Info("Skipped Kubernetes load balancer", "loadBalancer", lbName)
 				continue
 			}
 			// If LB exists in Azure but not in ServiceGateway AND not in K8s, it's orphaned
@@ -1001,7 +989,7 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 			}
 			// If NAT is desired in K8s, reconcileServices will handle it - NOT orphaned
 			if diffTracker.K8sResources.Egresses.Has(natName) {
-				klog.V(4).Infof("scheduleOrphanedResourceDeletions: NAT %s exists in K8s, not orphaned", natName)
+				logger.V(5).Info("Skipped Kubernetes NAT gateway", "natGateway", natName)
 				continue
 			}
 			// If NAT exists in Azure but not in ServiceGateway AND not in K8s, it's orphaned
@@ -1015,36 +1003,35 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 
 	totalOrphans := len(orphanedLBs) + len(orphanedNATs)
 	if totalOrphans == 0 {
-		klog.Infof("scheduleOrphanedResourceDeletions: no orphaned resources found")
+		logger.V(2).Info("Found no orphaned Azure resources")
 		return
 	}
 
-	klog.Infof("scheduleOrphanedResourceDeletions: found %d orphaned LBs and %d orphaned NAT Gateways, scheduling deletion",
-		len(orphanedLBs), len(orphanedNATs))
+	logger.V(2).Info("Found orphaned Azure resources", "loadBalancers", len(orphanedLBs), "natGateways", len(orphanedNATs))
 
 	// Schedule orphaned LBs for deletion
 	for _, lbName := range orphanedLBs {
-		klog.Infof("scheduleOrphanedResourceDeletions: scheduling deletion for orphaned LB %s", lbName)
+		logger.V(5).Info("Scheduled orphaned load balancer deletion", "loadBalancer", lbName)
 		diffTracker.DeleteService(lbName, true, true) // inbound, isOrphan=true
 		recordOrphanedResourceCleaned()
 	}
 
 	// Schedule orphaned NAT Gateways for deletion
 	for _, natName := range orphanedNATs {
-		klog.Infof("scheduleOrphanedResourceDeletions: scheduling deletion for orphaned NAT Gateway %s", natName)
+		logger.V(5).Info("Scheduled orphaned NAT gateway deletion", "natGateway", natName)
 		diffTracker.DeleteService(natName, false, true) // outbound, isOrphan=true
 		recordOrphanedResourceCleaned()
 	}
 
-	klog.Infof("scheduleOrphanedResourceDeletions: scheduled %d orphaned resources for deletion", totalOrphans)
+	logger.V(2).Info("Scheduled orphaned resource deletions", "resources", totalOrphans)
 }
 
 // cleanupOrphanedPIPs attempts to cleanup orphaned Public IPs (non-fatal)
 // Uses pre-fetched PIPs from buildNRPState to avoid duplicate API calls.
 func cleanupOrphanedPIPs(ctx context.Context, diffTracker *DiffTracker, azurePIPs []*armnetwork.PublicIPAddress) {
-	klog.Infof("cleanupOrphanedPIPs: checking for orphaned Public IPs")
+	logger := log.FromContextOrBackground(ctx)
 	if err := diffTracker.cleanupOrphanedPublicIPs(ctx, azurePIPs); err != nil {
-		klog.Warningf("cleanupOrphanedPIPs: failed to cleanup orphaned Public IPs: %v", err)
+		logger.V(4).Info("Could not clean up orphaned Public IPs", "err", err)
 	}
 }
 
@@ -1210,15 +1197,16 @@ func dumpStringIntSyncMap(m *sync.Map) map[string]int {
 
 // LogSyncStringIntMap logs the contents of a sync.Map of string keys to int values
 func LogSyncStringIntMap(prefix string, m *sync.Map) {
+	logger := log.Background().WithName("difftracker")
 	tmp := dumpStringIntSyncMap(m)
 	keys := make([]string, 0, len(tmp))
 	for k := range tmp {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	klog.Infof("%s size=%d", prefix, len(keys))
+	logger.V(2).Info("Logged sync map", "prefix", prefix, "size", len(keys))
 	for _, k := range keys {
-		klog.V(4).Infof("%s entry: %s -> %d", prefix, k, tmp[k])
+		logger.V(5).Info("Logged sync map entry", "prefix", prefix, "key", k, "value", tmp[k])
 	}
 }
 
@@ -1234,6 +1222,7 @@ type WorkerPool struct {
 // NewWorkerPool creates a worker pool with the given number of workers. The context
 // cancels Submit's rate-limit wait and task hand-off so it stops accepting work on shutdown.
 func NewWorkerPool(ctx context.Context, workers int) *WorkerPool {
+	logger := log.FromContextOrBackground(ctx)
 	p := &WorkerPool{
 		ctx:   ctx,
 		tasks: make(chan func() error),
@@ -1249,7 +1238,7 @@ func NewWorkerPool(ctx context.Context, workers int) *WorkerPool {
 					defer func() {
 						if r := recover(); r != nil {
 							taskErr = fmt.Errorf("worker pool task panicked: %v", r)
-							klog.Errorf("WorkerPool: recovered from task panic: %v", r)
+							logger.V(4).Info("Recovered worker pool task panic", "err", r)
 						}
 					}()
 					return task()
@@ -1313,6 +1302,7 @@ func extractOldEndpointsFromNRP(serviceUID string, nrp NRPState) map[string]stri
 // extractNewEndpointsFromK8s extracts endpoint state from K8s endpointslices for a given service
 // Returns map[podIP]nodeIP
 func extractNewEndpointsFromK8s(serviceUID string, endpointSliceList *discoveryv1.EndpointSliceList, nodeNameToIPMap map[string]string) map[string]string {
+	logger := log.Background().WithName("difftracker")
 	newEndpoints := make(map[string]string)
 
 	for _, endpointSlice := range endpointSliceList.Items {
@@ -1337,7 +1327,7 @@ func extractNewEndpointsFromK8s(serviceUID string, endpointSliceList *discoveryv
 
 			nodeIP, exists := nodeNameToIPMap[*endpoint.NodeName]
 			if !exists {
-				klog.V(4).Infof("extractNewEndpointsFromK8s: Could not find IP for node %s", *endpoint.NodeName)
+				logger.V(5).Info("Could not find node IP", "node", *endpoint.NodeName)
 				continue
 			}
 
@@ -1392,6 +1382,7 @@ func extractNewPodsFromK8s(serviceUID string, k8sNodes map[string]Node) map[stri
 // enhanceNRPStateWithOrphans adds orphaned Azure resources to NRP state for deletion tracking
 // Orphaned resources are those that exist in Azure but not in ServiceGateway
 func enhanceNRPStateWithOrphans(nrp *NRPState, currentLBs, currentNATs utilsets.IgnoreCaseSet) {
+	logger := log.Background().WithName("difftracker")
 	orphanedLBCount := 0
 	orphanedNATCount := 0
 
@@ -1418,7 +1409,7 @@ func enhanceNRPStateWithOrphans(nrp *NRPState, currentLBs, currentNATs utilsets.
 	}
 
 	if orphanedLBCount > 0 || orphanedNATCount > 0 {
-		klog.Infof("enhanceNRPStateWithOrphans: found %d orphaned LBs and %d orphaned NAT Gateways", orphanedLBCount, orphanedNATCount)
+		logger.V(2).Info("Found orphaned Azure resources", "loadBalancers", orphanedLBCount, "natGateways", orphanedNATCount)
 	}
 }
 
@@ -1430,20 +1421,21 @@ func enhanceNRPStateWithOrphans(nrp *NRPState, currentLBs, currentNATs utilsets.
 // Calls DeleteService for removals, AddService for additions
 // This is the ONLY reconciliation method still needed - endpoint/pod reconciliation is redundant
 func (dt *DiffTracker) reconcileServices(syncOps *SyncDiffTrackerReturnType, serviceUIDToService map[string]*v1.Service) {
-	klog.Infof("reconcileServices: starting service reconciliation")
+	logger := dt.logger
+	logger.V(2).Info("Started service reconciliation")
 
 	// Process deletions first (LB + NAT deletions)
 	totalDeletions := syncOps.LoadBalancerUpdates.Removals.Len() + syncOps.NATGatewayUpdates.Removals.Len()
 	if totalDeletions > 0 {
-		klog.Infof("reconcileServices: processing %d service deletions", totalDeletions)
+		logger.V(2).Info("Processed service deletions", "services", totalDeletions)
 
 		// Call DeleteService for each service - they'll be batched by ServiceUpdater
 		for _, serviceUID := range syncOps.LoadBalancerUpdates.Removals.UnsortedList() {
-			klog.V(3).Infof("reconcileServices: calling DeleteService for LB %s", serviceUID)
+			logger.V(5).Info("Called DeleteService for load balancer", "serviceUID", serviceUID)
 			dt.DeleteService(serviceUID, true, false) // inbound, not orphan
 		}
 		for _, serviceUID := range syncOps.NATGatewayUpdates.Removals.UnsortedList() {
-			klog.V(3).Infof("reconcileServices: calling DeleteService for NAT %s", serviceUID)
+			logger.V(5).Info("Called DeleteService for NAT gateway", "serviceUID", serviceUID)
 			dt.DeleteService(serviceUID, false, false) // outbound, not orphan
 		}
 	}
@@ -1454,8 +1446,7 @@ func (dt *DiffTracker) reconcileServices(syncOps *SyncDiffTrackerReturnType, ser
 	totalAdditions := len(lbAdditions) + len(natAdditions)
 
 	if totalAdditions > 0 {
-		klog.Infof("reconcileServices: processing %d service additions (%d LBs, %d NATs)",
-			totalAdditions, len(lbAdditions), len(natAdditions))
+		logger.V(2).Info("Processed service additions", "services", totalAdditions, "loadBalancers", len(lbAdditions), "natGateways", len(natAdditions))
 
 		for _, serviceUID := range lbAdditions {
 			svc, exists := serviceUIDToService[serviceUID]
@@ -1464,18 +1455,18 @@ func (dt *DiffTracker) reconcileServices(syncOps *SyncDiffTrackerReturnType, ser
 				inboundConfig = ExtractInboundConfigFromService(svc)
 			}
 			config := NewInboundServiceConfig(serviceUID, inboundConfig)
-			klog.V(3).Infof("reconcileServices: calling AddService for LB %s", serviceUID)
+			logger.V(5).Info("Called AddService for load balancer", "serviceUID", serviceUID)
 			dt.AddService(config)
 		}
 
 		for _, serviceUID := range natAdditions {
 			config := NewOutboundServiceConfig(serviceUID, nil)
-			klog.V(3).Infof("reconcileServices: calling AddService for NAT %s", serviceUID)
+			logger.V(5).Info("Called AddService for NAT gateway", "serviceUID", serviceUID)
 			dt.AddService(config)
 		}
 	}
 
-	klog.Infof("reconcileServices: completed service reconciliation")
+	logger.V(2).Info("Completed service reconciliation")
 }
 
 /*
@@ -1489,7 +1480,7 @@ func (dt *DiffTracker) reconcileServices(syncOps *SyncDiffTrackerReturnType, ser
 // reconcileInboundEndpoints reconciles endpoints for all inbound (LoadBalancer) services
 // Calls UpdateEndpoints with old state from NRP and new state from K8s
 func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRPState, endpointSliceList *discoveryv1.EndpointSliceList, nodeNameToIPMap map[string]string) {
-	klog.Infof("reconcileInboundEndpoints: starting endpoint reconciliation")
+	logger.Infof("reconcileInboundEndpoints: starting endpoint reconciliation")
 
 	// Build union of all services: K8s services + NRP services
 	// We need to process both to handle:
@@ -1514,14 +1505,14 @@ func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRPState, endpointSliceList
 
 		// Only call UpdateEndpoints if there's a difference
 		if len(oldEndpoints) > 0 || len(newEndpoints) > 0 {
-			klog.V(3).Infof("reconcileInboundEndpoints: calling UpdateEndpoints for %s (old=%d, new=%d)",
+			logger.V(3).Infof("reconcileInboundEndpoints: calling UpdateEndpoints for %s (old=%d, new=%d)",
 				serviceUID, len(oldEndpoints), len(newEndpoints))
 			dt.UpdateEndpoints(serviceUID, oldEndpoints, newEndpoints)
 			processedCount++
 		}
 	}
 
-	klog.Infof("reconcileInboundEndpoints: completed endpoint reconciliation for %d services", processedCount)
+	logger.Infof("reconcileInboundEndpoints: completed endpoint reconciliation for %d services", processedCount)
 }
 */
 
@@ -1536,7 +1527,7 @@ func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRPState, endpointSliceList
 // reconcileOutboundPods reconciles pods for all outbound (NAT Gateway) services
 // Calls DeletePod for NRP-only pods, AddPod for K8s-only pods
 func (dt *DiffTracker) reconcileOutboundPods(nrp NRPState, k8sNodes map[string]Node) {
-	klog.Infof("reconcileOutboundPods: starting pod reconciliation")
+	logger.Infof("reconcileOutboundPods: starting pod reconciliation")
 
 	// Build union of all services: K8s egresses + NRP NAT Gateways
 	// We need to process both to handle:
@@ -1566,11 +1557,11 @@ func (dt *DiffTracker) reconcileOutboundPods(nrp NRPState, k8sNodes map[string]N
 				// Parse key back into location and address
 				parts := strings.Split(key, ":")
 				if len(parts) != 2 {
-					klog.Warningf("reconcileOutboundPods: invalid key format %s", key)
+					logger.Warningf("reconcileOutboundPods: invalid key format %s", key)
 					continue
 				}
 				location, address := parts[0], parts[1]
-				klog.V(3).Infof("reconcileOutboundPods: calling DeletePod for %s (location=%s, address=%s)",
+				logger.V(3).Infof("reconcileOutboundPods: calling DeletePod for %s (location=%s, address=%s)",
 					serviceUID, location, address)
 				// During initialization, we don't have namespace/name - pass empty strings
 				// This is fine because orphaned NRP entries don't need pod finalizer tracking
@@ -1585,11 +1576,11 @@ func (dt *DiffTracker) reconcileOutboundPods(nrp NRPState, k8sNodes map[string]N
 				// Parse key back into location and address
 				parts := strings.Split(key, ":")
 				if len(parts) != 2 {
-					klog.Warningf("reconcileOutboundPods: invalid key format %s", key)
+					logger.Warningf("reconcileOutboundPods: invalid key format %s", key)
 					continue
 				}
 				location, address := parts[0], parts[1]
-				klog.V(3).Infof("reconcileOutboundPods: calling AddPod for %s (podKey=%s, location=%s, address=%s)",
+				logger.V(3).Infof("reconcileOutboundPods: calling AddPod for %s (podKey=%s, location=%s, address=%s)",
 					serviceUID, podKey, location, address)
 				dt.AddPod(serviceUID, podKey, location, address)
 				addCount++
@@ -1597,7 +1588,7 @@ func (dt *DiffTracker) reconcileOutboundPods(nrp NRPState, k8sNodes map[string]N
 		}
 	}
 
-	klog.Infof("reconcileOutboundPods: completed pod reconciliation (added=%d, deleted=%d)", addCount, deleteCount)
+	logger.Infof("reconcileOutboundPods: completed pod reconciliation (added=%d, deleted=%d)", addCount, deleteCount)
 }
 */
 
@@ -1606,7 +1597,8 @@ func (dt *DiffTracker) reconcileOutboundPods(nrp NRPState, k8sNodes map[string]N
 // Uses pre-fetched PIPs from initialization to avoid duplicate API calls.
 // If pips is nil, falls back to fetching from Azure (for non-initialization use cases).
 func (dt *DiffTracker) cleanupOrphanedPublicIPs(ctx context.Context, pips []*armnetwork.PublicIPAddress) error {
-	klog.V(3).Infof("cleanupOrphanedPublicIPs: starting orphaned PIP cleanup")
+	logger := dt.logger
+	logger.V(2).Info("Started orphaned Public IP cleanup")
 
 	// If PIPs not provided, fetch them (fallback for non-initialization calls)
 	if pips == nil {
@@ -1629,19 +1621,19 @@ func (dt *DiffTracker) cleanupOrphanedPublicIPs(ctx context.Context, pips []*arm
 
 		// Skip PIPs that don't follow our naming convention (must end with "-pip")
 		if !strings.HasSuffix(pipName, "-pip") {
-			klog.V(4).Infof("cleanupOrphanedPublicIPs: skipping PIP %s (doesn't follow naming convention)", pipName)
+			logger.V(5).Info("Skipped Public IP with unexpected name", "publicIP", pipName)
 			continue
 		}
 
 		// Skip the default NAT Gateway PIP
 		if pipName == "default-natgw-pip" {
-			klog.V(4).Infof("cleanupOrphanedPublicIPs: skipping default NAT Gateway PIP")
+			logger.V(5).Info("Skipped default NAT gateway Public IP")
 			continue
 		}
 
 		// Skip PIPs that are still attached to a resource (will fail deletion with "PublicIPAddressCannotBeDeleted")
 		if pip.Properties != nil && pip.Properties.IPConfiguration != nil {
-			klog.V(4).Infof("cleanupOrphanedPublicIPs: skipping PIP %s (still attached to resource)", pipName)
+			logger.V(5).Info("Skipped attached Public IP", "publicIP", pipName)
 			continue
 		}
 
@@ -1660,11 +1652,11 @@ func (dt *DiffTracker) cleanupOrphanedPublicIPs(ctx context.Context, pips []*arm
 	dt.mu.Unlock()
 
 	if len(orphanedPIPs) == 0 {
-		klog.Infof("cleanupOrphanedPublicIPs: no orphaned Public IPs found")
+		logger.V(2).Info("Found no orphaned Public IPs")
 		return nil
 	}
 
-	klog.Infof("cleanupOrphanedPublicIPs: found %d orphaned Public IPs, deleting them", len(orphanedPIPs))
+	logger.V(2).Info("Found orphaned Public IPs", "publicIPs", len(orphanedPIPs))
 
 	// Delete orphaned PIPs in parallel using WorkerPool
 	pool := NewWorkerPool(ctx, workerPoolSize)
@@ -1672,22 +1664,19 @@ func (dt *DiffTracker) cleanupOrphanedPublicIPs(ctx context.Context, pips []*arm
 	for _, pipName := range orphanedPIPs {
 		pipName := pipName // capture for closure
 		pool.Submit(func() error {
-			klog.V(3).Infof("cleanupOrphanedPublicIPs: deleting orphaned Public IP %s", pipName)
 			if err := dt.deletePublicIP(ctx, dt.config.ResourceGroup, pipName); err != nil {
-				klog.Warningf("cleanupOrphanedPublicIPs: failed to delete orphaned Public IP %s: %v", pipName, err)
-				return err
+				return fmt.Errorf("deleting orphaned Public IP %s: %w", pipName, err)
 			}
 			atomic.AddInt32(&deletedCount, 1)
-			klog.V(3).Infof("cleanupOrphanedPublicIPs: deleted orphaned Public IP %s", pipName)
+			logger.V(5).Info("Deleted orphaned Public IP", "publicIP", pipName)
 			return nil
 		})
 	}
 
 	if err := pool.Wait(); err != nil {
-		klog.Warningf("cleanupOrphanedPublicIPs: completed with errors: %v", err)
-		return err
+		return fmt.Errorf("waiting for orphaned Public IP cleanup: %w", err)
 	}
 
-	klog.Infof("cleanupOrphanedPublicIPs: successfully deleted %d orphaned Public IPs", atomic.LoadInt32(&deletedCount))
+	logger.V(2).Info("Deleted orphaned Public IPs", "publicIPs", atomic.LoadInt32(&deletedCount))
 	return nil
 }
