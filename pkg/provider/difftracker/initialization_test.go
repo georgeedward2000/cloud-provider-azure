@@ -1,7 +1,6 @@
 package difftracker
 
 import (
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,83 +8,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
-
-func TestLogSyncStringIntMap_EmptyMap(t *testing.T) {
-	m := &sync.Map{}
-	// Should not panic with empty map
-	LogSyncStringIntMap("test", m)
-}
-
-func TestLogSyncStringIntMap_WithData(t *testing.T) {
-	m := &sync.Map{}
-	m.Store("service1", 10)
-	m.Store("service2", 20)
-	m.Store("service3", -34)
-
-	// Should not panic with data
-	LogSyncStringIntMap("test", m)
-}
-
-func TestDumpStringIntSyncMap_VariousTypes(t *testing.T) {
-	m := &sync.Map{}
-	m.Store("int", 42)
-	m.Store("int32", int32(32))
-	m.Store("int64", int64(64))
-	intVal := 100
-	m.Store("intptr", &intVal)
-
-	result := dumpStringIntSyncMap(m)
-
-	assert.Equal(t, 42, result["int"])
-	assert.Equal(t, 32, result["int32"])
-	assert.Equal(t, 64, result["int64"])
-	assert.Equal(t, 100, result["intptr"])
-}
-
-func TestDumpStringIntSyncMap_NilPointer(t *testing.T) {
-	m := &sync.Map{}
-	var nilInt *int
-	m.Store("nilptr", nilInt)
-
-	result := dumpStringIntSyncMap(m)
-
-	// Nil pointer should not appear in result
-	_, exists := result["nilptr"]
-	assert.False(t, exists)
-}
-
-func TestSyncMapFromMap_Empty(t *testing.T) {
-	input := make(map[string]int)
-	result := syncMapFromMap(input)
-
-	assert.NotNil(t, result)
-	// Should be empty
-	count := 0
-	result.Range(func(k, v any) bool {
-		count++
-		return true
-	})
-	assert.Equal(t, 0, count)
-}
-
-func TestSyncMapFromMap_WithData(t *testing.T) {
-	input := map[string]int{
-		"service1": 10,
-		"service2": 20,
-		"service3": -34,
-	}
-
-	result := syncMapFromMap(input)
-
-	assert.NotNil(t, result)
-
-	// Verify all entries transferred
-	for key, expectedVal := range input {
-		val, ok := result.Load(key)
-		assert.True(t, ok, "Key %s should exist", key)
-		assert.Equal(t, expectedVal, val, "Value for key %s should match", key)
-	}
-}
 
 func TestNewIgnoreCaseSetFromSlice_Duplicates(t *testing.T) {
 	items := []string{"service1", "SERVICE1", "service1", "service2"}

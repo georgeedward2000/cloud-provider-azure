@@ -27,13 +27,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	v1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
@@ -229,31 +232,28 @@ func TestGuardInitAdversarial_C7_TerminalEgressPodsSkipped(t *testing.T) {
 
 			k8s := newInitTestK8sState()
 			nodeNameToIPMap := map[string]string{nodeName: nodeIP}
-			seedMap := map[string]int{}
 
 			pod := makeEgressPod("pod-c7", "default", egressVal, nodeName, podIP, tc.phase)
 			kube := fake.NewSimpleClientset(pod)
 
-			_, err := processK8sEgresses(context.Background(), kube, &k8s, nodeNameToIPMap, seedMap)
+			_, err := processK8sEgresses(context.Background(), kube, &k8s, nodeNameToIPMap)
 			assert.NoError(t, err)
 
 			// C7_TERMINAL_PODS: a terminal egress pod must not be seeded anywhere.
 			assert.False(t, k8s.Egresses.Has(egressVal),
 				"C7_TERMINAL_PODS: terminal-phase (%s) egress pod must NOT be inserted into K8s egress state", tc.phase)
-			assert.Equal(t, 0, seedMap[egressVal],
-				"C7_TERMINAL_PODS: terminal-phase (%s) egress pod must NOT increment the outbound ref-count seed", tc.phase)
 			assert.False(t, podIPInK8sState(&k8s, podIP),
 				"C7_TERMINAL_PODS: terminal-phase (%s) egress pod IP must NOT be added to K8s state", tc.phase)
 		})
 	}
 }
 
-// C21_REFCOUNT_NEG — init counter seeding must not produce a NEGATIVE
-// outboundIdentityPodRefCount when an inbound LoadBalancer service UID collides with a
-// pod egress label. processK8sServices seeds the inbound sentinel (-34) into the SAME
-// map that processK8sEgresses increments; a UID/label collision leaves the egress
-// identity seeded at a negative value, which then poisons DeletePod's `counter <= 0`
-// guard and blocks pod removal (finalizer leak).
+// C21_REFCOUNT_NEG — the outbound ref-counter must never be seeded NEGATIVE when an
+// inbound LoadBalancer service UID collides with a pod egress label. The legacy
+// localServiceNameToNRPServiceMap (which mixed the inbound -34 sentinel into the same map
+// that fed the egress counter) has been removed; outboundIdentityPodRefCount is now seeded
+// solely by New() from real egress pods, so a collision must yield the egress pod count (1),
+// never a poisoned negative value that would block DeletePod's `counter <= 0` guard.
 func TestGuardInitAdversarial_C21_RefCountNeverNegativeOnUIDCollision(t *testing.T) {
 	const (
 		collideID = "collide-c21" // serves as BOTH the inbound svc UID and the egress label
@@ -274,28 +274,44 @@ func TestGuardInitAdversarial_C21_RefCountNeverNegativeOnUIDCollision(t *testing
 	kube := fake.NewSimpleClientset(svc, pod)
 
 	k8s := newInitTestK8sState()
-	seedMap := map[string]int{}
 	nodeNameToIPMap := map[string]string{nodeName: nodeIP}
 
-	// Seed inbound services first (sets the -34 sentinel for the colliding UID), then egresses.
-	_, _, err := processK8sServices(context.Background(), kube, &k8s, seedMap)
+	// Build the cold-start K8s state: inbound LB service + colliding egress pod.
+	_, _, err := processK8sServices(context.Background(), kube, &k8s)
 	assert.NoError(t, err)
-	_, err = processK8sEgresses(context.Background(), kube, &k8s, nodeNameToIPMap, seedMap)
+	_, err = processK8sEgresses(context.Background(), kube, &k8s, nodeNameToIPMap)
 	assert.NoError(t, err)
 
-	// C21_REFCOUNT_NEG (root cause): the seeded outbound ref-count must never be negative.
-	assert.GreaterOrEqual(t, seedMap[collideID], 0,
-		"C21_REFCOUNT_NEG: inbound-UID/egress-label collision must not seed a NEGATIVE outbound ref-count (got %d)", seedMap[collideID])
+	// New() seeds outboundIdentityPodRefCount from the egress pods now present in k8s state.
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	nrp := NRPState{
+		LoadBalancers: utilsets.NewString(),
+		NATGateways:   utilsets.NewString(),
+		Locations:     map[string]NRPLocation{},
+	}
+	cfg := Config{
+		SubscriptionID:             "sub",
+		ResourceGroup:              "rg",
+		Location:                   "loc",
+		ServiceGatewayResourceName: "sgw",
+		ServiceGatewayID:           "/sgw/id",
+		VNetName:                   "vnet",
+	}
+	dt, err := New(logr.Discard(), k8s, nrp, cfg, mock_azclient.NewMockClientFactory(ctrl), kube)
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
 
-	// C21_REFCOUNT_NEG (downstream effect): a poisoned negative counter must not block DeletePod.
-	dt := newTestDiffTracker()
-	dt.outboundIdentityPodRefCount.Store(strings.ToLower(collideID), seedMap[collideID])
-	node := newNode()
-	p := newPod()
-	p.PublicOutboundIdentity = collideID
-	node.Pods[podIP] = p
-	dt.K8sResources.Nodes[nodeIP] = node
+	v, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(collideID))
+	assert.True(t, ok, "C21_REFCOUNT_NEG: colliding egress identity must be seeded")
+	assert.GreaterOrEqual(t, v.(int), 0,
+		"C21_REFCOUNT_NEG: inbound-UID/egress-label collision must not seed a NEGATIVE outbound ref-count (got %v)", v)
+	assert.Equal(t, 1, v.(int),
+		"C21_REFCOUNT_NEG: outbound ref-count must equal the egress pod count (1), not a poisoned value")
 
+	// C21_REFCOUNT_NEG (downstream effect): a correct (non-negative) counter must allow DeletePod
+	// to complete; a poisoned negative counter would trip the `counter <= 0` guard and block removal.
 	res := dt.DeletePod(collideID, nodeIP, podIP, "default", "pod-c21")
 	assert.True(t, res.IsLastPod,
 		"C21_REFCOUNT_NEG: with exactly one live egress pod the ref-count must be 1 (last pod); a poisoned negative counter blocks DeletePod")

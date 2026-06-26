@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +16,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
@@ -69,7 +69,7 @@ func InitializeFromCluster(
 	}
 
 	// Build K8s state from cluster (also returns lists for reuse by recoverStuckFinalizers)
-	k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, localServiceNameToNRPServiceMap, nodeNameToIPMap, err := buildK8sState(ctx, kubeClient)
+	k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, nodeNameToIPMap, err := buildK8sState(ctx, kubeClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build K8s state: %w", err)
 	}
@@ -82,7 +82,7 @@ func InitializeFromCluster(
 	}
 
 	// Initialize DiffTracker with computed state
-	diffTracker, err := initializeDiffTrackerWithState(log.FromContextOrBackground(ctx), k8s, nrp, config, networkClientFactory, kubeClient, localServiceNameToNRPServiceMap)
+	diffTracker, err := initializeDiffTrackerWithState(log.FromContextOrBackground(ctx), k8s, nrp, config, networkClientFactory, kubeClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize DiffTracker: %w", err)
 	}
@@ -200,39 +200,38 @@ func validateInitializationInputs(kubeClient kubernetes.Interface, networkClient
 func buildK8sState(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
-) (K8sState, *v1.ServiceList, map[string]*v1.Service, *discoveryv1.EndpointSliceList, *v1.PodList, map[string]int, map[string]string, error) {
+) (K8sState, *v1.ServiceList, map[string]*v1.Service, *discoveryv1.EndpointSliceList, *v1.PodList, map[string]string, error) {
 	k8s := K8sState{
 		Services: utilsets.NewString(),
 		Egresses: utilsets.NewString(),
 		Nodes:    make(map[string]Node),
 	}
-	localServiceNameToNRPServiceMap := make(map[string]int)
 
 	// Build node name to IP mapping
 	nodeNameToIPMap, err := buildNodeNameToIPMap(ctx, kubeClient)
 	if err != nil {
-		return K8sState{}, nil, nil, nil, nil, nil, nil, err
+		return K8sState{}, nil, nil, nil, nil, nil, err
 	}
 
 	// Fetch and process services
-	serviceList, serviceUIDToService, err := processK8sServices(ctx, kubeClient, &k8s, localServiceNameToNRPServiceMap)
+	serviceList, serviceUIDToService, err := processK8sServices(ctx, kubeClient, &k8s)
 	if err != nil {
-		return K8sState{}, nil, nil, nil, nil, nil, nil, err
+		return K8sState{}, nil, nil, nil, nil, nil, err
 	}
 
 	// Fetch and process endpoint slices
 	endpointSliceList, err := processK8sEndpoints(ctx, kubeClient, &k8s, nodeNameToIPMap)
 	if err != nil {
-		return K8sState{}, nil, nil, nil, nil, nil, nil, err
+		return K8sState{}, nil, nil, nil, nil, nil, err
 	}
 
 	// Fetch and process egress pods
-	egressPodList, err := processK8sEgresses(ctx, kubeClient, &k8s, nodeNameToIPMap, localServiceNameToNRPServiceMap)
+	egressPodList, err := processK8sEgresses(ctx, kubeClient, &k8s, nodeNameToIPMap)
 	if err != nil {
-		return K8sState{}, nil, nil, nil, nil, nil, nil, err
+		return K8sState{}, nil, nil, nil, nil, nil, err
 	}
 
-	return k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, localServiceNameToNRPServiceMap, nodeNameToIPMap, nil
+	return k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, nodeNameToIPMap, nil
 }
 
 // buildNodeNameToIPMap creates a mapping from node names to their internal IPs
@@ -464,7 +463,6 @@ func processK8sServices(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
 	k8s *K8sState,
-	localServiceNameToNRPServiceMap map[string]int,
 ) (*v1.ServiceList, map[string]*v1.Service, error) {
 	logger := log.FromContextOrBackground(ctx)
 	services, err := kubeClient.CoreV1().Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
@@ -483,8 +481,6 @@ func processK8sServices(
 			}
 			uid := strings.ToLower(string(service.UID))
 			k8s.Services.Insert(uid)
-			// Initialize reference counter with sentinel value -34
-			localServiceNameToNRPServiceMap[uid] = -34
 			serviceUIDToService[uid] = &services.Items[i]
 		}
 	}
@@ -522,6 +518,15 @@ func processK8sEndpoints(
 		}
 
 		for _, endpoint := range endpointSlice.Endpoints {
+			// Skip endpoints that are not ready, matching the runtime EndpointSlice informer
+			// path (getPodIPToNodeIPMapFromEndpointSlice). Per the EndpointSlice API contract a
+			// nil Ready condition is interpreted as "true", so only an explicit Ready=false
+			// endpoint is excluded. Without this, a CCM restart imports not-ready pod IPs as LB
+			// backends that the runtime diff can never remove (they were never in its snapshots),
+			// leaving stale/blackhole backends until the next restart.
+			if !ptr.Deref(endpoint.Conditions.Ready, true) {
+				continue
+			}
 			if endpoint.NodeName == nil || len(endpoint.Addresses) == 0 {
 				continue
 			}
@@ -552,7 +557,6 @@ func processK8sEgresses(
 	kubeClient kubernetes.Interface,
 	k8s *K8sState,
 	nodeNameToIPMap map[string]string,
-	localServiceNameToNRPServiceMap map[string]int,
 ) (*v1.PodList, error) {
 	logger := log.FromContextOrBackground(ctx)
 	egressPods, err := kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
@@ -586,7 +590,6 @@ func processK8sEgresses(
 
 		ensureNodeExists(k8s, nodeIP)
 		addOutboundIdentityToPod(k8s, nodeIP, pod.Status.PodIP, egressVal)
-		localServiceNameToNRPServiceMap[egressVal] = localServiceNameToNRPServiceMap[egressVal] + 1
 	}
 	logger.V(2).Info("Processed Kubernetes egress services", "egresses", k8s.Egresses.Len())
 	return egressPods, nil
@@ -786,6 +789,9 @@ func fetchAzurePublicIPs(
 }
 
 // initializeDiffTrackerWithState creates a DiffTracker and populates initial state
+// initializeDiffTrackerWithState creates a DiffTracker and populates initial state.
+// The outbound ref-counter (outboundIdentityPodRefCount) is seeded inside New() from the
+// egress pods already present in k8s state, so no further seeding is required here.
 func initializeDiffTrackerWithState(
 	logger logr.Logger,
 	k8s K8sState,
@@ -793,15 +799,8 @@ func initializeDiffTrackerWithState(
 	config Config,
 	networkClientFactory azclient.ClientFactory,
 	kubeClient kubernetes.Interface,
-	localServiceNameToNRPServiceMap map[string]int,
 ) (*DiffTracker, error) {
-	diffTracker, err := New(logger, k8s, nrp, config, networkClientFactory, kubeClient)
-	if err != nil {
-		return nil, err
-	}
-	diffTracker.outboundIdentityPodRefCount = *syncMapFromMap(localServiceNameToNRPServiceMap)
-	LogSyncStringIntMap("initializeDiffTrackerWithState: outboundIdentityPodRefCount", &diffTracker.outboundIdentityPodRefCount)
-	return diffTracker, nil
+	return New(logger, k8s, nrp, config, networkClientFactory, kubeClient)
 }
 
 // logSyncOperations logs the sync operations summary
@@ -1160,55 +1159,6 @@ func parseLocationAddresses(location interface{}) map[string]NRPAddress {
 }
 
 // Helper functions
-
-func syncMapFromMap(localServiceNameToNRPServiceMap map[string]int) *sync.Map {
-	var syncMap sync.Map
-	for k, v := range localServiceNameToNRPServiceMap {
-		syncMap.Store(k, v)
-	}
-	return &syncMap
-}
-
-func dumpStringIntSyncMap(m *sync.Map) map[string]int {
-	out := make(map[string]int)
-	m.Range(func(k, v any) bool {
-		ks, ok := k.(string)
-		if !ok {
-			return true
-		}
-		switch vv := v.(type) {
-		case int:
-			out[ks] = vv
-		case int32:
-			out[ks] = int(vv)
-		case int64:
-			out[ks] = int(vv)
-		case *int:
-			if vv != nil {
-				out[ks] = *vv
-			}
-		default:
-			out[ks] = 0
-		}
-		return true
-	})
-	return out
-}
-
-// LogSyncStringIntMap logs the contents of a sync.Map of string keys to int values
-func LogSyncStringIntMap(prefix string, m *sync.Map) {
-	logger := log.Background().WithName("difftracker")
-	tmp := dumpStringIntSyncMap(m)
-	keys := make([]string, 0, len(tmp))
-	for k := range tmp {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	logger.V(2).Info("Logged sync map", "prefix", prefix, "size", len(keys))
-	for _, k := range keys {
-		logger.V(5).Info("Logged sync map entry", "prefix", prefix, "key", k, "value", tmp[k])
-	}
-}
 
 // WorkerPool manages a pool of worker goroutines for parallel task execution
 type WorkerPool struct {
