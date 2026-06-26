@@ -208,12 +208,13 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 		dt.triggerLocationsUpdater()
 
 	case StateDeletionPending:
-		// Service is pending deletion - still process endpoint removals to clear NRP locations
-		klog.V(2).Infof("Engine.UpdateEndpoints: Service %s is pending deletion, processing endpoint update to clear locations (old=%d, new=%d)", serviceUID, len(oldPodIPToNodeIP), len(newPodIPToNodeIP))
+		// Service is pending deletion - process removals only. NewAddresses is dropped so
+		// a service being torn down cannot re-insert pod refs that delete-success never scrubs.
+		klog.V(2).Infof("Engine.UpdateEndpoints: Service %s is pending deletion, processing endpoint removals to clear locations (old=%d, new ignored=%d)", serviceUID, len(oldPodIPToNodeIP), len(newPodIPToNodeIP))
 		errs := dt.updateK8sEndpointsLocked(UpdateK8sEndpointsInputType{
 			InboundIdentity: serviceUID,
 			OldAddresses:    oldPodIPToNodeIP,
-			NewAddresses:    newPodIPToNodeIP,
+			NewAddresses:    nil,
 		})
 		if len(errs) > 0 {
 			klog.Errorf("Engine.UpdateEndpoints: Failed to update endpoints for service %s: %v", serviceUID, errs)
@@ -510,7 +511,6 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 // For creation: promotes buffered endpoints/pods and updates the service state.
 // For deletion: cleans up Engine state.
 func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool, err error) {
-	startTime := time.Now()
 	defer func() {
 		updatePendingServiceOperationsMetric(dt)
 		updatePendingOperationOldestAgeMetric(dt)
@@ -523,6 +523,13 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 	if !exists {
 		klog.Warningf("Engine.OnServiceCreationComplete: Service %s not found in pending operations", serviceUID)
 		return
+	}
+
+	// Measure latency from when the operation was dispatched (in processBatch), not from
+	// this callback which runs after the Azure work is done. Fall back to now if unset.
+	startTime := opState.OperationStartedAt
+	if startTime.IsZero() {
+		startTime = time.Now()
 	}
 
 	// PRE-EMPT: if a Delete arrived during the in-flight create/update, DeleteService

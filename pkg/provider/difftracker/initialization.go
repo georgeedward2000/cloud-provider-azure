@@ -1224,15 +1224,18 @@ func LogSyncStringIntMap(prefix string, m *sync.Map) {
 
 // WorkerPool manages a pool of worker goroutines for parallel task execution
 type WorkerPool struct {
+	ctx   context.Context
 	tasks chan func() error
 	wg    sync.WaitGroup
 	mu    sync.Mutex
 	err   error
 }
 
-// NewWorkerPool creates a new worker pool with the specified number of workers
-func NewWorkerPool(workers int) *WorkerPool {
+// NewWorkerPool creates a worker pool with the given number of workers. The context
+// cancels Submit's rate-limit wait and task hand-off so it stops accepting work on shutdown.
+func NewWorkerPool(ctx context.Context, workers int) *WorkerPool {
 	p := &WorkerPool{
+		ctx:   ctx,
 		tasks: make(chan func() error),
 	}
 	for i := 0; i < workers; i++ {
@@ -1240,7 +1243,18 @@ func NewWorkerPool(workers int) *WorkerPool {
 		go func() {
 			defer p.wg.Done()
 			for task := range p.tasks {
-				if err := task(); err != nil {
+				// Recover task panics so one failed task is recorded as a pool error
+				// rather than crashing the process.
+				err := func() (taskErr error) {
+					defer func() {
+						if r := recover(); r != nil {
+							taskErr = fmt.Errorf("worker pool task panicked: %v", r)
+							klog.Errorf("WorkerPool: recovered from task panic: %v", r)
+						}
+					}()
+					return task()
+				}()
+				if err != nil {
 					p.mu.Lock()
 					if p.err == nil {
 						p.err = err
@@ -1253,10 +1267,18 @@ func NewWorkerPool(workers int) *WorkerPool {
 	return p
 }
 
-// Submit adds a task to the worker pool with inter-task delay for rate limiting
+// Submit adds a task to the pool after a rate-limit delay. Both the delay and the
+// hand-off are cancellable via the pool context so shutdown is not blocked.
 func (p *WorkerPool) Submit(task func() error) {
-	time.Sleep(taskDelay)
-	p.tasks <- task
+	select {
+	case <-p.ctx.Done():
+		return
+	case <-time.After(taskDelay):
+	}
+	select {
+	case p.tasks <- task:
+	case <-p.ctx.Done():
+	}
 }
 
 // Wait closes the task channel and waits for all workers to complete, returning the first error encountered
@@ -1645,7 +1667,7 @@ func (dt *DiffTracker) cleanupOrphanedPublicIPs(ctx context.Context, pips []*arm
 	klog.Infof("cleanupOrphanedPublicIPs: found %d orphaned Public IPs, deleting them", len(orphanedPIPs))
 
 	// Delete orphaned PIPs in parallel using WorkerPool
-	pool := NewWorkerPool(workerPoolSize)
+	pool := NewWorkerPool(ctx, workerPoolSize)
 	var deletedCount int32
 	for _, pipName := range orphanedPIPs {
 		pipName := pipName // capture for closure

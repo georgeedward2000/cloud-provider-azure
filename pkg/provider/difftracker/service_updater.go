@@ -159,6 +159,7 @@ func (s *ServiceUpdater) processBatch() {
 			}
 			// Transition to CreationInProgress
 			opState.State = StateCreationInProgress
+			opState.OperationStartedAt = time.Now()
 			configSnapshot := opState.Config
 			opState.InFlightConfig = &configSnapshot
 			workToDo = append(workToDo, workItem{serviceUID, configSnapshot, StateCreationInProgress, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
@@ -187,10 +188,12 @@ func (s *ServiceUpdater) processBatch() {
 			klog.V(4).Infof("ServiceUpdater: service %s in StateDeletionPending, waiting for locations to be cleared", serviceUID)
 
 		case StateDeletionInProgress:
+			opState.OperationStartedAt = time.Now()
 			workToDo = append(workToDo, workItem{serviceUID, opState.Config, StateDeletionInProgress, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
 
 		case StateUpdateInProgress:
 			// Snapshot the desired config so OnServiceCreationComplete can detect drift.
+			opState.OperationStartedAt = time.Now()
 			configSnapshot := opState.Config
 			opState.InFlightConfig = &configSnapshot
 			workToDo = append(workToDo, workItem{serviceUID, configSnapshot, StateUpdateInProgress, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})

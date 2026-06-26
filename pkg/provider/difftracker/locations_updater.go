@@ -113,6 +113,12 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 		// still be processed so their finalizers are not left pending.
 		lu.diffTracker.CheckPendingServiceDeletions()
 		lu.diffTracker.CheckPendingPodDeletions(ctx)
+		if lu.initPodFinalizersStillPending() {
+			// During init, retry instead of reporting success: CheckPendingPodDeletions
+			// swallows transient errors, and init completion requires pendingPodDeletions==0.
+			klog.Warningf("LocationsUpdater: init pod-finalizer removal incomplete; retrying")
+			return
+		}
 		isOperationSucceeded = true
 		return
 	}
@@ -157,7 +163,28 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	// in podInformerRemovePod(), not here.
 	lu.diffTracker.CheckPendingPodDeletions(ctx)
 
+	if lu.initPodFinalizersStillPending() {
+		// During init, a transient finalizer-removal failure must retry rather than
+		// report success, which would hang WaitForInitialSync.
+		klog.Warningf("LocationsUpdater: init pod-finalizer removal incomplete after sync; retrying")
+		return
+	}
+
 	isOperationSucceeded = true
+}
+
+// initPodFinalizersStillPending reports whether init is in progress and recovered pod
+// deletions remain. Init completion requires pendingPodDeletions==0, and
+// CheckPendingPodDeletions swallows transient errors, so process() uses this to keep
+// retrying during init. Returns false post-init (steady-state behavior unchanged).
+func (lu *LocationsUpdater) initPodFinalizersStillPending() bool {
+	dt := lu.diffTracker
+	if atomic.LoadInt32(&dt.isInitializing) != 1 {
+		return false
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	return len(dt.pendingPodDeletions) > 0
 }
 
 // backoffAndRetry waits a bounded, jittered delay and then re-triggers the LocationsUpdater

@@ -350,6 +350,11 @@ type ServiceOperationState struct {
 	// Used by the oldest-age metric to detect stuck operations.
 	CreatedAt time.Time
 
+	// OperationStartedAt is when the current Azure operation was dispatched in
+	// processBatch (refreshed on every dispatch, including retries). Used to measure
+	// real operation latency rather than the time spent in the completion callback.
+	OperationStartedAt time.Time
+
 	// IsOrphan indicates this is an orphaned Azure resource being cleaned up at startup.
 	IsOrphan bool
 
