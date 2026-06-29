@@ -168,6 +168,19 @@ var (
 		},
 	)
 
+	// podFinalizerAddFailedTotal counts egress pods registered WITHOUT the cleanup finalizer
+	// because adding it failed even after retries (e.g. a sustained apiserver outage during the
+	// pod's IP-assignment burst). Such pods lack NRP-drain protection on delete, so a non-zero
+	// value should be alerted on.
+	podFinalizerAddFailedTotal = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Subsystem:      diffTrackerSubsystem,
+			Name:           "pod_finalizer_add_failed_total",
+			Help:           "Total count of egress pods registered without a cleanup finalizer after add retries failed",
+			StabilityLevel: metrics.ALPHA,
+		},
+	)
+
 	// initializationDurationSeconds reports how long SLB controller initialization took.
 	initializationDurationSeconds = metrics.NewGauge(
 		&metrics.GaugeOpts{
@@ -213,6 +226,7 @@ func RegisterMetrics() {
 		legacyregistry.MustRegister(servicegatewayEnabled)
 		legacyregistry.MustRegister(orphanedResourcesCleanedTotal)
 		legacyregistry.MustRegister(finalizersRecoveredTotal)
+		legacyregistry.MustRegister(podFinalizerAddFailedTotal)
 		legacyregistry.MustRegister(initializationDurationSeconds)
 		legacyregistry.MustRegister(pendingOperationOldestAgeSeconds)
 	})
@@ -339,6 +353,13 @@ func recordOrphanedResourceCleaned() {
 // recordFinalizerRecovered increments the counter for each recovered finalizer
 func recordFinalizerRecovered() {
 	finalizersRecoveredTotal.Inc()
+}
+
+// RecordPodFinalizerAddFailed increments the counter for an egress pod that was registered without
+// its cleanup finalizer because adding the finalizer failed after retries. Exported for the pod
+// informer in the provider package.
+func RecordPodFinalizerAddFailed() {
+	podFinalizerAddFailedTotal.Inc()
 }
 
 // recordInitializationDuration records how long initialization took

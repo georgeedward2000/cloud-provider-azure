@@ -298,11 +298,11 @@ func TestGuardAddPod_ExistingNRPNATGatewayAddsImmediately(t *testing.T) {
 // TestGuardDeletePod_InvalidParamsIsNoOp verifies the validation rule.
 func TestGuardDeletePod_InvalidParamsIsNoOp(t *testing.T) {
 	dt := newTestDiffTracker()
-	res := dt.DeletePod("", "loc", "addr", "ns", "p")
+	res := dt.DeletePod("", "loc", "addr", "ns", "p", "")
 	assert.False(t, res.IsLastPod)
-	res = dt.DeletePod("uid", "", "addr", "ns", "p")
+	res = dt.DeletePod("uid", "", "addr", "ns", "p", "")
 	assert.False(t, res.IsLastPod)
-	res = dt.DeletePod("uid", "loc", "", "ns", "p")
+	res = dt.DeletePod("uid", "loc", "", "ns", "p", "")
 	assert.False(t, res.IsLastPod)
 }
 
@@ -323,8 +323,9 @@ func TestGuardDeletePod_NonLastEnqueuesPendingPodDeletion(t *testing.T) {
 	dt.AddPod(uid, "ns/a", "10.0.0.1", "10.244.0.1")
 	dt.AddPod(uid, "ns/b", "10.0.0.1", "10.244.0.2")
 
-	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "a")
+	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "a", "")
 	assert.False(t, res.IsLastPod)
+	assert.True(t, res.Enqueued, "a tracked non-last delete must report Enqueued so the caller defers to drain-gated removal")
 	ppd, ok := dt.pendingPodDeletions["ns/a"]
 	if assert.True(t, ok, "non-last DeletePod must enqueue a drain-gated PendingPodDeletion") {
 		assert.False(t, ppd.IsLastPod, "non-last entry must have IsLastPod=false")
@@ -348,7 +349,7 @@ func TestGuardDeletePod_LastPodWithNamespaceNameTracksLastPodEntry(t *testing.T)
 	}
 	dt.AddPod(uid, "ns/only", "10.0.0.1", "10.244.0.7")
 
-	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.7", "ns", "only")
+	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.7", "ns", "only", "")
 	assert.True(t, res.IsLastPod, "removing the sole pod must be the last-pod case")
 	entry, ok := dt.pendingPodDeletions["ns/only"]
 	if assert.True(t, ok, "last pod with ns/name must enqueue PendingPodDeletion") {

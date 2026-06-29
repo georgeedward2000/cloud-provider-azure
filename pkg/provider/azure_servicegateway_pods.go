@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
 )
 
 // ResyncPeriod returns a function that generates a randomized resync duration
@@ -223,11 +224,17 @@ func (az *Cloud) podInformerAddPod(pod *v1.Pod) {
 	klog.V(2).Infof("podInformerAddPod: Pod %s added with egress %s (HostIP=%s, PodIP=%s)",
 		podKey, egressName, pod.Status.HostIP, pod.Status.PodIP)
 
-	// Add pod finalizer before registering with engine
-	// This prevents the pod from being deleted before Azure resources are cleaned up
+	// Add pod finalizer before registering with engine. AddPodFinalizer already retries with
+	// backoff, so a failure here means a sustained apiserver outage during the pod's IP burst.
+	// We deliberately still register the pod (returning would silently kill its egress), but the
+	// pod is now synced into NRP WITHOUT the cleanup finalizer, so it lacks NRP-drain protection
+	// on a later delete. Make that rare, unprotected state observable via a metric + warning Event
+	// rather than only a log line.
 	if err := az.diffTracker.AddPodFinalizer(context.Background(), pod); err != nil {
-		klog.Warningf("podInformerAddPod: Failed to add finalizer to pod %s: %v", podKey, err)
-		// Continue anyway - finalizer is best-effort protection
+		klog.Warningf("podInformerAddPod: registering egress pod %s WITHOUT cleanup finalizer after retries: %v", podKey, err)
+		difftracker.RecordPodFinalizerAddFailed()
+		az.Event(pod, v1.EventTypeWarning, "ServiceGatewayFinalizerAddFailed",
+			fmt.Sprintf("Failed to add ServiceGateway cleanup finalizer after retries; egress pod registered without NRP-drain protection: %v", err))
 	}
 
 	// Call Engine.AddPod - it handles all states and service creation
@@ -236,13 +243,14 @@ func (az *Cloud) podInformerAddPod(pod *v1.Pod) {
 
 // podInformerRemovePod handles pod deletion events for egress.
 // It calls Engine.DeletePod() which handles last-pod deletion logic:
-//   - Not last pod → Engine removes pod, decrements counter, triggers LocationsUpdater.
-//     The finalizer is removed by CheckPendingPodDeletions once the address is drained from NRP.
-//   - Last pod → Engine removes pod, marks service for deletion, triggers ServiceUpdater.
-//     The finalizer is removed after NAT Gateway/PIP deletion completes.
+//   - Tracked, not last pod → Engine enqueues it; the finalizer is removed by
+//     CheckPendingPodDeletions once the address is drained from NRP.
+//   - Tracked, last pod → the finalizer is removed after NAT Gateway/PIP deletion completes.
+//   - Not tracked (stale/duplicate delete, or no live address after a restart) or no IPs → there is
+//     nothing to drain, so the finalizer is removed directly here to avoid stranding the pod.
 //
-// In both cases the finalizer is removed only after NRP has drained the pod's overlay address,
-// never inline here, so the pod (and its IP) is not reclaimed while NRP still maps the address.
+// In the tracked cases the finalizer is removed only after NRP has drained the pod's overlay
+// address, so the pod (and its IP) is not reclaimed while NRP still maps the address.
 func (az *Cloud) podInformerRemovePod(pod *v1.Pod) {
 	// Validate pod has egress label
 	if pod.Labels == nil || pod.Labels[consts.PodLabelServiceEgressGateway] == "" {
@@ -250,23 +258,37 @@ func (az *Cloud) podInformerRemovePod(pod *v1.Pod) {
 		return
 	}
 
-	// Need IPs to identify which location/address to remove
-	if pod.Status.HostIP == "" || pod.Status.PodIP == "" {
-		klog.Warningf("podInformerRemovePod: Pod %s/%s has egress label but no IPs, cannot remove",
-			pod.Namespace, pod.Name)
-		return
-	}
-
 	egressName := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
 	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+
+	// Need IPs to identify which NRP address/location to drain. Without them there is nothing to
+	// drain, so remove the finalizer directly to avoid stranding the pod in Terminating; the
+	// periodic reconcile drains any orphaned NRP address independently of the finalizer.
+	if pod.Status.HostIP == "" || pod.Status.PodIP == "" {
+		klog.V(2).Infof("podInformerRemovePod: Pod %s has egress label but no IPs; removing finalizer directly (nothing to drain)", podKey)
+		if err := az.diffTracker.RemovePodFinalizerByPod(context.Background(), pod); err != nil {
+			klog.Warningf("podInformerRemovePod: Failed to remove finalizer from no-IP pod %s: %v", podKey, err)
+		}
+		return
+	}
 
 	klog.V(2).Infof("podInformerRemovePod: Pod %s removed from egress %s (HostIP=%s, PodIP=%s)",
 		podKey, egressName, pod.Status.HostIP, pod.Status.PodIP)
 
-	// Call Engine.DeletePod. The pod's finalizer is intentionally NOT removed here: the engine
-	// records the pod in pendingPodDeletions, and the finalizer is stripped only after the pod's
-	// overlay address has been drained from NRP (CheckPendingPodDeletions for non-last pods,
+	// Call Engine.DeletePod. For a tracked pod the finalizer is intentionally NOT removed here:
+	// the engine records it in pendingPodDeletions and the finalizer is stripped only after the
+	// pod's overlay address has been drained from NRP (CheckPendingPodDeletions for non-last pods,
 	// RemoveLastPodFinalizers after NAT Gateway deletion for the last pod). Removing it inline
 	// would let the pod (and its IP) be reclaimed while NRP still maps the address.
-	az.diffTracker.DeletePod(egressName, pod.Status.HostIP, pod.Status.PodIP, pod.Namespace, pod.Name)
+	result := az.diffTracker.DeletePod(egressName, pod.Status.HostIP, pod.Status.PodIP, pod.Namespace, pod.Name, string(pod.UID))
+
+	// If the engine did not enqueue the pod (a stale/duplicate delete, or a pod no longer in live
+	// state after a restart) and it is not the last pod, there is nothing to drain from NRP, so the
+	// finalizer must be removed directly here; otherwise it would be stranded forever.
+	if !result.IsLastPod && !result.Enqueued {
+		klog.V(2).Infof("podInformerRemovePod: Pod %s is not tracked by the engine; removing finalizer directly (nothing to drain)", podKey)
+		if err := az.diffTracker.RemovePodFinalizerByPod(context.Background(), pod); err != nil {
+			klog.Warningf("podInformerRemovePod: Failed to remove finalizer from untracked pod %s: %v", podKey, err)
+		}
+	}
 }

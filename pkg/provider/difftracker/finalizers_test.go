@@ -749,7 +749,7 @@ func TestGuardNonLastPodFinalizerRemovedOnlyAfterNRPDrain(t *testing.T) {
 	}
 
 	// Delete the non-last pod "a".
-	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "a")
+	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "a", "")
 	assert.False(t, res.IsLastPod, "deleting one of two pods is not the last-pod case")
 
 	// It must be enqueued for drain-gated finalizer removal, not stripped inline.

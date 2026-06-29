@@ -39,8 +39,6 @@ func newFinalizerPod(name, uid string, hasFinalizer bool) *v1.Pod {
 
 // PendingPodDeletion should not remove a replacement pod's finalizer.
 func TestGuardPendingPodDeletion_DoesNotStripReplacementPodFinalizer(t *testing.T) {
-	t.Skip("pending: PendingPodDeletion tracks namespace/name but not pod UID")
-
 	// Seed kube with the REPLACEMENT pod (same name, different UID),
 	// already carrying the finalizer (added by an AddPod against the new UID).
 	replacement := newFinalizerPod("foo", "uid-NEW", true)
@@ -56,15 +54,15 @@ func TestGuardPendingPodDeletion_DoesNotStripReplacementPodFinalizer(t *testing.
 		State:      StateCreated,
 	}
 
-	// Seed a PendingPodDeletion for the OLD pod (it has the same ns/name).
+	// Seed a PendingPodDeletion for the OLD pod (same ns/name, but the predecessor's UID).
 	dt.pendingPodDeletions["default/foo"] = &PendingPodDeletion{
 		Namespace:  "default",
 		Name:       "foo",
+		UID:        "uid-OLD",
 		ServiceUID: euid,
 		Address:    "10.244.0.7",
 		Location:   "10.0.0.1",
 		IsLastPod:  false,
-		// NO UID field today — that is the bug.
 	}
 
 	// Address has been removed from NRP (location-sync complete) so
@@ -79,8 +77,6 @@ func TestGuardPendingPodDeletion_DoesNotStripReplacementPodFinalizer(t *testing.
 
 // Last-pod finalizer removal should not affect a replacement pod.
 func TestGuardLastPodFinalizer_DoesNotStripReplacementPod(t *testing.T) {
-	t.Skip("pending: last-pod deletion entry does not currently validate pod UID")
-
 	replacement := newFinalizerPod("foo", "uid-NEW", true)
 	kube := fake.NewSimpleClientset(replacement)
 
@@ -91,11 +87,11 @@ func TestGuardLastPodFinalizer_DoesNotStripReplacementPod(t *testing.T) {
 	dt.pendingPodDeletions["default/foo"] = &PendingPodDeletion{
 		Namespace:  "default",
 		Name:       "foo",
+		UID:        "uid-OLD",
 		ServiceUID: euid,
 		Address:    "10.244.0.7",
 		Location:   "10.0.0.1",
 		IsLastPod:  true,
-		// NO UID stored.
 	}
 
 	dt.RemoveLastPodFinalizers(context.Background(), euid)
@@ -118,6 +114,7 @@ func TestGuardFinalizers_PositiveStripRemovesFinalizer(t *testing.T) {
 	dt.pendingPodDeletions["default/foo"] = &PendingPodDeletion{
 		Namespace:  "default",
 		Name:       "foo",
+		UID:        "uid-LIVE",
 		ServiceUID: euid,
 		Address:    "10.244.0.7",
 		Location:   "10.0.0.1",

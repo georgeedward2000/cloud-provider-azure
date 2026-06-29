@@ -608,9 +608,10 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 				recordServiceOperation("update", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
 				opState.RetryCount++
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
+				opState.NextRetryAt = time.Now().Add(computeRetryBackoff(opState.RetryCount))
 				recordServiceOperationRetry("update", opState.Config.IsInbound, opState.RetryCount)
 
-				dt.logger.V(4).Info("Scheduled service update retry", "service", serviceUID, "attempt", opState.RetryCount)
+				dt.logger.V(4).Info("Scheduled service update retry", "service", serviceUID, "attempt", opState.RetryCount, "nextRetryAt", opState.NextRetryAt)
 				// Stay in StateUpdateInProgress so dispatcher picks it up again.
 				dt.triggerServiceUpdater()
 			}
@@ -687,9 +688,10 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			recordServiceOperation("delete", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
 			opState.RetryCount++
 			opState.LastAttempt = time.Now().Format(time.RFC3339)
+			opState.NextRetryAt = time.Now().Add(computeRetryBackoff(opState.RetryCount))
 			recordServiceOperationRetry("delete", opState.Config.IsInbound, opState.RetryCount)
 
-			dt.logger.V(4).Info("Scheduled service deletion retry", "service", serviceUID, "attempt", opState.RetryCount)
+			dt.logger.V(4).Info("Scheduled service deletion retry", "service", serviceUID, "attempt", opState.RetryCount, "nextRetryAt", opState.NextRetryAt)
 			// Trigger ServiceUpdater for retry
 			dt.triggerServiceUpdater()
 		}
@@ -750,9 +752,10 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 				recordServiceOperation("create", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
 				opState.RetryCount++
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
+				opState.NextRetryAt = time.Now().Add(computeRetryBackoff(opState.RetryCount))
 				recordServiceOperationRetry("create", opState.Config.IsInbound, opState.RetryCount)
 
-				dt.logger.V(4).Info("Scheduled service creation retry", "service", serviceUID, "attempt", opState.RetryCount)
+				dt.logger.V(4).Info("Scheduled service creation retry", "service", serviceUID, "attempt", opState.RetryCount, "nextRetryAt", opState.NextRetryAt)
 				// Reset to NotStarted for retry
 				opState.State = StateNotStarted
 				// Trigger ServiceUpdater for retry
@@ -968,6 +971,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 // DeletePodResult contains the result of a DeletePod operation
 type DeletePodResult struct {
 	IsLastPod bool // True if this was the last pod for the service
+	Enqueued  bool // True if the pod was recorded in pendingPodDeletions for drain-gated finalizer removal
 }
 
 // DeletePod handles pod deletion events for outbound (NAT Gateway) services.
@@ -979,7 +983,7 @@ type DeletePodResult struct {
 // Finalizer handling:
 // - Non-last pods: Caller should remove finalizer immediately (no need to wait)
 // - Last pods: Tracked in pendingPodDeletions, finalizer removed after NAT Gateway deletion
-func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name string) DeletePodResult {
+func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name, uid string) DeletePodResult {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 
@@ -1103,12 +1107,14 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 		dt.pendingPodDeletions[podKey] = &PendingPodDeletion{
 			Namespace:  namespace,
 			Name:       name,
+			UID:        uid,
 			ServiceUID: serviceUID,
 			Address:    address,
 			Location:   location,
 			IsLastPod:  isLastPod,
 			Timestamp:  time.Now().Format(time.RFC3339),
 		}
+		result.Enqueued = true
 		dt.logger.V(5).Info("Added pending pod deletion", "pod", podKey, "isLastPod", isLastPod)
 	}
 	// Note: Counter is managed by UpdateK8sPod for both last pod and non-last pod cases

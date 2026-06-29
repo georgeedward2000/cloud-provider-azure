@@ -589,6 +589,75 @@ var _ = Describe("Container Load Balancer Outbound Crash Recovery", Label(slbTes
 			"NAT Gateway ID and pod registrations should persist after CCM recovery")
 	})
 
+	It("should not strand egress pod finalizers when pods are deleted during CCM downtime", func() {
+		const (
+			numPods    = 3
+			egressName = "egress-strand-crash"
+			targetPort = 8080
+			waitTime   = 90 * time.Second
+		)
+		ctx := context.Background()
+		egressSelector := egressLabel + "=" + egressName
+
+		By(fmt.Sprintf("Creating %d egress pods", numPods))
+		for i := 0; i < numPods; i++ {
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("egress-strand-pod-%d", i),
+					Namespace: ns.Name,
+					Labels:    map[string]string{egressLabel: egressName},
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{
+						Name:            "test-app",
+						Image:           utils.AgnhostImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Args:            []string{"netexec", fmt.Sprintf("--http-port=%d", targetPort)},
+					}},
+				},
+			}
+			_, err := cs.CoreV1().Pods(ns.Name).Create(ctx, pod, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		By("Waiting for the NAT gateway to provision and pods to register")
+		eventuallyEgressRegistered(egressName, numPods, waitTime)
+
+		// Delete the egress pods, then immediately crash CCM so the in-flight pod-deletion tracking
+		// (the in-memory pendingPodDeletions) is lost. On recovery those pods are mid-deletion but no
+		// longer in live engine state, so DeletePod takes its stale-pod early return and never
+		// enqueues them. Their servicegateway.azure.com/pod-cleanup finalizer must still be removed
+		// (directly, since there is nothing left to drain from NRP) rather than stranding the pod
+		// Terminating forever. This guards the finalizer drain-gating regression.
+		By("Deleting the egress pods and immediately crashing CCM to lose the in-flight delete tracking")
+		Expect(cs.CoreV1().Pods(ns.Name).DeleteCollection(ctx, metav1.DeleteOptions{},
+			metav1.ListOptions{LabelSelector: egressSelector})).To(Succeed())
+		Expect(ccmClient.DeleteAllCCMPods(ctx)).To(Succeed())
+
+		By("Waiting for CCM to recover")
+		Expect(ccmClient.WaitForCCMReady(ctx, utils.CCMRecoveryTimeout)).To(Succeed())
+
+		By("Verifying the egress pods fully delete (no stranded pod-cleanup finalizer)")
+		Eventually(func() (int, error) {
+			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{LabelSelector: egressSelector})
+			if err != nil {
+				return -1, err
+			}
+			for i := range pods.Items {
+				p := &pods.Items[i]
+				for _, f := range p.Finalizers {
+					if f == serviceGatewayPodFinalizer {
+						utils.Logf("pod %s still holds %s (deletionTS=%v, phase=%s)", p.Name, serviceGatewayPodFinalizer, p.DeletionTimestamp, p.Status.Phase)
+					}
+				}
+			}
+			return len(pods.Items), nil
+		}, 4*time.Minute, defaultPollInterval).Should(Equal(0),
+			"egress pods deleted during CCM downtime must not be stranded Terminating by a stuck pod-cleanup finalizer")
+
+		utils.Logf("✓ Egress pod finalizers cleared after delete-during-CCM-downtime (no strand)")
+	})
+
 	It("should handle pod creation during CCM downtime for NAT gateway", func() {
 		const (
 			initialPods    = 3

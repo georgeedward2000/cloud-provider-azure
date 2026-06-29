@@ -480,7 +480,7 @@ func TestInitOutboundRefCount_NotNegativeOnServiceUIDEgressLabelCollision(t *tes
 		"the outbound ref-count must equal the egress pod count (1)")
 
 	// A correct (non-negative) counter must allow DeletePod to complete.
-	res := dt.DeletePod(collideID, nodeIP, podIP, "default", "pod-collide")
+	res := dt.DeletePod(collideID, nodeIP, podIP, "default", "pod-collide", "")
 	assert.True(t, res.IsLastPod,
 		"with exactly one live egress pod the ref-count must be 1 (last pod)")
 	assert.False(t, podIPTracked(&dt.K8sResources, podIP),

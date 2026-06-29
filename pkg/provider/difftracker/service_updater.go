@@ -125,6 +125,45 @@ func (s *ServiceUpdater) requeueIfMoreWork(uid string) {
 	s.diffTracker.triggerServiceUpdater()
 }
 
+// maxServiceRetries bounds how many times a transient create/update/delete failure is retried
+// before the dispatcher gives up and parks the operation (RetriesExhausted) instead of looping
+// unbounded. Paired with the per-attempt backoff recorded in ServiceOperationState.NextRetryAt.
+const maxServiceRetries = 12
+
+// retryGate decides whether a retryable operation should be skipped this dispatch pass. It returns
+// true (caller must `continue`) when the op is still within its post-failure backoff window
+// (scheduling a guaranteed revisit via time.AfterFunc) or has exhausted its retry budget (a
+// "gave up" park). It must be called with s.diffTracker.mu held and after activeOps[uid] has been
+// set; it releases activeOps[uid] on skip.
+func (s *ServiceUpdater) retryGate(serviceUID string, opState *ServiceOperationState) bool {
+	// Terminal ceiling: stop re-dispatching after exhausting the retry budget.
+	if opState.RetryCount >= maxServiceRetries {
+		if !opState.RetriesExhausted {
+			opState.RetriesExhausted = true
+			s.logger.Info("Giving up service operation after exhausting retries",
+				"serviceUID", serviceUID, "state", opState.State, "retries", opState.RetryCount)
+		}
+		s.mu.Lock()
+		delete(s.activeOps, serviceUID)
+		s.mu.Unlock()
+		return true
+	}
+
+	// Backoff: not yet time to retry. Release the slot and guarantee a revisit when the backoff
+	// elapses; a buffered trigger only coalesces, so without this the op could otherwise wait for
+	// an unrelated future trigger on a quiet cluster.
+	if !opState.NextRetryAt.IsZero() && time.Now().Before(opState.NextRetryAt) {
+		delay := time.Until(opState.NextRetryAt)
+		s.mu.Lock()
+		delete(s.activeOps, serviceUID)
+		s.mu.Unlock()
+		time.AfterFunc(delay, s.diffTracker.triggerServiceUpdater)
+		return true
+	}
+
+	return false
+}
+
 // processBatch scans pendingServiceOps and spawns goroutines for services that need processing
 func (s *ServiceUpdater) processBatch() {
 	// Collect work to do while holding lock, then spawn goroutines after releasing lock
@@ -161,6 +200,9 @@ func (s *ServiceUpdater) processBatch() {
 				continue
 			}
 			// Transition to CreationInProgress
+			if s.retryGate(serviceUID, opState) {
+				continue
+			}
 			opState.State = StateCreationInProgress
 			opState.OperationStartedAt = time.Now()
 			configSnapshot := opState.Config
@@ -191,10 +233,16 @@ func (s *ServiceUpdater) processBatch() {
 			s.logger.V(4).Info("Skipped service waiting for locations to clear", "serviceUID", serviceUID, "state", StateDeletionPending)
 
 		case StateDeletionInProgress:
+			if s.retryGate(serviceUID, opState) {
+				continue
+			}
 			opState.OperationStartedAt = time.Now()
 			workToDo = append(workToDo, workItem{serviceUID, opState.Config, StateDeletionInProgress, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
 
 		case StateUpdateInProgress:
+			if s.retryGate(serviceUID, opState) {
+				continue
+			}
 			// Snapshot the desired config so OnServiceCreationComplete can detect drift.
 			opState.OperationStartedAt = time.Now()
 			configSnapshot := opState.Config
@@ -316,16 +364,28 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 			s.onComplete(serviceUID, false, fmt.Errorf("failed to get service for finalizer: %w", err))
 			return
 		}
-		// Typed NotFound: the service is genuinely gone, so there is nothing to anchor; continue.
-		s.logger.V(4).Info("Service not found for finalizer, continuing", "serviceUID", serviceUID, "correlationID", correlationID)
-	} else {
-		if err := s.diffTracker.addServiceGatewayFinalizer(ctx, svc); err != nil {
-			s.logger.V(4).Info("Could not add finalizer to service", "serviceUID", serviceUID, "err", err)
-			s.onComplete(serviceUID, false, fmt.Errorf("failed to add finalizer: %w", err))
-			return
-		}
-		s.logger.V(5).Info("Added finalizer to service", "serviceUID", serviceUID)
+		// Typed NotFound: the K8s Service is gone. Do NOT fall through to create the PIP/LB/SGW -
+		// those would be orphaned (no Service object means no delete event ever cleans them up,
+		// only the next restart's orphan-cleanup). Abort and drop tracking instead; if this was a
+		// stale-List false-NotFound for a still-live Service, the cloud-provider re-syncs and
+		// re-calls EnsureLoadBalancer, which re-adds the operation. We deliberately do NOT call
+		// onComplete here: onComplete(false) would re-hit NotFound and loop, and onComplete(true)
+		// would falsely report the service as Created.
+		s.logger.V(4).Info("Service gone (NotFound) before create; aborting to avoid orphaned resources", "serviceUID", serviceUID, "correlationID", correlationID)
+		s.diffTracker.mu.Lock()
+		delete(s.diffTracker.pendingServiceOps, serviceUID)
+		s.diffTracker.checkInitializationCompleteLocked()
+		s.diffTracker.mu.Unlock()
+		return
 	}
+
+	// Service exists: add the cleanup finalizers before creating any Azure resources.
+	if err := s.diffTracker.addServiceGatewayFinalizer(ctx, svc); err != nil {
+		s.logger.V(4).Info("Could not add finalizer to service", "serviceUID", serviceUID, "err", err)
+		s.onComplete(serviceUID, false, fmt.Errorf("failed to add finalizer: %w", err))
+		return
+	}
+	s.logger.V(5).Info("Added finalizer to service", "serviceUID", serviceUID)
 
 	// Step 1: Build resources using shared helper
 	pipResource, lbResource, servicesDTO, err := buildInboundServiceResources(serviceUID, config, s.diffTracker.config)

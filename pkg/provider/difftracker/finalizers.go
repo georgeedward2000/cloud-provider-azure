@@ -54,6 +54,7 @@ const (
 type PendingPodDeletion struct {
 	Namespace  string // Pod namespace
 	Name       string // Pod name
+	UID        string // Pod UID; guards against stripping a same-name replacement pod's finalizer
 	ServiceUID string // Egress service this pod belongs to
 	Address    string // PodIP
 	Location   string // HostIP (NodeIP)
@@ -313,6 +314,15 @@ func (dt *DiffTracker) removePodFinalizer(ctx context.Context, pod *v1.Pod) erro
 	})
 }
 
+// RemovePodFinalizerByPod removes the ServiceGateway pod cleanup finalizer from a pod object
+// directly (Get-fresh + retry under the hood). It is the fallback for the cases the drain-gated
+// path does not cover: a pod the engine is not (or no longer) tracking, such as a stale/duplicate
+// delete or a pod with no live address after a restart, has no overlay address to drain from NRP,
+// so its finalizer can be removed immediately rather than waiting on a drain that will never fire.
+func (dt *DiffTracker) RemovePodFinalizerByPod(ctx context.Context, pod *v1.Pod) error {
+	return dt.removePodFinalizer(ctx, pod)
+}
+
 // ================================================================================================
 // PENDING DELETION TRACKING - POD FINALIZERS
 // ================================================================================================
@@ -323,14 +333,21 @@ type pendingPodToProcess struct {
 	Key       string
 	Namespace string
 	Name      string
+	UID       string
 }
 
 // CheckPendingPodDeletions checks pending pod deletions and removes finalizers for non-last pods
 // whose addresses have been synced to NRP.
 // For non-last pods (isLastPod=false): remove finalizer immediately after location sync
 // For last pods (isLastPod=true): finalizer is removed in deleteOutboundService after NAT Gateway deletion
-// Must be called AFTER CheckPendingServiceDeletions to ensure locations have been processed
-func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) {
+// Must be called AFTER CheckPendingServiceDeletions to ensure locations have been processed.
+//
+// It returns readyRemovalPending=true when at least one ready (address-drained, non-last) finalizer
+// removal did NOT complete this cycle (a transient GET/Update failure), so the caller can reschedule
+// a retry instead of reporting success. It is false when there is nothing ready to remove (last-pod
+// entries waiting on NAT Gateway deletion, or non-last entries still waiting on the NRP drain, do
+// not count - they must not force a retry spin).
+func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) (readyRemovalPending bool) {
 	// Phase 1: Collect pods ready for finalizer removal (with lock)
 	dt.mu.Lock()
 
@@ -365,6 +382,7 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) {
 			Key:       podKey,
 			Namespace: pending.Namespace,
 			Name:      pending.Name,
+			UID:       pending.UID,
 		})
 	}
 
@@ -381,8 +399,26 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) {
 		// Get the pod and remove finalizer
 		pod, err := dt.getPodByNamespaceName(ctx, p.Namespace, p.Name)
 		if err != nil {
-			// Pod not found - already deleted, clean up tracking
-			dt.logger.V(4).Info("Pod not found, cleaning up tracking", "pod", p.Key)
+			if apierrors.IsNotFound(err) {
+				// Pod genuinely gone - finalizer effectively removed; clean up tracking.
+				dt.logger.V(4).Info("Pod not found, cleaning up tracking", "pod", p.Key)
+				processed = append(processed, p.Key)
+				continue
+			}
+			// Transient error (5xx/429/etcd timeout - not a typed NotFound): keep the entry so a
+			// later cycle retries. Dropping it here would forget the pending finalizer removal and
+			// permanently strand the pod Terminating until a CCM restart re-seeds it.
+			dt.logger.V(4).Info("Transient error getting pod, will retry next cycle", "pod", p.Key, "err", err)
+			continue
+		}
+
+		// Guard against stripping a same-name replacement pod (e.g. a StatefulSet pod recreated
+		// with the same namespace/name before this stale entry was processed): if the live pod's
+		// UID differs from the one recorded at delete time, it is a different pod that still needs
+		// its own NRP-drain protection - drop the stale entry without touching it. An empty
+		// recorded UID preserves the legacy ns/name behaviour (e.g. recovered entries).
+		if p.UID != "" && string(pod.UID) != p.UID {
+			dt.logger.V(4).Info("Pod UID changed (replacement pod); dropping stale finalizer entry without stripping", "pod", p.Key, "wantUID", p.UID, "gotUID", string(pod.UID))
 			processed = append(processed, p.Key)
 			continue
 		}
@@ -407,6 +443,10 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) {
 
 		dt.logger.V(2).Info("Processed pod deletions", "processed", len(processed), "remaining", remaining)
 	}
+
+	// A ready removal that was not processed this cycle (transient GET/Update failure) means the
+	// caller should reschedule a retry rather than report success.
+	return len(toProcess) > len(processed)
 }
 
 // isAddressInNRPLocked checks if a specific address exists in NRP for a service/location
@@ -445,6 +485,7 @@ func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID s
 		Key       string
 		Namespace string
 		Name      string
+		UID       string
 	}
 	var toProcess []lastPodEntry
 
@@ -460,6 +501,7 @@ func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID s
 			Key:       podKey,
 			Namespace: pending.Namespace,
 			Name:      pending.Name,
+			UID:       pending.UID,
 		})
 	}
 
@@ -489,6 +531,15 @@ func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID s
 				lastErr = err
 				dt.logger.V(4).Info("Transient error getting pod, will retry", "pod", p.Key, "err", err)
 				return false, nil // Retry
+			}
+
+			// Guard against stripping a same-name replacement pod (see CheckPendingPodDeletions):
+			// if the live pod's UID differs from the one recorded at delete time, this is a
+			// different pod - drop the stale entry without stripping. An empty recorded UID
+			// preserves the legacy ns/name behaviour.
+			if p.UID != "" && string(pod.UID) != p.UID {
+				dt.logger.V(4).Info("Last pod UID changed (replacement pod); dropping stale entry without stripping", "pod", p.Key, "wantUID", p.UID, "gotUID", string(pod.UID))
+				return true, nil // Done - do not strip the replacement
 			}
 
 			if err := dt.removePodFinalizer(ctx, pod); err != nil {

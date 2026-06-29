@@ -21,6 +21,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -44,6 +45,63 @@ func newTestServiceUpdater(dt *DiffTracker) *ServiceUpdater {
 		semaphore:   make(chan struct{}, 10),
 		activeOps:   make(map[string]bool),
 	}
+}
+
+// TestGuardServiceUpdater_BackoffAndTerminalCeiling verifies that a transient (non-terminal) create
+// failure must schedule a backoff (NextRetryAt in the future, advancing per attempt); the dispatcher
+// must skip the op while it is in backoff (no immediate re-dispatch hot-loop); and after
+// maxServiceRetries the op is parked (RetriesExhausted) and no longer dispatched.
+func TestGuardServiceUpdater_BackoffAndTerminalCeiling(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-backoff"
+	transientErr := errors.New("transient ARM 429")
+
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:      StateCreationInProgress,
+	}
+
+	// failOnce puts the op back in-flight (as the dispatcher would) and signals a transient
+	// failure, returning the scheduled backoff delay.
+	failOnce := func() time.Duration {
+		op := dt.pendingServiceOps[uid]
+		op.State = StateCreationInProgress
+		snap := op.Config
+		op.InFlightConfig = &snap
+		before := time.Now()
+		dt.OnServiceCreationComplete(uid, false, transientErr)
+		return dt.pendingServiceOps[uid].NextRetryAt.Sub(before)
+	}
+
+	// First transient failure: RetryCount advances, NextRetryAt is set in the future.
+	d1 := failOnce()
+	assert.Equal(t, 1, dt.pendingServiceOps[uid].RetryCount)
+	assert.Greater(t, d1, time.Duration(0), "a transient failure must schedule a future retry")
+	assert.Equal(t, StateNotStarted, dt.pendingServiceOps[uid].State)
+
+	// The dispatcher must SKIP the op while it is in backoff (now < NextRetryAt): not dispatched
+	// and activeOps released - i.e. no immediate re-dispatch hot-loop.
+	su := newTestServiceUpdater(dt)
+	su.processBatch()
+	assert.Equal(t, StateNotStarted, dt.pendingServiceOps[uid].State, "op in backoff must not be dispatched")
+	su.mu.Lock()
+	_, active := su.activeOps[uid]
+	su.mu.Unlock()
+	assert.False(t, active, "activeOps must be released for a backoff-skipped op")
+
+	// Second failure: the backoff grows per attempt.
+	d2 := failOnce()
+	assert.Equal(t, 2, dt.pendingServiceOps[uid].RetryCount)
+	assert.Greater(t, d2, d1, "backoff must grow per attempt")
+
+	// Terminal ceiling: at maxServiceRetries the op is parked and no longer dispatched.
+	op := dt.pendingServiceOps[uid]
+	op.RetryCount = maxServiceRetries
+	op.NextRetryAt = time.Time{} // exercise the ceiling, not the backoff window
+	su.processBatch()
+	assert.True(t, dt.pendingServiceOps[uid].RetriesExhausted, "op must park after exhausting the retry budget")
+	assert.Equal(t, StateNotStarted, dt.pendingServiceOps[uid].State, "parked op must not be dispatched")
 }
 
 // TestCreateInboundService_TransientServiceLookupErrorDoesNotCreatePIP verifies that a transient
@@ -87,6 +145,49 @@ func TestCreateInboundService_TransientServiceLookupErrorDoesNotCreatePIP(t *tes
 		assert.False(t, *gotSuccess, "a transient service-lookup error must fail the op for retry")
 	}
 	assert.Error(t, gotErr, "the transient error must be propagated")
+}
+
+// TestCreateInboundService_ServiceGoneNotFoundAbortsWithoutCreatingResources verifies that when the
+// K8s Service is gone (getServiceByUID returns a typed NotFound), createInboundService must abort -
+// it must NOT fall through to create the PIP/LB/SGW (which would be orphaned with no Service object
+// to ever clean them up). It drops tracking and does NOT call onComplete (which would loop on
+// NotFound or falsely report Created); a still-live Service is re-added on the next resync.
+func TestCreateInboundService_ServiceGoneNotFoundAbortsWithoutCreatingResources(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Empty kube (no Services): the List succeeds but no UID matches, so getServiceByUID returns a
+	// typed NotFound.
+	kube := fake.NewSimpleClientset()
+
+	// The PIP must never be created on the abort path.
+	pip := mock_publicipaddressclient.NewMockInterface(ctrl)
+	pip.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	factory := mock_azclient.NewMockClientFactory(ctrl)
+	factory.EXPECT().GetPublicIPAddressClient().Return(pip).AnyTimes()
+
+	dt := newTestDiffTracker()
+	dt.config = testConfig()
+	dt.kubeClient = kube
+	dt.networkClientFactory = factory
+	uid := "uid-gone"
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:      StateCreationInProgress,
+	}
+
+	completeCalled := false
+	su := newTestServiceUpdater(dt)
+	su.onComplete = func(string, bool, error) { completeCalled = true }
+
+	su.createInboundService(uid, makeInboundConfig(80), "corr-gone")
+
+	dt.mu.Lock()
+	_, tracked := dt.pendingServiceOps[uid]
+	dt.mu.Unlock()
+	assert.False(t, tracked, "a NotFound (service gone) create must drop tracking, not orphan resources")
+	assert.False(t, completeCalled, "the abort path must not call onComplete")
 }
 
 // TestServiceUpdaterWorker_RecoversFromPanic verifies that a panic inside a worker operation is

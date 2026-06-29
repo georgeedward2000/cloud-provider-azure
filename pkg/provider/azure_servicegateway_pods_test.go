@@ -1,12 +1,21 @@
 package provider
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
@@ -31,6 +40,7 @@ type deletePodCall struct {
 	address    string
 	namespace  string
 	name       string
+	uid        string
 }
 
 func (m *mockDiffTracker) AddPod(serviceUID, podKey, location, address string) {
@@ -42,13 +52,14 @@ func (m *mockDiffTracker) AddPod(serviceUID, podKey, location, address string) {
 	})
 }
 
-func (m *mockDiffTracker) DeletePod(serviceUID, location, address, namespace, name string) difftracker.DeletePodResult {
+func (m *mockDiffTracker) DeletePod(serviceUID, location, address, namespace, name, uid string) difftracker.DeletePodResult {
 	m.deletePodCalls = append(m.deletePodCalls, deletePodCall{
 		serviceUID: serviceUID,
 		location:   location,
 		address:    address,
 		namespace:  namespace,
 		name:       name,
+		uid:        uid,
 	})
 	// Mock always returns non-last pod (tests can adjust if needed)
 	return difftracker.DeletePodResult{IsLastPod: false}
@@ -208,6 +219,50 @@ func TestPodInformerAddPod(t *testing.T) {
 	}
 }
 
+// TestPodInformerAddPod_FinalizerAddFailureRegistersAndAlerts verifies that when AddPodFinalizer fails
+// after its retries (sustained apiserver outage), podInformerAddPod must STILL register the pod
+// (returning would silently kill its egress) and make the rare unprotected-pod state observable via
+// a warning Event (and the pod_finalizer_add_failed_total metric).
+func TestPodInformerAddPod_FinalizerAddFailureRegistersAndAlerts(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "egress-p",
+			Namespace: "default",
+			Labels:    map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning, HostIP: "10.0.0.1", PodIP: "10.244.0.1"},
+	}
+	kube := fake.NewSimpleClientset(pod)
+	// Persistent non-NotFound error on the finalizer Update -> AddPodFinalizer exhausts its retries.
+	kube.PrependReactor("update", "pods", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(fmt.Errorf("apiserver down"))
+	})
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = newProviderDiffTracker(t, az, kube)
+	rec := record.NewFakeRecorder(10)
+	az.eventRecorder = rec
+
+	az.podInformerAddPod(pod)
+
+	// The pod must still be registered with the engine despite the finalizer add failure.
+	assert.True(t, az.diffTracker.IsServiceTracked("egress-svc"),
+		"pod must still be registered (AddPod called) even when the finalizer could not be added")
+
+	// And the rare unprotected-pod state must be surfaced as a warning Event.
+	select {
+	case ev := <-rec.Events:
+		assert.Contains(t, ev, "ServiceGatewayFinalizerAddFailed",
+			"a warning Event must be emitted when an egress pod is registered without its cleanup finalizer")
+	default:
+		t.Fatal("expected a ServiceGatewayFinalizerAddFailed warning Event on finalizer add failure")
+	}
+}
+
 // TestPodInformerRemovePod tests the podInformerRemovePod function
 func TestPodInformerRemovePod(t *testing.T) {
 	tests := []struct {
@@ -281,6 +336,68 @@ func TestPodInformerRemovePod(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPodInformerRemovePod_UntrackedPodFinalizerRemovedDirectly verifies that when the engine is
+// not tracking the pod (a stale/duplicate delete, or a pod no longer in live state after a CCM
+// restart), podInformerRemovePod removes the ServiceGateway finalizer directly. There is nothing
+// to drain from NRP, so the pod must not be stranded in Terminating. Regression test for the
+// drain-gating gap where DeletePod's stale-pod early return skipped the pendingPodDeletions enqueue.
+func TestPodInformerRemovePod_UntrackedPodFinalizerRemovedDirectly(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "egress-stale",
+			Namespace:  "default",
+			Labels:     map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
+			Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+		},
+		Status: v1.PodStatus{HostIP: "10.0.0.1", PodIP: "10.244.0.1"},
+	}
+	kubeClient := fake.NewSimpleClientset(pod)
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kubeClient
+	az.diffTracker = newProviderDiffTracker(t, az, kubeClient) // empty engine state -> pod is untracked
+
+	az.podInformerRemovePod(pod)
+
+	got, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "egress-stale", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.NotContains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+		"an untracked egress pod's finalizer must be removed directly so it is not stranded in Terminating")
+}
+
+// TestPodInformerRemovePod_NoIPPodFinalizerRemovedDirectly verifies the same direct removal when a
+// deleted egress pod has no IPs (so its NRP address cannot be identified): there is nothing to
+// drain, so the finalizer must be removed rather than stranding the pod.
+func TestPodInformerRemovePod_NoIPPodFinalizerRemovedDirectly(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "egress-noip",
+			Namespace:  "default",
+			Labels:     map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
+			Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+		},
+		Status: v1.PodStatus{}, // no HostIP/PodIP
+	}
+	kubeClient := fake.NewSimpleClientset(pod)
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kubeClient
+	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+
+	az.podInformerRemovePod(pod)
+
+	got, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "egress-noip", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.NotContains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+		"a no-IP egress pod's finalizer must be removed directly so it is not stranded")
 }
 
 // TestPodInformerUpdateFunc tests the UpdateFunc logic in the informer
@@ -608,5 +725,5 @@ func (tc *testCloudWithMockDiffTracker) podInformerRemovePod(pod *v1.Pod) {
 	egressName := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
 
 	// Call mock instead of real diffTracker
-	tc.mock.DeletePod(egressName, pod.Status.HostIP, pod.Status.PodIP, pod.Namespace, pod.Name)
+	tc.mock.DeletePod(egressName, pod.Status.HostIP, pod.Status.PodIP, pod.Namespace, pod.Name, string(pod.UID))
 }

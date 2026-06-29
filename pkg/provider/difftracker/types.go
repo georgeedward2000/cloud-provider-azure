@@ -341,6 +341,16 @@ type ServiceOperationState struct {
 	RetryCount        int
 	LastAttempt       string // timestamp as string for serialization
 
+	// NextRetryAt is the earliest time the dispatcher may re-dispatch this operation after a
+	// transient failure. Set in the failure branches of OnServiceCreationComplete to now+backoff;
+	// the dispatcher skips (and schedules a revisit) while now is before it. Prevents the
+	// no-backoff hot-loop on a persistent transient ARM/NRP error or a recovered worker panic.
+	NextRetryAt time.Time
+
+	// RetriesExhausted is set once the operation has been retried maxServiceRetries times; the
+	// dispatcher then stops re-dispatching it (a "gave up" park) instead of looping unbounded.
+	RetriesExhausted bool
+
 	// CreationFailedTerminal is set when creation failed with a non-retryable
 	// (deterministic) error such as an invalid Service spec (unsupported protocol,
 	// port out of range). The dispatcher skips such entries instead of retrying

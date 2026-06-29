@@ -672,7 +672,7 @@ func TestEngineAddPod_DeletedDuringCreationNotResurrected(t *testing.T) {
 	location, address := "192.168.0.1", "10.0.0.5"
 
 	dt.AddPod(egressUID, "ns/pod", location, address) // buffers + creates StateNotStarted op
-	dt.DeletePod(egressUID, location, address, "ns", "pod")
+	dt.DeletePod(egressUID, location, address, "ns", "pod", "")
 	dt.OnServiceCreationComplete(egressUID, true, nil)
 
 	dt.mu.Lock()
@@ -702,7 +702,7 @@ func TestEngineAddPod_DuringDeletionPendingRevivesService(t *testing.T) {
 	}
 
 	dt.AddPod(egressUID, "ns/pod", location, "10.0.0.10")
-	res := dt.DeletePod(egressUID, location, "10.0.0.10", "ns", "pod")
+	res := dt.DeletePod(egressUID, location, "10.0.0.10", "ns", "pod", "")
 	assert.True(t, res.IsLastPod, "removing the sole pod should be the last-pod case")
 	assert.Equal(t, StateDeletionPending, dt.pendingServiceOps[egressUID].State)
 
@@ -835,14 +835,16 @@ func TestEngineDeletePod_StaleDuplicateRemovalIsNoOp(t *testing.T) {
 	}
 	dt.AddPod(egressUID, "ns/live", "192.168.0.1", "10.0.0.1")
 
-	res := dt.DeletePod(egressUID, "192.168.0.2", "10.0.0.2", "ns", "gone")
+	res := dt.DeletePod(egressUID, "192.168.0.2", "10.0.0.2", "ns", "gone", "")
 	assert.False(t, res.IsLastPod, "a removal matching no live pod must not be the last-pod case")
+	assert.False(t, res.Enqueued, "a stale/untracked delete must NOT enqueue a pending pod deletion; the caller removes the finalizer directly so the pod is not stranded")
 	_, marked := dt.pendingServiceDeletions[egressUID]
 	assert.False(t, marked, "the service must not be marked for deletion while a live pod remains")
 	assert.Equal(t, StateCreated, dt.pendingServiceOps[egressUID].State)
 
-	res = dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.1", "ns", "live")
+	res = dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.1", "ns", "live", "")
 	assert.True(t, res.IsLastPod, "the genuine last-pod removal must still tear the service down")
+	assert.True(t, res.Enqueued, "a tracked pod removal must enqueue a pending pod deletion for drain-gated finalizer removal")
 	_, marked = dt.pendingServiceDeletions[egressUID]
 	assert.True(t, marked)
 }
@@ -891,7 +893,7 @@ func TestEngineDeletePod_LastBufferedPodSchedulesDeletion(t *testing.T) {
 	snap := dt.pendingServiceOps[egressUID].Config
 	dt.pendingServiceOps[egressUID].InFlightConfig = &snap
 
-	dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.5", "ns", "pod")
+	dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.5", "ns", "pod", "")
 	assert.Equal(t, StateDeletionInProgress, dt.pendingServiceOps[egressUID].State,
 		"cancelling the only buffered pod mid-create must schedule deletion")
 
@@ -909,7 +911,7 @@ func TestEngineDeletePod_LastBufferedPodBeforeCreateAbortsService(t *testing.T) 
 	egressUID := "egress-buffered-abort"
 
 	dt.AddPod(egressUID, "ns/pod", "192.168.0.1", "10.0.0.6")
-	dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.6", "ns", "pod")
+	dt.DeletePod(egressUID, "192.168.0.1", "10.0.0.6", "ns", "pod", "")
 
 	_, tracked := dt.pendingServiceOps[egressUID]
 	assert.False(t, tracked, "cancelling the only buffered pod before creation must abort the service")

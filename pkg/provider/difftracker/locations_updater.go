@@ -124,10 +124,12 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 		// Even with no location diff, recovered pending service/pod deletions must
 		// still be processed so their finalizers are not left pending.
 		lu.diffTracker.CheckPendingServiceDeletions()
-		lu.diffTracker.CheckPendingPodDeletions(ctx)
-		if lu.initPodFinalizersStillPending() {
-			// During init, retry instead of reporting success: CheckPendingPodDeletions
-			// swallows transient errors, and init completion requires pendingPodDeletions==0.
+		readyRemovalPending := lu.diffTracker.CheckPendingPodDeletions(ctx)
+		if lu.initPodFinalizersStillPending() || readyRemovalPending {
+			// Retry instead of reporting success: during init, init completion requires
+			// pendingPodDeletions==0; post-init, a ready non-last finalizer removal that failed
+			// transiently must be retried via backoffAndRetry rather than waiting for the next
+			// unrelated trigger (which on a quiet cluster could strand the pod Terminating).
 			lu.logger.V(4).Info("Pod finalizer removal incomplete, retrying")
 			return
 		}
@@ -167,11 +169,11 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	// to NRP and reflected in NRPResources above, so any non-last pod whose address has now
 	// left NRP gets its finalizer removed here. Last-pod entries are skipped (their finalizers
 	// are removed after NAT Gateway deletion by RemoveLastPodFinalizers).
-	lu.diffTracker.CheckPendingPodDeletions(ctx)
-
-	if lu.initPodFinalizersStillPending() {
-		// During init, a transient finalizer-removal failure must retry rather than
-		// report success, which would hang WaitForInitialSync.
+	readyRemovalPending := lu.diffTracker.CheckPendingPodDeletions(ctx)
+	if lu.initPodFinalizersStillPending() || readyRemovalPending {
+		// Retry instead of reporting success: during init this keeps WaitForInitialSync blocked
+		// until finalizers clear; post-init it reschedules a backoff retry for a ready non-last
+		// removal that failed transiently, so a quiet cluster does not strand the pod Terminating.
 		lu.logger.V(4).Info("Pod finalizer removal incomplete after sync, retrying")
 		return
 	}
@@ -193,6 +195,23 @@ func (lu *LocationsUpdater) initPodFinalizersStillPending() bool {
 	return len(dt.pendingPodDeletions) > 0
 }
 
+// computeRetryBackoff returns a bounded, jittered backoff delay for the given 1-based attempt
+// number, using the shared retry schedule (base delay doubling, capped, +~20% jitter). It is used
+// by both the LocationsUpdater sync retry and the ServiceUpdater operation retry so the two stay
+// in lockstep.
+func computeRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := locationsRetryBaseDelay << min(attempt-1, 5)
+	if delay <= 0 || delay > locationsRetryMaxDelay {
+		delay = locationsRetryMaxDelay
+	}
+	// Add up to ~20% jitter to avoid synchronized retries across controllers.
+	delay += time.Duration(rand.Int63n(int64(delay)/5 + 1))
+	return delay
+}
+
 // backoffAndRetry waits a bounded, jittered delay and then re-triggers the LocationsUpdater
 // so a failed NRP/ARM sync is retried instead of stalling until an unrelated future trigger.
 // It must be called from process() BEFORE the in-flight trigger counter is decremented, so
@@ -200,12 +219,7 @@ func (lu *LocationsUpdater) initPodFinalizersStillPending() bool {
 // the updater context (shutdown), and a concurrently buffered trigger simply shortcuts it.
 func (lu *LocationsUpdater) backoffAndRetry() {
 	lu.failureCount++
-	delay := locationsRetryBaseDelay << min(lu.failureCount-1, 5)
-	if delay <= 0 || delay > locationsRetryMaxDelay {
-		delay = locationsRetryMaxDelay
-	}
-	// Add up to ~20% jitter to avoid synchronized retries across controllers.
-	delay += time.Duration(rand.Int63n(int64(delay)/5 + 1))
+	delay := computeRetryBackoff(lu.failureCount)
 
 	lu.logger.V(4).Info("Scheduled NRP location sync retry", "delay", delay, "attempt", lu.failureCount)
 

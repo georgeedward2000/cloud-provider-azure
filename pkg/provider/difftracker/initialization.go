@@ -413,6 +413,7 @@ func recoverStuckFinalizers(
 			pendingPods[podKey] = &PendingPodDeletion{
 				Namespace:  pod.Namespace,
 				Name:       pod.Name,
+				UID:        string(pod.UID),
 				ServiceUID: egressLabel,
 				Address:    podIP,
 				Location:   nodeIP,
@@ -1515,7 +1516,7 @@ func (dt *DiffTracker) reconcileOutboundPods(nrp NRPState, k8sNodes map[string]N
 					serviceUID, location, address)
 				// During initialization, we don't have namespace/name - pass empty strings
 				// This is fine because orphaned NRP entries don't need pod finalizer tracking
-				dt.DeletePod(serviceUID, location, address, "", "")
+				dt.DeletePod(serviceUID, location, address, "", "", "")
 				deleteCount++
 			}
 		}
