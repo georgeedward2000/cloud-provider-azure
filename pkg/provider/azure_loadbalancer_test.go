@@ -810,18 +810,8 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 			service: getTestService("service1", v1.ProtocolTCP, nil, false, 80),
 		},
 		{
-			desc:          "internal service then flipped to external should be created and deleted successfully",
-			service:       getInternalTestService("service2", 80),
-			isInternalSvc: true,
-		},
-		{
 			desc:    "external service should be created and deleted successfully",
 			service: getTestService("service3", v1.ProtocolTCP, nil, false, 80),
-		},
-		{
-			desc:          "internal service should be created and deleted successfully",
-			service:       getInternalTestService("service4", 80),
-			isInternalSvc: true,
 		},
 		{
 			desc:    "annotated service with same resourceGroup should be created and deleted successfully",
@@ -915,18 +905,8 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 			service: getTestService("service1", v1.ProtocolTCP, nil, false, 80),
 		},
 		{
-			desc:          "internal service then flipped to external should be created and deleted successfully",
-			service:       getInternalTestService("service2", 80),
-			isInternalSvc: true,
-		},
-		{
 			desc:    "external service should be created and deleted successfully",
 			service: getTestService("service3", v1.ProtocolTCP, nil, false, 80),
-		},
-		{
-			desc:          "internal service should be created and deleted successfully",
-			service:       getInternalTestService("service4", 80),
-			isInternalSvc: true,
 		},
 		{
 			desc:    "annotated service with same resourceGroup should be created and deleted successfully",

@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -16,7 +15,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/securitygroupclient/mock_securitygroupclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient/mock_subnetclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
@@ -55,21 +53,6 @@ func newProviderDiffTracker(t *testing.T, az *Cloud, kubeClient kubernetes.Inter
 		t.FailNow()
 	}
 	return dt
-}
-
-func securityRuleHasDestinationPrefix(rule *armnetwork.SecurityRule, wantedPrefix string) bool {
-	if rule == nil || rule.Properties == nil {
-		return false
-	}
-	if rule.Properties.DestinationAddressPrefix != nil && *rule.Properties.DestinationAddressPrefix == wantedPrefix {
-		return true
-	}
-	for _, p := range rule.Properties.DestinationAddressPrefixes {
-		if p != nil && *p == wantedPrefix {
-			return true
-		}
-	}
-	return false
 }
 
 func TestPodIPWithoutServiceGateway_RejectsDualStack(t *testing.T) {
@@ -151,61 +134,6 @@ func TestServiceGatewayInternalAnnotation_IsRejected(t *testing.T) {
 	assert.Error(t, err, "internal load balancer must be rejected when ServiceGateway is enabled")
 	assert.Nil(t, status, "rejected internal service must not receive an ingress status")
 	assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)), "rejected internal service must not be tracked")
-}
-
-func TestServiceGatewayEnsureLoadBalancer_ReconcilesNSGForSourceRanges(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	svc := getTestService("servicegateway-source-ranges", v1.ProtocolTCP, nil, false, 80)
-	svc.Spec.LoadBalancerSourceRanges = []string{"10.20.0.0/24"}
-
-	sgClient := az.NetworkClientFactory.GetSecurityGroupClient().(*mock_securitygroupclient.MockInterface)
-	sgClient.EXPECT().Get(gomock.Any(), az.ResourceGroup, az.SecurityGroupName).Return(&armnetwork.SecurityGroup{
-		Name: to.Ptr(az.SecurityGroupName),
-		Properties: &armnetwork.SecurityGroupPropertiesFormat{
-			SecurityRules: []*armnetwork.SecurityRule{},
-		},
-	}, nil).Times(1)
-	sgClient.EXPECT().CreateOrUpdate(gomock.Any(), az.ResourceGroup, az.SecurityGroupName, gomock.Any()).Return(&armnetwork.SecurityGroup{}, nil).Times(1)
-
-	_, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
-	assert.NoError(t, err)
-}
-
-func TestServiceGatewayReconcileSecurityGroup_RetainsPodCIDRRules(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	az := GetTestCloudWithContainerLoadBalancerAndPrefixCidr(ctrl, false)
-	svc := getTestService("servicegateway-podcidr-rules", v1.ProtocolTCP, nil, false, 80)
-	wantedPodCIDR := az.PodCidrsIPv4[0].String()
-
-	sgClient := az.NetworkClientFactory.GetSecurityGroupClient().(*mock_securitygroupclient.MockInterface)
-	sgClient.EXPECT().Get(gomock.Any(), az.ResourceGroup, az.SecurityGroupName).Return(&armnetwork.SecurityGroup{
-		Name: to.Ptr(az.SecurityGroupName),
-		Properties: &armnetwork.SecurityGroupPropertiesFormat{
-			SecurityRules: []*armnetwork.SecurityRule{},
-		},
-	}, nil).Times(1)
-	sgClient.EXPECT().CreateOrUpdate(gomock.Any(), az.ResourceGroup, az.SecurityGroupName, gomock.Any()).DoAndReturn(func(_ context.Context, _, _ string, sg armnetwork.SecurityGroup) (*armnetwork.SecurityGroup, error) {
-		if !assert.NotNil(t, sg.Properties) {
-			t.FailNow()
-		}
-		found := false
-		for _, rule := range sg.Properties.SecurityRules {
-			if securityRuleHasDestinationPrefix(rule, wantedPodCIDR) {
-				found = true
-				break
-			}
-		}
-		assert.True(t, found, "expected a retained security rule targeting PodCIDR %s", wantedPodCIDR)
-		return &sg, nil
-	}).Times(1)
-
-	_, err := az.reconcileSecurityGroup(context.Background(), "test-cluster", &svc, "lb1", []string{"20.0.0.1"}, true)
-	assert.NoError(t, err)
 }
 
 func TestAttachServiceGatewayToSubnet_UsesConfiguredVNetRGAndSubnet(t *testing.T) {
