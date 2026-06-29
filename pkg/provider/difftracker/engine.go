@@ -340,6 +340,13 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 			// config starts with a clean retry budget rather than inheriting an exhausted one.
 			recoverPark = opState.RetriesExhausted
 			resetRetryStateLocked(opState)
+		} else if opState.RetriesExhausted && time.Now().After(opState.NextRetryAt) {
+			// Same spec, but the cooldown since the op parked has elapsed: the transient outage is
+			// likely over, so re-arm it. Without this a stable Service whose create exhausted its
+			// budget would never get its load balancer or public IP until the CCM restarts. The
+			// cooldown bounds this to one retry burst per parkReArmCooldown, not a per-resync storm.
+			recoverPark = true
+			resetRetryStateLocked(opState)
 		}
 		opState.Config = config
 		dt.mu.Unlock()
@@ -367,11 +374,27 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 
 	case StateUpdateInProgress:
 		// An updater is (or will be) processing this service. Overwrite with the latest desired
-		// config. If equal to the in-flight config, OnServiceCreationComplete will be a no-op;
-		// if different, OnServiceCreationComplete will detect the diff and reschedule.
+		// config. A live in-flight worker re-checks Config on completion via OnServiceCreationComplete
+		// and reschedules if it changed; a parked op (retries exhausted, no worker) has nothing to
+		// reschedule it, so it is re-armed here on a spec change or once the park cooldown has elapsed.
 		dt.logger.V(5).Info("Overwrote desired config while service is updating", "service", serviceUID)
+		recoverPark := false
+		if !configsEqualForUpdate(&opState.Config, &config) {
+			recoverPark = opState.RetriesExhausted
+			resetRetryStateLocked(opState)
+		} else if opState.RetriesExhausted && time.Now().After(opState.NextRetryAt) {
+			// Same spec, but the cooldown since the op parked has elapsed: re-arm so a stable Service
+			// applies the pending update instead of serving stale config until the CCM restarts.
+			recoverPark = true
+			resetRetryStateLocked(opState)
+		}
 		opState.Config = config
 		dt.mu.Unlock()
+		if recoverPark {
+			// The parked op has no worker to pick up the latest config; nudge the updater so the
+			// recovered op dispatches instead of being silently dropped.
+			dt.triggerServiceUpdater()
+		}
 
 	case StateDeletionPending, StateDeletionInProgress:
 		// A re-create (e.g. a LoadBalancer->ClusterIP->LoadBalancer toggle) arrived while
@@ -475,8 +498,17 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 			opState.State = StateDeletionPending
 
 		case StateDeletionPending, StateDeletionInProgress:
-			dt.mu.Unlock()
-			dt.logger.V(5).Info("Skipped service already being deleted", "service", serviceUID)
+			if opState.RetriesExhausted {
+				// A repeated delete is fresh intent: re-arm a delete that exhausted its retry budget
+				// so it dispatches again instead of leaking the Azure load balancer and public IP and
+				// leaving the Service stuck Terminating until the CCM restarts.
+				resetRetryStateLocked(opState)
+				dt.mu.Unlock()
+				dt.triggerServiceUpdater()
+			} else {
+				dt.mu.Unlock()
+				dt.logger.V(5).Info("Skipped service already being deleted", "service", serviceUID)
+			}
 			return
 
 		default:

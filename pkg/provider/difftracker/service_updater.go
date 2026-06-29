@@ -130,6 +130,13 @@ func (s *ServiceUpdater) requeueIfMoreWork(uid string) {
 // unbounded. Paired with the per-attempt backoff recorded in ServiceOperationState.NextRetryAt.
 const maxServiceRetries = 12
 
+// parkReArmCooldown is how long a parked operation stays parked before a resync may re-arm it, so a
+// transient outage self-heals on the next resync of an unchanged Service while bounding retries to
+// one burst per cooldown instead of a per-resync PUT storm. It must exceed the worst-case time to
+// exhaust maxServiceRetries (~4.5 min at the 30s backoff cap) so a re-arm never overlaps the burst
+// that parked it.
+const parkReArmCooldown = 5 * time.Minute
+
 // retryGate decides whether a retryable operation should be skipped this dispatch pass. It returns
 // true (caller must `continue`) when the op is still within its post-failure backoff window
 // (scheduling a guaranteed revisit via time.AfterFunc) or has exhausted its retry budget (a
@@ -140,6 +147,8 @@ func (s *ServiceUpdater) retryGate(serviceUID string, opState *ServiceOperationS
 	if opState.RetryCount >= maxServiceRetries {
 		if !opState.RetriesExhausted {
 			opState.RetriesExhausted = true
+			// Record when the op may be re-armed so a resync can self-heal it after the outage.
+			opState.NextRetryAt = time.Now().Add(parkReArmCooldown)
 			s.logger.Info("Giving up service operation after exhausting retries",
 				"serviceUID", serviceUID, "state", opState.State, "retries", opState.RetryCount)
 		}
