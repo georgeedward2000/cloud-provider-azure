@@ -502,6 +502,47 @@ func getServiceUIDOfEndpointSlice(es *discovery_v1.EndpointSlice) (uid string, l
 	return "", false
 }
 
+// seedInboundEndpointsFromCache pushes the current ready endpoints of an inbound (Load
+// Balancer) service into the engine using the EndpointSlice cache, so a service that is
+// (re)registered without a corresponding EndpointSlice event still gets its backend.
+//
+// The EndpointSlice informer only emits Add/Update events when a slice actually changes. A
+// brand-new Service produces a brand-new slice (its AddFunc seeds the endpoints), but a Service
+// that flips type LoadBalancer<->ClusterIP keeps the same Service object and the same, unchanged
+// slices. In that case EnsureLoadBalancer re-registers the LB/PIP/ServiceGateway entry but no
+// slice event fires, so without this seeding the re-provisioned load balancer would come up with
+// an empty backend pool. Seeding is idempotent: UpdateEndpoints inserts pod identities into a
+// set, so re-adding already-registered addresses is a no-op.
+func (az *Cloud) seedInboundEndpointsFromCache(serviceUID string) {
+	if serviceUID == "" {
+		return
+	}
+
+	combined := make(map[string]string)
+	az.endpointSlicesCache.Range(func(_, value interface{}) bool {
+		es, ok := value.(*discovery_v1.EndpointSlice)
+		if !ok || es == nil || es.DeletionTimestamp != nil {
+			return true
+		}
+		uid, loaded := getServiceUIDOfEndpointSlice(es)
+		if !loaded || uid != serviceUID {
+			return true
+		}
+		ipv6 := es.AddressType == discovery_v1.AddressTypeIPv6
+		for podIP, nodeIP := range az.getPodIPToNodeIPMapFromEndpointSlice(es, ipv6) {
+			combined[podIP] = nodeIP
+		}
+		return true
+	})
+
+	if len(combined) == 0 {
+		return
+	}
+
+	klog.V(2).Infof("seedInboundEndpointsFromCache: seeding %d endpoint(s) for re-registered service %s", len(combined), serviceUID)
+	az.diffTracker.UpdateEndpoints(serviceUID, nil, combined)
+}
+
 // getPodIPToNodeIPMapFromEndpointSlice returns a mapping from pod IP addresses to node IP addresses
 // matching the specified IP family (IPv6 when ipv6=true, IPv4 when ipv6=false)
 func (az *Cloud) getPodIPToNodeIPMapFromEndpointSlice(es *discovery_v1.EndpointSlice, ipv6 bool) map[string]string {

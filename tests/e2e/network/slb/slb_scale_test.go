@@ -66,9 +66,8 @@ var _ = Describe("SLB - Pod Scaling", Label(slbTestLabel), func() {
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			// Wait for Azure cleanup - increased for multi-service tests
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup")
+			eventuallyAzureCleanup(2 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -210,8 +209,10 @@ var _ = Describe("SLB - Pod Scaling", Label(slbTestLabel), func() {
 		utils.Logf("Service created: %s/%s (UID: %s)", ns.Name, serviceName, createdService.UID)
 
 		By("Waiting for Azure to provision resources")
-		utils.Logf("Waiting %v for Azure provisioning...", azureWaitTime)
-		time.Sleep(azureWaitTime)
+		Eventually(func() error {
+			return serviceReconciledErr(string(createdService.UID), numPods)
+		}, azureWaitTime, 10*time.Second).Should(Succeed(),
+			"service should be reconciled in Azure and the Service Gateway")
 
 		// Azure names resources based on the service UID
 		serviceUID := string(createdService.UID)

@@ -426,8 +426,10 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 360 seconds for Azure cleanup (egress gateway cleanup is slower)...")
-			time.Sleep(360 * time.Second)
+			By("Waiting for Azure cleanup to complete (egress gateway cleanup is slower)")
+			// Poll instead of a fixed sleep so the spec only waits as long as Azure
+			// actually needs. The cap matches the previous conservative fixed wait.
+			eventuallyAzureCleanup(6 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -564,51 +566,24 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 		err = waitForCCMFullyUp(ctx, ccmClient, utils.CCMRecoveryTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("Waiting 3 minutes for CCM to reconcile all services")
-		time.Sleep(3 * time.Minute)
-
-		By("Verifying Azure resources are reconciled (K8s external IP not expected)")
-		for i := 1; i <= numServices; i++ {
-			serviceName := fmt.Sprintf("init-lb-svc-%d", i)
-
-			// Verify service still exists
-			svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Note: K8s service.Status.LoadBalancer.Ingress will NOT be set - this is the known limitation
-			// But Azure resources (PIPs, LBs) and Service Gateway endpoints SHOULD be created
-			if len(svc.Status.LoadBalancer.Ingress) > 0 {
-				utils.Logf("Service %s has K8s external IP: %s (unexpected)",
-					serviceName, svc.Status.LoadBalancer.Ingress[0].IP)
-			} else {
-				utils.Logf("Service %s has no K8s external IP (expected - status not updated)", serviceName)
-			}
-
-			// Verify Azure resources (PIPs, LBs) were created
-			serviceUID := string(svc.UID)
-			err = verifyAzureResources(serviceUID)
-			Expect(err).NotTo(HaveOccurred(), "Azure resources should exist for service %s", serviceName)
-			utils.Logf("Service %s has Azure PIPs and Load Balancer", serviceName)
-
-			// Verify endpoints match pod count in Service Gateway
-			alResponse, err := queryServiceGatewayAddressLocations()
-			Expect(err).NotTo(HaveOccurred())
-
-			registeredPods := 0
-			for _, location := range alResponse.Value {
-				for _, addr := range location.Addresses {
-					for _, svcName := range addr.Services {
-						if svcName == serviceUID {
-							registeredPods++
-						}
-					}
+		By("Waiting for CCM to reconcile all services")
+		// Poll until every service is reconciled in Azure and the Service Gateway rather
+		// than sleeping a fixed 3 minutes; the cap matches the previous fixed wait.
+		Eventually(func() error {
+			for i := 1; i <= numServices; i++ {
+				serviceName := fmt.Sprintf("init-lb-svc-%d", i)
+				svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("get service %s: %w", serviceName, err)
+				}
+				if err := serviceReconciledErr(string(svc.UID), podsPerSvc); err != nil {
+					return fmt.Errorf("service %s: %w", serviceName, err)
 				}
 			}
-			utils.Logf("Service %s has %d registered endpoints in Service Gateway (expected %d)",
-				serviceName, registeredPods, podsPerSvc)
-			Expect(registeredPods).To(Equal(podsPerSvc),
-				"Service %s should have %d endpoints in Address Locations", serviceName, podsPerSvc)
-		}
+			return nil
+		}, 3*time.Minute, 10*time.Second).Should(Succeed(),
+			"all services should be reconciled in Azure and the Service Gateway after CCM recovery")
+		utils.Logf("✓ All %d services reconciled with %d endpoints each", numServices, podsPerSvc)
 	})
 
 	It("should reconcile 4 LoadBalancer services deleted during CCM downtime", func() {
@@ -679,25 +654,31 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 			serviceUIDs = append(serviceUIDs, string(svc.UID))
 		}
 
-		By("Waiting for services to be established")
-		time.Sleep(90 * time.Second)
-
-		By("Verifying all Service Gateway services exist")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-		for _, serviceUID := range serviceUIDs {
-			found := false
-			for _, svc := range sgResponse.Value {
-				if svc.Name == serviceUID {
-					found = true
-					break
+		By("Waiting for all services to be established in the Service Gateway")
+		// Poll instead of a fixed 90s sleep; returns as soon as all services appear.
+		Eventually(func() error {
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
+			}
+			for _, serviceUID := range serviceUIDs {
+				found := false
+				for _, svc := range sgResponse.Value {
+					if svc.Name == serviceUID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return fmt.Errorf("Service Gateway service for %s does not exist yet", serviceUID)
 				}
 			}
-			Expect(found).To(BeTrue(), "Service Gateway service for %s should exist before deletion", serviceUID)
-		}
+			return nil
+		}, 90*time.Second, 5*time.Second).Should(Succeed(),
+			"all services should be established in the Service Gateway before deletion")
 
 		By("Scaling CCM to 0 replicas")
-		err = scaleCCMDeployment(ctx, ccmClient, 0)
+		err := scaleCCMDeployment(ctx, ccmClient, 0)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for CCM to be fully down")
@@ -728,25 +709,24 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 		err = waitForCCMFullyUp(ctx, ccmClient, utils.CCMRecoveryTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("Waiting 5 minutes for deletion reconciliation")
-		time.Sleep(5 * time.Minute)
-
-		By("Verifying all services are deleted from K8s")
-		for i := 1; i <= numServices; i++ {
-			serviceName := fmt.Sprintf("init-lb-del-%d", i)
-			_, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
-			Expect(err).To(HaveOccurred(), "Service %s should be deleted from K8s", serviceName)
-		}
-
-		By("Verifying all Service Gateway services are gone")
-		sgResponse, err = queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-		for _, serviceUID := range serviceUIDs {
-			for _, svc := range sgResponse.Value {
-				Expect(svc.Name).NotTo(Equal(serviceUID),
-					"Service Gateway service for %s should be deleted", serviceUID)
+		By("Waiting for deletion to be reconciled")
+		// Poll instead of a fixed 5m sleep; returns as soon as every service is gone
+		// from both K8s and the Service Gateway.
+		Eventually(func() error {
+			for i := 1; i <= numServices; i++ {
+				serviceName := fmt.Sprintf("init-lb-del-%d", i)
+				if _, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{}); err == nil {
+					return fmt.Errorf("service %s still exists in K8s", serviceName)
+				}
 			}
-		}
+			for _, serviceUID := range serviceUIDs {
+				if err := serviceDeletedErr(serviceUID); err != nil {
+					return err
+				}
+			}
+			return nil
+		}, 5*time.Minute, 10*time.Second).Should(Succeed(),
+			"all services should be deleted from K8s and the Service Gateway after CCM recovery")
 
 		By("Verifying Service Gateway cleanup")
 		verifyServiceGatewayCleanup()
@@ -820,50 +800,19 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 		err = waitForCCMFullyUp(ctx, ccmClient, utils.CCMRecoveryTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("Waiting 3 minutes for CCM to reconcile egress gateways")
-		time.Sleep(3 * time.Minute)
-
-		By("Verifying all egress gateway services exist in Service Gateway with NAT Gateways")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
-		foundGateways := 0
-		for _, svc := range sgResponse.Value {
-			if svc.Properties.ServiceType == "Outbound" {
-				for _, egressName := range egressGateways {
-					if svc.Name == egressName {
-						foundGateways++
-						utils.Logf("Found egress gateway '%s' with NAT Gateway: %s",
-							egressName, svc.Properties.PublicNatGatewayID)
-						Expect(svc.Properties.PublicNatGatewayID).NotTo(BeEmpty(),
-							"NAT Gateway ID should exist for %s", egressName)
-					}
+		By("Waiting for CCM to reconcile egress gateways")
+		// Poll instead of a fixed 3m sleep; returns as soon as all egress gateways are
+		// reconciled with NAT Gateways and their pods are registered.
+		Eventually(func() error {
+			for _, egressName := range egressGateways {
+				if err := egressRegisteredErr(egressName, podsPerGateway); err != nil {
+					return err
 				}
 			}
-		}
-		Expect(foundGateways).To(Equal(len(egressGateways)),
-			"All %d egress gateways should exist in Service Gateway", len(egressGateways))
-
-		By("Verifying all egress gateways have correct number of registered pods")
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
-		for _, egressName := range egressGateways {
-			registeredPods := 0
-			for _, location := range alResponse.Value {
-				for _, addr := range location.Addresses {
-					for _, svcName := range addr.Services {
-						if svcName == egressName {
-							registeredPods++
-						}
-					}
-				}
-			}
-			utils.Logf("Egress gateway '%s' has %d registered pods (expected %d)",
-				egressName, registeredPods, podsPerGateway)
-			Expect(registeredPods).To(Equal(podsPerGateway),
-				"Egress gateway %s should have %d registered pods", egressName, podsPerGateway)
-		}
+			return nil
+		}, 3*time.Minute, 10*time.Second).Should(Succeed(),
+			"all egress gateways should be reconciled with NAT Gateways and registered pods after CCM recovery")
+		utils.Logf("✓ All %d egress gateways reconciled with %d pods each", len(egressGateways), podsPerGateway)
 	})
 
 	It("should reconcile 4 egress gateways deleted during CCM downtime", func() {
@@ -908,27 +857,31 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 			}
 		}
 
-		By("Waiting for NAT Gateways to be provisioned")
-		time.Sleep(90 * time.Second)
-
-		By("Verifying all egress gateways exist before deletion")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-		for _, egressName := range egressGateways {
-			found := false
-			for _, svc := range sgResponse.Value {
-				if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
-					found = true
-					utils.Logf("Egress gateway '%s' exists with NAT Gateway: %s",
-						egressName, svc.Properties.PublicNatGatewayID)
-					break
+		By("Waiting for all egress gateways to be established before deletion")
+		// Poll instead of a fixed 90s sleep.
+		Eventually(func() error {
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
+			}
+			for _, egressName := range egressGateways {
+				found := false
+				for _, svc := range sgResponse.Value {
+					if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return fmt.Errorf("egress gateway %s does not exist yet", egressName)
 				}
 			}
-			Expect(found).To(BeTrue(), "Egress gateway %s should exist before deletion", egressName)
-		}
+			return nil
+		}, 90*time.Second, 5*time.Second).Should(Succeed(),
+			"all egress gateways should exist before deletion")
 
 		By("Scaling CCM to 0 replicas")
-		err = scaleCCMDeployment(ctx, ccmClient, 0)
+		err := scaleCCMDeployment(ctx, ccmClient, 0)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for CCM to be fully down")
@@ -961,29 +914,32 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 		err = waitForCCMFullyUp(ctx, ccmClient, utils.CCMRecoveryTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("Waiting 5 minutes for deletion reconciliation")
-		time.Sleep(5 * time.Minute)
-
-		By("Verifying all pods are deleted from K8s")
-		for _, egressName := range egressGateways {
-			for i := 0; i < podsPerGateway; i++ {
-				podName := fmt.Sprintf("%s-pod-%d", egressName, i)
-				_, err := cs.CoreV1().Pods(ns.Name).Get(ctx, podName, metav1.GetOptions{})
-				Expect(err).To(HaveOccurred(), "Pod %s should be deleted", podName)
-			}
-		}
-
-		By("Verifying all outbound services are deleted from Service Gateway")
-		sgResponse, err = queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-		for _, egressName := range egressGateways {
-			for _, svc := range sgResponse.Value {
-				if svc.Properties.ServiceType == "Outbound" {
-					Expect(svc.Name).NotTo(Equal(egressName),
-						"Outbound service for %s should be deleted", egressName)
+		By("Waiting for egress deletion to be reconciled")
+		// Poll instead of a fixed 5m sleep; returns as soon as all egress pods are gone
+		// from K8s and their outbound services are removed from the Service Gateway.
+		Eventually(func() error {
+			for _, egressName := range egressGateways {
+				for i := 0; i < podsPerGateway; i++ {
+					podName := fmt.Sprintf("%s-pod-%d", egressName, i)
+					if _, err := cs.CoreV1().Pods(ns.Name).Get(ctx, podName, metav1.GetOptions{}); err == nil {
+						return fmt.Errorf("pod %s still exists", podName)
+					}
 				}
 			}
-		}
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
+			}
+			for _, egressName := range egressGateways {
+				for _, svc := range sgResponse.Value {
+					if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
+						return fmt.Errorf("outbound service for %s still exists", egressName)
+					}
+				}
+			}
+			return nil
+		}, 5*time.Minute, 10*time.Second).Should(Succeed(),
+			"all egress pods and outbound services should be deleted after CCM recovery")
 
 		By("Verifying NAT Gateway cleanup")
 		verifyNATGatewayCleanup(egressGateways)
@@ -1266,92 +1222,51 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 		err = waitForCCMFullyUp(ctx, ccmClient, utils.CCMRecoveryTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("Waiting 5 minutes for full reconciliation of all operations")
-		time.Sleep(5 * time.Minute)
-
-		By("Verifying 4 active services exist (3 new + 1 existing)")
-		allActiveServices := append(newServices, baselineServices[1])
-		for _, serviceName := range allActiveServices {
-			svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
-			Expect(err).NotTo(HaveOccurred(), "Service %s should exist", serviceName)
-
-			// Note: K8s service.Status.LoadBalancer.Ingress will NOT be set - this is the known limitation
-			// But Azure resources should exist
-			if len(svc.Status.LoadBalancer.Ingress) > 0 {
-				utils.Logf("Service %s has K8s external IP: %s (unexpected)",
-					serviceName, svc.Status.LoadBalancer.Ingress[0].IP)
-			} else {
-				utils.Logf("Service %s has no K8s external IP (expected)", serviceName)
-			}
-
-			// Verify Azure resources exist
-			serviceUID := string(svc.UID)
-			err = verifyAzureResources(serviceUID)
-			Expect(err).NotTo(HaveOccurred(), "Azure resources should exist for service %s", serviceName)
-			utils.Logf("Service %s has Azure PIPs and Load Balancer", serviceName)
-		}
-
-		By("Verifying deleted service is gone")
-		_, err = cs.CoreV1().Services(ns.Name).Get(ctx, baselineServices[0], metav1.GetOptions{})
-		Expect(err).To(HaveOccurred(), "Service %s should be deleted", baselineServices[0])
-
-		By("Verifying existing service has 6 endpoints")
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
-		existingSvc, err := cs.CoreV1().Services(ns.Name).Get(ctx, baselineServices[1], metav1.GetOptions{})
-		Expect(err).NotTo(HaveOccurred())
-		existingSvcUID := string(existingSvc.UID)
-
-		registeredPods := 0
-		for _, location := range alResponse.Value {
-			for _, addr := range location.Addresses {
-				for _, svcName := range addr.Services {
-					if svcName == existingSvcUID {
-						registeredPods++
-					}
-				}
-			}
-		}
+		By("Waiting for all mixed operations to be reconciled")
+		// Poll instead of a fixed 5m sleep; returns as soon as all create/delete/scale
+		// operations performed during downtime have been reconciled.
 		expectedPods := baselinePods + additionalPods
-		utils.Logf("Service %s has %d registered pods (expected %d)", baselineServices[1], registeredPods, expectedPods)
-		Expect(registeredPods).To(Equal(expectedPods),
-			"Service %s should have %d endpoints", baselineServices[1], expectedPods)
-
-		By("Verifying 2 active egress gateways with 4 pods each")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
-		foundNewGateways := 0
-		for _, svc := range sgResponse.Value {
-			if svc.Properties.ServiceType == "Outbound" {
-				for _, egressName := range newEgressGateways {
-					if svc.Name == egressName {
-						foundNewGateways++
-						utils.Logf("Found new egress gateway '%s'", egressName)
-					}
+		Eventually(func() error {
+			// 4 active services (3 new + 1 existing baseline) must exist with Azure resources.
+			allActiveServices := append(append([]string{}, newServices...), baselineServices[1])
+			for _, serviceName := range allActiveServices {
+				svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("get service %s: %w", serviceName, err)
+				}
+				if err := serviceReconciledErr(string(svc.UID), -1); err != nil {
+					return fmt.Errorf("service %s: %w", serviceName, err)
 				}
 			}
-		}
-		Expect(foundNewGateways).To(Equal(len(newEgressGateways)),
-			"Both new egress gateways should exist")
 
-		for _, egressName := range newEgressGateways {
-			registeredPods := 0
-			for _, location := range alResponse.Value {
-				for _, addr := range location.Addresses {
-					for _, svcName := range addr.Services {
-						if svcName == egressName {
-							registeredPods++
-						}
-					}
+			// The deleted baseline service must be gone from K8s.
+			if _, err := cs.CoreV1().Services(ns.Name).Get(ctx, baselineServices[0], metav1.GetOptions{}); err == nil {
+				return fmt.Errorf("service %s still exists", baselineServices[0])
+			}
+
+			// The surviving baseline service must have baseline+additional endpoints.
+			existingSvc, err := cs.CoreV1().Services(ns.Name).Get(ctx, baselineServices[1], metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("get service %s: %w", baselineServices[1], err)
+			}
+			got, err := countRegisteredEndpoints(string(existingSvc.UID))
+			if err != nil {
+				return err
+			}
+			if got != expectedPods {
+				return fmt.Errorf("service %s has %d endpoints, want %d", baselineServices[1], got, expectedPods)
+			}
+
+			// Both new egress gateways must exist with their pods registered.
+			for _, egressName := range newEgressGateways {
+				if err := egressRegisteredErr(egressName, newEgressPods); err != nil {
+					return err
 				}
 			}
-			utils.Logf("Egress gateway '%s' has %d registered pods (expected %d)",
-				egressName, registeredPods, newEgressPods)
-			Expect(registeredPods).To(Equal(newEgressPods),
-				"Egress gateway %s should have %d pods", egressName, newEgressPods)
-		}
+			return nil
+		}, 5*time.Minute, 10*time.Second).Should(Succeed(),
+			"all mixed operations should be reconciled after CCM recovery")
+		utils.Logf("✓ Mixed operations reconciled: 3 new + 1 surviving service, 2 new egress gateways")
 
 		By("Verifying deleted egress gateway is fully cleaned up")
 		verifyNATGatewayCleanup([]string{baselineEgress})
@@ -1460,38 +1375,37 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 		err = waitForCCMFullyUp(ctx, ccmClient, utils.CCMRecoveryTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("Waiting briefly for CCM initialization to process services (add finalizers)")
-		// This short delay allows CCM to run initialization and add our finalizers.
-		// The bug occurs when our finalizer is added but K8s LB finalizer is not,
-		// so we delete quickly after init to trigger the race condition.
-		time.Sleep(30 * time.Second)
-
-		By("Verifying services have our ServiceGateway finalizer")
-		for i := 1; i <= numServices; i++ {
-			serviceName := fmt.Sprintf("init-finalizer-svc-%d", i)
-			svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Check for our custom finalizer
-			hasServiceGatewayFinalizer := false
-			hasK8sLBFinalizer := false
-			for _, f := range svc.Finalizers {
-				if f == "servicegateway.azure.com/service-cleanup" {
-					hasServiceGatewayFinalizer = true
+		By("Waiting for CCM initialization to add finalizers to the services")
+		// Poll until our finalizers are present instead of a fixed 30s sleep. Returning as
+		// soon as they appear also tightens the race window this test exercises (the
+		// namespace is deleted immediately afterwards).
+		Eventually(func() error {
+			for i := 1; i <= numServices; i++ {
+				serviceName := fmt.Sprintf("init-finalizer-svc-%d", i)
+				svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("get service %s: %w", serviceName, err)
 				}
-				if f == "service.kubernetes.io/load-balancer-cleanup" {
-					hasK8sLBFinalizer = true
+				hasServiceGatewayFinalizer := false
+				hasK8sLBFinalizer := false
+				for _, f := range svc.Finalizers {
+					if f == "servicegateway.azure.com/service-cleanup" {
+						hasServiceGatewayFinalizer = true
+					}
+					if f == "service.kubernetes.io/load-balancer-cleanup" {
+						hasK8sLBFinalizer = true
+					}
+				}
+				if !hasServiceGatewayFinalizer {
+					return fmt.Errorf("service %s missing ServiceGateway finalizer", serviceName)
+				}
+				if !hasK8sLBFinalizer {
+					return fmt.Errorf("service %s missing K8s LB finalizer (fix for race condition)", serviceName)
 				}
 			}
-			utils.Logf("Service %s finalizers: ServiceGateway=%v, K8sLB=%v",
-				serviceName, hasServiceGatewayFinalizer, hasK8sLBFinalizer)
-
-			// With the fix, both finalizers should be present
-			Expect(hasServiceGatewayFinalizer).To(BeTrue(),
-				"Service %s should have ServiceGateway finalizer", serviceName)
-			Expect(hasK8sLBFinalizer).To(BeTrue(),
-				"Service %s should have K8s LB finalizer (fix for race condition)", serviceName)
-		}
+			return nil
+		}, 60*time.Second, 2*time.Second).Should(Succeed(),
+			"both finalizers should be added to all services during CCM initialization")
 
 		By("Deleting namespace immediately to trigger potential finalizer race condition")
 		// Store namespace name before deleting
@@ -1535,8 +1449,9 @@ var _ = Describe("Container Load Balancer Initialization Tests", Label(slbTestLa
 			namespaceDeleteTimeout)
 		utils.Logf("SUCCESS: Namespace deletion completed without hanging!")
 
-		By("Waiting 60 seconds for Azure cleanup to complete")
-		time.Sleep(60 * time.Second)
+		By("Waiting for Azure cleanup to complete")
+		// Poll instead of a fixed 60s sleep; returns as soon as cleanup is done.
+		eventuallyAzureCleanup(2 * time.Minute)
 
 		By("Verifying Service Gateway cleanup")
 		verifyServiceGatewayCleanup()

@@ -108,6 +108,12 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 				return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: idle timeout %d out of range (4-30) for service %s", idleTimeout, serviceUID)
 			}
 		}
+		// Azure rejects two load-balancing rules that share the same protocol and backend
+		// port on the same backend pool when floating IP is disabled (always the case for
+		// PodIP backends): RulesUseSameBackendPortProtocolAndPool. Detect that collision here
+		// and fail the build terminally (as with named/dual-stack above) so the engine parks
+		// the service instead of retrying an Azure PUT that can never succeed.
+		seenBackend := make(map[string]int, len(config.FrontendPorts))
 		for i, frontendPort := range config.FrontendPorts {
 			backendPort := frontendPort.Port
 			if i < len(config.BackendPorts) {
@@ -130,6 +136,12 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 			default:
 				return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: unsupported protocol %q for service %s", frontendPort.Protocol, serviceUID)
 			}
+
+			backendKey := fmt.Sprintf("%s/%d", protocol, backendPort)
+			if prev, ok := seenBackend[backendKey]; ok {
+				return pip, lb, servicesDTO, fmt.Errorf("buildInboundServiceResources: service %s frontend ports %d and %d both map to backend port %d over %s; Azure rejects load-balancing rules that share a backend port and protocol on the same pool with floating IP disabled (RulesUseSameBackendPortProtocolAndPool), so distinct service ports must use distinct targetPorts", serviceUID, config.FrontendPorts[prev].Port, frontendPort.Port, backendPort, protocol)
+			}
+			seenBackend[backendKey] = i
 
 			ruleName := fmt.Sprintf("rule-%s-%d", strings.ToLower(frontendPort.Protocol), frontendPort.Port)
 

@@ -71,9 +71,8 @@ var _ = Describe("SLB - Basic Service", Label(slbTestLabel), func() {
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			// Wait for Azure cleanup - increased for multi-service tests
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup")
+			eventuallyAzureCleanup(2 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -126,8 +125,10 @@ var _ = Describe("SLB - Basic Service", Label(slbTestLabel), func() {
 		utils.Logf("  External Traffic Policy: Local")
 
 		By("Waiting for Azure to provision LoadBalancer resources")
-		utils.Logf("Waiting 60 seconds for Azure to create Public IP and Load Balancer...")
-		time.Sleep(60 * time.Second)
+		Eventually(func() error {
+			return serviceReconciledErr(string(createdService.UID), -1)
+		}, 60*time.Second, 10*time.Second).Should(Succeed(),
+			"service should be reconciled in Azure and the Service Gateway")
 
 		By("Verifying Public IP exists in Azure using CLI")
 

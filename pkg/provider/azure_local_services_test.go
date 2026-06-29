@@ -842,7 +842,7 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 				VNetName:                   cloud.VnetName,
 				ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
 				ServiceGatewayID:           cloud.GetServiceGatewayID(),
-			}, cloud.NetworkClientFactory, nil)
+			}, cloud.NetworkClientFactory, fake.NewSimpleClientset())
 			if err != nil {
 				t.Fatalf("failed to initialize diffTracker: %v", err)
 			}
@@ -878,6 +878,100 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 			time.Sleep(2 * time.Second)
 		})
 	}
+}
+
+// TestSeedInboundEndpointsFromCache verifies that seedInboundEndpointsFromCache pushes the
+// current ready endpoints of an inbound service into the engine from the EndpointSlice cache.
+// This is the path that keeps a ClusterIP<->LoadBalancer type flip (which re-registers the
+// service without any EndpointSlice change) from coming up with an empty backend pool.
+func TestSeedInboundEndpointsFromCache(t *testing.T) {
+	const svcUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	// newCloud builds a Cloud whose diffTracker already considers svcUID a registered NRP
+	// load balancer, so UpdateEndpoints registers seeded addresses synchronously (rather than
+	// only buffering them), letting us assert the result via GetSyncLocationsAddresses.
+	newCloud := func(t *testing.T) *Cloud {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		cloud := GetTestCloudWithContainerLoadBalancer(ctrl)
+		k8s := difftracker.K8sState{
+			Services: utilsets.NewString(svcUID),
+			Egresses: utilsets.NewString(),
+			Nodes:    make(map[string]difftracker.Node),
+		}
+		nrp := difftracker.NRPState{
+			LoadBalancers: utilsets.NewString(svcUID),
+			NATGateways:   utilsets.NewString(),
+			Locations:     make(map[string]difftracker.NRPLocation),
+		}
+		var err error
+		cloud.diffTracker, err = difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
+			SubscriptionID:             cloud.SubscriptionID,
+			ResourceGroup:              cloud.ResourceGroup,
+			Location:                   cloud.Location,
+			VNetName:                   cloud.VnetName,
+			ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
+			ServiceGatewayID:           cloud.GetServiceGatewayID(),
+		}, cloud.NetworkClientFactory, fake.NewSimpleClientset())
+		if err != nil {
+			t.Fatalf("failed to initialize diffTracker: %v", err)
+		}
+		cloud.nodePrivateIPs = map[string]*utilsets.IgnoreCaseSet{
+			"node1": utilsets.NewString("10.0.0.1"),
+			"node2": utilsets.NewString("10.0.0.2"),
+		}
+		return cloud
+	}
+
+	// ipv4Slice returns an IPv4 EndpointSlice owned by the given service UID. The base helper
+	// leaves AddressType empty, which getPodIPToNodeIPMapFromEndpointSlice would skip, so it is
+	// set explicitly here.
+	ipv4Slice := func(ownerUID string) *discovery_v1.EndpointSlice {
+		es := getTestEndpointSliceWithAddressesAndServiceOwnerReference(
+			"eps1", "test", "svc1", types.UID(ownerUID),
+			[]string{"1.1.1.1", "2.2.2.2"}, "node1", "node2")
+		es.AddressType = discovery_v1.AddressTypeIPv4
+		return es
+	}
+
+	t.Run("seeds endpoints for the matching service", func(t *testing.T) {
+		cloud := newCloud(t)
+		cloud.endpointSlicesCache.Store("test/eps1", ipv4Slice(svcUID))
+
+		cloud.seedInboundEndpointsFromCache(svcUID)
+
+		ld := cloud.diffTracker.GetSyncLocationsAddresses()
+		loc1, ok := ld.Locations["10.0.0.1"]
+		assert.True(t, ok, "node1 IP should have a location entry")
+		_, ok = loc1.Addresses["1.1.1.1"]
+		assert.True(t, ok, "pod 1.1.1.1 should be registered on node1")
+		loc2, ok := ld.Locations["10.0.0.2"]
+		assert.True(t, ok, "node2 IP should have a location entry")
+		addr2, ok := loc2.Addresses["2.2.2.2"]
+		assert.True(t, ok, "pod 2.2.2.2 should be registered on node2")
+		assert.True(t, addr2.ServiceRef.Has(svcUID), "address should reference the seeded service")
+	})
+
+	t.Run("ignores slices owned by a different service", func(t *testing.T) {
+		cloud := newCloud(t)
+		cloud.endpointSlicesCache.Store("test/eps1", ipv4Slice("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"))
+
+		cloud.seedInboundEndpointsFromCache(svcUID)
+
+		ld := cloud.diffTracker.GetSyncLocationsAddresses()
+		assert.Empty(t, ld.Locations, "no addresses should be registered when no slice matches the UID")
+	})
+
+	t.Run("is a no-op for an empty UID", func(t *testing.T) {
+		cloud := newCloud(t)
+		cloud.endpointSlicesCache.Store("test/eps1", ipv4Slice(svcUID))
+
+		cloud.seedInboundEndpointsFromCache("")
+
+		ld := cloud.diffTracker.GetSyncLocationsAddresses()
+		assert.Empty(t, ld.Locations, "an empty UID must not register anything")
+	})
 }
 
 func TestGetBackendPoolNamesAndIDsForService(t *testing.T) {

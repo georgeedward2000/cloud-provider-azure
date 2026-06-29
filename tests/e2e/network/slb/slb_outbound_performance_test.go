@@ -143,19 +143,14 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 		provisionedEgress := make(map[string]bool)
 		var provMutex sync.Mutex
 
-		for {
-			if time.Since(provisionStart) > 30*time.Minute {
-				utils.Logf("WARNING: Timeout waiting for Azure NAT Gateway provisioning")
-				break
-			}
-
+		Eventually(func() error {
 			sgResponse, err := queryServiceGatewayServices()
 			if err != nil {
-				time.Sleep(5 * time.Second)
-				continue
+				return fmt.Errorf("query Service Gateway services: %w", err)
 			}
 
 			provMutex.Lock()
+			defer provMutex.Unlock()
 			for _, sgSvc := range sgResponse.Value {
 				if sgSvc.Properties.ServiceType == "Outbound" {
 					// Check if this is one of our egress services
@@ -168,15 +163,14 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 				}
 			}
 			count := len(provisionedEgress)
-			provMutex.Unlock()
 
 			utils.Logf("  NAT Gateways provisioned: %d/%d", count, numEgressServices)
-
-			if count >= numEgressServices {
-				break
+			if count < numEgressServices {
+				return fmt.Errorf("NAT Gateways provisioned: %d/%d", count, numEgressServices)
 			}
-			time.Sleep(5 * time.Second)
-		}
+			return nil
+		}, 30*time.Minute, 10*time.Second).Should(Succeed(),
+			"all NAT Gateways should be provisioned in Azure")
 
 		totalCreateDuration := time.Since(createStart)
 		azureProvisionDuration := time.Since(provisionStart)
@@ -228,12 +222,7 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 		// ============================================
 		utils.Logf("\n--- PHASE 5: Waiting for pods to disappear from K8s ---")
 
-		for {
-			if time.Since(deleteStart) > 20*time.Minute {
-				utils.Logf("WARNING: Timeout waiting for pod deletion")
-				break
-			}
-
+		Eventually(func() error {
 			remaining := 0
 			for i := 0; i < numEgressServices; i++ {
 				_, err := cs.CoreV1().Pods(ns.Name).Get(context.TODO(), fmt.Sprintf("egress-pod-%d", i), metav1.GetOptions{})
@@ -249,10 +238,11 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 			}
 
 			if remaining == 0 {
-				break
+				return nil
 			}
-			time.Sleep(2 * time.Second)
-		}
+			return fmt.Errorf("%d pod(s) still exist", remaining)
+		}, 20*time.Minute, 10*time.Second).Should(Succeed(),
+			"all egress pods should be deleted from K8s")
 
 		utils.Logf("✓ ALL %d PODS DELETED", numEgressServices)
 
@@ -261,32 +251,10 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 		// ============================================
 		utils.Logf("\n--- PHASE 6: Verifying NAT Gateway cleanup ---")
 
-		for {
-			if time.Since(deleteStart) > 25*time.Minute {
-				utils.Logf("WARNING: Timeout waiting for NAT Gateway cleanup")
-				break
-			}
-
-			sgResponse, err := queryServiceGatewayServices()
-			if err != nil {
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			remaining := 0
-			for _, sgSvc := range sgResponse.Value {
-				if sgSvc.Properties.ServiceType == "Outbound" && sgSvc.Name != "default-natgw" {
-					remaining++
-				}
-			}
-
-			utils.Logf("  NAT Gateways remaining (excluding default): %d", remaining)
-
-			if remaining == 0 {
-				break
-			}
-			time.Sleep(5 * time.Second)
-		}
+		Eventually(func() error {
+			return natGatewayCleanupErr(egressNames)
+		}, 25*time.Minute, 10*time.Second).Should(Succeed(),
+			"all NAT Gateways should be cleaned up")
 
 		azureCleanupDuration := time.Since(deleteStart)
 		utils.Logf("✓ All NAT Gateways cleaned up")
@@ -400,46 +368,31 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 		var natGatewayReady bool
 		var addressCount int
 
-		for {
-			if time.Since(provisionStart) > 10*time.Minute {
-				utils.Logf("WARNING: Timeout waiting for NAT Gateway provisioning")
-				break
+		Eventually(func() error {
+			if err := egressRegisteredErr(egressName, numPods); err != nil {
+				return err
 			}
-
-			// Check Service Gateway for our egress service
 			sgResponse, err := queryServiceGatewayServices()
 			if err != nil {
-				time.Sleep(2 * time.Second)
-				continue
+				return fmt.Errorf("query Service Gateway services: %w", err)
 			}
-
+			natGatewayReady = false
 			for _, sgSvc := range sgResponse.Value {
 				if sgSvc.Name == egressName && sgSvc.Properties.ServiceType == "Outbound" {
 					natGatewayReady = true
 					break
 				}
 			}
-
-			// Check address locations
-			addrResponse, err := queryServiceGatewayAddressLocations()
+			count, err := countRegisteredEndpoints(egressName)
 			if err != nil {
-				time.Sleep(2 * time.Second)
-				continue
+				return err
 			}
-
-			totalAddresses := 0
-			for _, loc := range addrResponse.Value {
-				totalAddresses += len(loc.Addresses)
-			}
-			addressCount = totalAddresses
+			addressCount = count
 
 			utils.Logf("  NAT Gateway: %v, Addresses registered: %d", natGatewayReady, addressCount)
-
-			if natGatewayReady && addressCount >= numPods {
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
+			return nil
+		}, 10*time.Minute, 10*time.Second).Should(Succeed(),
+			"NAT Gateway and pod addresses should be registered")
 
 		totalCreateDuration := time.Since(createStart)
 		azureProvisionDuration := time.Since(provisionStart)
@@ -491,12 +444,7 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 		// ============================================
 		utils.Logf("\n--- PHASE 5: Waiting for pods to disappear ---")
 
-		for {
-			if time.Since(deleteStart) > 15*time.Minute {
-				utils.Logf("WARNING: Timeout waiting for pod deletion")
-				break
-			}
-
+		Eventually(func() error {
 			remaining := 0
 			for i := 0; i < numPods; i++ {
 				_, err := cs.CoreV1().Pods(ns.Name).Get(context.TODO(), fmt.Sprintf("scale-pod-%d", i), metav1.GetOptions{})
@@ -512,10 +460,11 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 			}
 
 			if remaining == 0 {
-				break
+				return nil
 			}
-			time.Sleep(2 * time.Second)
-		}
+			return fmt.Errorf("%d pod(s) still exist", remaining)
+		}, 15*time.Minute, 10*time.Second).Should(Succeed(),
+			"all scale pods should be deleted from K8s")
 
 		totalDeleteDuration := time.Since(deleteStart)
 		utils.Logf("✓ ALL %d PODS DELETED IN: %v", numPods, totalDeleteDuration)
@@ -525,33 +474,15 @@ var _ = Describe("Container Load Balancer Outbound Performance Test", Label(slbT
 		// ============================================
 		utils.Logf("\n--- PHASE 6: Verifying NAT Gateway cleanup ---")
 
-		for {
-			if time.Since(deleteStart) > 20*time.Minute {
-				break
+		Eventually(func() error {
+			if err := natGatewayCleanupErr([]string{egressName}); err != nil {
+				utils.Logf("  NAT Gateway '%s' still exists, waiting...", egressName)
+				return err
 			}
-
-			sgResponse, err := queryServiceGatewayServices()
-			if err != nil {
-				time.Sleep(2 * time.Second)
-				continue
-			}
-
-			found := false
-			for _, sgSvc := range sgResponse.Value {
-				if sgSvc.Name == egressName {
-					found = true
-					break
-				}
-			}
-
-			if !found {
-				utils.Logf("✓ NAT Gateway '%s' cleaned up", egressName)
-				break
-			}
-
-			utils.Logf("  NAT Gateway '%s' still exists, waiting...", egressName)
-			time.Sleep(2 * time.Second)
-		}
+			utils.Logf("✓ NAT Gateway '%s' cleaned up", egressName)
+			return nil
+		}, 20*time.Minute, 10*time.Second).Should(Succeed(),
+			"NAT Gateway should be cleaned up")
 
 		azureCleanupDuration := time.Since(deleteStart)
 

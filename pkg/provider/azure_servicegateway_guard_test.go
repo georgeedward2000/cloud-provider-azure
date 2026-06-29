@@ -16,11 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/loadbalancerclient/mock_loadbalancerclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipaddressclient/mock_publicipaddressclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/securitygroupclient/mock_securitygroupclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient/mock_servicegatewayclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient/mock_subnetclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
@@ -141,7 +137,7 @@ func TestPodIPWithoutServiceGateway_ProgramsBackendTargetPortAndProtocol(t *test
 	assert.Empty(t, probes, "PodIP backend path should not create health probes")
 }
 
-func TestServiceGatewayInternalAnnotation_DoesNotProgramPublicFrontend(t *testing.T) {
+func TestServiceGatewayInternalAnnotation_IsRejected(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -151,57 +147,10 @@ func TestServiceGatewayInternalAnnotation_DoesNotProgramPublicFrontend(t *testin
 	az.KubeClient = kubeClient
 	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
 
-	mockFactory := az.NetworkClientFactory.(*mock_azclient.MockClientFactory)
-	mockSGWClient := mock_servicegatewayclient.NewMockInterface(ctrl)
-	mockFactory.EXPECT().GetServiceGatewayClient().Return(mockSGWClient).AnyTimes()
-	mockSGWClient.EXPECT().UpdateServices(gomock.Any(), az.ResourceGroup, consts.DefaultServiceGatewayResourceName, gomock.Any()).Return(nil).Times(1)
-
-	pipClient := az.NetworkClientFactory.GetPublicIPAddressClient().(*mock_publicipaddressclient.MockInterface)
-	pipClient.EXPECT().CreateOrUpdate(gomock.Any(), az.ResourceGroup, gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, _, _ string, pip armnetwork.PublicIPAddress) (*armnetwork.PublicIPAddress, error) {
-		if pip.Properties == nil {
-			pip.Properties = &armnetwork.PublicIPAddressPropertiesFormat{}
-		}
-		pip.Properties.IPAddress = to.Ptr("20.0.0.10")
-		return &pip, nil
-	}).Times(1)
-
-	lbClient := az.NetworkClientFactory.GetLoadBalancerClient().(*mock_loadbalancerclient.MockInterface)
-	lbCreated := make(chan armnetwork.LoadBalancer, 1)
-	lbClient.EXPECT().CreateOrUpdate(gomock.Any(), az.ResourceGroup, gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, _, _ string, lb armnetwork.LoadBalancer) (*armnetwork.LoadBalancer, error) {
-		lbCreated <- lb
-		return &lb, nil
-	}).Times(1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	updater := difftracker.NewServiceUpdater(ctx, az.diffTracker, az.diffTracker.OnServiceCreationComplete, az.diffTracker.GetServiceUpdaterTrigger())
-	go updater.Run()
-	t.Cleanup(func() {
-		cancel()
-		updater.Stop()
-	})
-
-	_, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
-	if !assert.NoError(t, err) {
-		t.FailNow()
-	}
-
-	var lb armnetwork.LoadBalancer
-	select {
-	case lb = <-lbCreated:
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for LB create")
-	}
-
-	if !assert.NotNil(t, lb.Properties) ||
-		!assert.NotEmpty(t, lb.Properties.FrontendIPConfigurations) ||
-		!assert.NotNil(t, lb.Properties.FrontendIPConfigurations[0].Properties) {
-		t.FailNow()
-	}
-
-	assert.Nil(t, lb.Properties.FrontendIPConfigurations[0].Properties.PublicIPAddress, "internal annotation must not be silently programmed as public frontend")
-	if lb.Properties.Scope != nil {
-		assert.NotEqual(t, armnetwork.LoadBalancerScopePublic, *lb.Properties.Scope, "internal annotation must not produce public LB scope")
-	}
+	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	assert.Error(t, err, "internal load balancer must be rejected when ServiceGateway is enabled")
+	assert.Nil(t, status, "rejected internal service must not receive an ingress status")
+	assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)), "rejected internal service must not be tracked")
 }
 
 func TestServiceGatewayEnsureLoadBalancer_ReconcilesNSGForSourceRanges(t *testing.T) {

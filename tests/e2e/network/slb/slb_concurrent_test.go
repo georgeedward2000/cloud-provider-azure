@@ -66,9 +66,8 @@ var _ = Describe("SLB - Concurrent Services", Label(slbTestLabel), func() {
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			// Wait for Azure cleanup - increased for multi-service tests
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup")
+			eventuallyAzureCleanup(2 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -203,8 +202,31 @@ var _ = Describe("SLB - Concurrent Services", Label(slbTestLabel), func() {
 		utils.Logf("  ✓ All %d pods are ready", totalPods)
 
 		By("Waiting for Azure to provision all services")
-		utils.Logf("Waiting %v for Azure provisioning...", azureWaitTime)
-		time.Sleep(azureWaitTime)
+		Eventually(func() error {
+			for _, service := range services {
+				if err := serviceReconciledErr(string(service.UID), -1); err != nil {
+					return fmt.Errorf("service %s: %w", service.Name, err)
+				}
+			}
+
+			addressLocations, err := queryServiceGatewayAddressLocations()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway address locations: %w", err)
+			}
+			totalRegisteredPods := 0
+			for _, location := range addressLocations.Value {
+				for _, addr := range location.Addresses {
+					if len(addr.Services) > 0 {
+						totalRegisteredPods++
+					}
+				}
+			}
+			if totalRegisteredPods < totalPods {
+				return fmt.Errorf("expected at least %d pod IPs in address locations, found %d", totalPods, totalRegisteredPods)
+			}
+			return nil
+		}, azureWaitTime, 10*time.Second).Should(Succeed(),
+			"all services should be reconciled in Azure and the Service Gateway")
 
 		// Verify all services in Service Gateway
 		By(fmt.Sprintf("Verifying all %d services are registered in Service Gateway", numServices))
@@ -228,23 +250,6 @@ var _ = Describe("SLB - Concurrent Services", Label(slbTestLabel), func() {
 		}
 
 		utils.Logf("Found %d non-default inbound services in Service Gateway", len(registeredServices))
-
-		if len(registeredServices) < numServices {
-			utils.Logf("WARNING: Only %d/%d services found. Waiting an additional 60 seconds...", len(registeredServices), numServices)
-			time.Sleep(60 * time.Second)
-
-			// Query again
-			sgServices, err = queryServiceGatewayServices()
-			Expect(err).NotTo(HaveOccurred())
-
-			registeredServices = make(map[string]bool)
-			for _, sgSvc := range sgServices.Value {
-				if !sgSvc.Properties.IsDefault && sgSvc.Properties.ServiceType == "Inbound" {
-					registeredServices[sgSvc.Name] = true
-				}
-			}
-			utils.Logf("After additional wait: Found %d non-default inbound services", len(registeredServices))
-		}
 
 		Expect(len(registeredServices)).To(BeNumerically(">=", numServices),
 			fmt.Sprintf("Expected at least %d services in Service Gateway, found %d", numServices, len(registeredServices)))

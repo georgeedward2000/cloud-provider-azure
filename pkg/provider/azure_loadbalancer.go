@@ -118,6 +118,20 @@ func (az *Cloud) GetLoadBalancer(ctx context.Context, clusterName string, servic
 		}
 	}
 
+	// When ServiceGateway is enabled the difftracker owns each service's full lifecycle,
+	// including services it still tracks that have no Azure LB/PIP yet (e.g. a service parked
+	// after a terminal build rejection such as a named targetPort or a dual-stack spec).
+	// GetLoadBalancer is consulted by the upstream service controller when a service is being
+	// deleted: if it reports exists=false the controller removes only the K8s LB finalizer and
+	// never calls EnsureLoadBalancerDeleted, stranding our ServiceGateway finalizer and leaving
+	// the Service (and its namespace) stuck Terminating. Report a tracked service as existing so
+	// deletion is routed through EnsureLoadBalancerDeleted -> difftracker.DeleteService, which
+	// removes our finalizer.
+	if az.ServiceGatewayEnabled && az.diffTracker != nil && az.diffTracker.IsServiceTracked(getServiceUID(service)) {
+		logger.V(5).Info("ServiceGateway-tracked service has no Azure LB/PIP; reporting as existing so deletion is engine-driven")
+		return nil, true, nil
+	}
+
 	// Return exists = false only if the load balancer and the public IP are not found on Azure
 	if !az.existsPip(ctx, clusterName, service) {
 		logger.V(5).Info("LoadBalancer and PublicIP not found")
@@ -391,6 +405,15 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 		serviceUID := getServiceUID(service)
 		logger.V(2).Info("Using Engine for async service reconcile", "serviceUID", serviceUID)
 
+		// Internal load balancers are not supported in ServiceGateway mode: every load balancer
+		// is provisioned with a public IP. Reject the request, surface it on the Service, and
+		// leave it without an ingress IP rather than silently provisioning a public LB.
+		if requiresInternalLoadBalancer(service) {
+			err = fmt.Errorf("internal load balancer is not supported when ServiceGateway is enabled; remove the %q annotation", consts.ServiceAnnotationLoadBalancerInternal)
+			az.Event(service, v1.EventTypeWarning, "UnsupportedInternalLoadBalancer", err.Error())
+			return nil, err
+		}
+
 		// Extract port configuration from service
 		inboundConfig := az.extractInboundConfigFromService(service)
 		config := difftracker.NewInboundServiceConfig(serviceUID, inboundConfig)
@@ -402,6 +425,13 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 			az.diffTracker.UpdateService(config)
 		} else {
 			az.diffTracker.AddService(config)
+			// The EndpointSlice informer only emits events when a slice changes, so a service
+			// re-registered without any slice change (most notably a ClusterIP->LoadBalancer
+			// type flip, where the Service and its slices are unchanged) would otherwise come up
+			// with an empty backend pool. Seed the current endpoints now; UpdateEndpoints is
+			// idempotent, so this is harmless for genuinely new services whose slice event will
+			// also arrive.
+			az.seedInboundEndpointsFromCache(serviceUID)
 		}
 
 		// Return the existing LoadBalancer status to prevent the service controller from clearing it.

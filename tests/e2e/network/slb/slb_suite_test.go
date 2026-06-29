@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -313,6 +314,62 @@ func verifyNATGatewayCleanup(egressNames []string) {
 	}
 }
 
+// serviceGatewayCleanupErr returns nil only when the Service Gateway contains just the
+// default outbound service (i.e. all test services have been cleaned up). It is the
+// error-returning core used to poll for cleanup via Eventually, so a spec waits exactly
+// as long as Azure actually needs instead of a fixed, conservative sleep.
+func serviceGatewayCleanupErr() error {
+	sgResponse, err := queryServiceGatewayServices()
+	if err != nil {
+		return fmt.Errorf("query Service Gateway services: %w", err)
+	}
+	for i := range sgResponse.Value {
+		svc := &sgResponse.Value[i]
+		if svc.Name != "default-natgw" {
+			return fmt.Errorf("unexpected service %q (type %s) still exists in Service Gateway after cleanup", svc.Name, svc.Properties.ServiceType)
+		}
+	}
+	return nil
+}
+
+// addressLocationsCleanupErr returns nil only when no address in the Service Gateway still
+// references a service. Error-returning core for polling address-location cleanup.
+func addressLocationsCleanupErr() error {
+	alResponse, err := queryServiceGatewayAddressLocations()
+	if err != nil {
+		return fmt.Errorf("query Service Gateway address locations: %w", err)
+	}
+	for _, location := range alResponse.Value {
+		for _, addr := range location.Addresses {
+			if len(addr.Services) > 0 {
+				return fmt.Errorf("address %s in location %s still has %d service reference(s) after cleanup",
+					addr.Address, location.AddressLocation, len(addr.Services))
+			}
+		}
+	}
+	return nil
+}
+
+// natGatewayCleanupErr returns nil only when none of the named egress (outbound) services
+// remain in the Service Gateway. Error-returning core for polling NAT Gateway cleanup.
+func natGatewayCleanupErr(egressNames []string) error {
+	if len(egressNames) == 0 {
+		return nil
+	}
+	sgResponse, err := queryServiceGatewayServices()
+	if err != nil {
+		return fmt.Errorf("query Service Gateway services: %w", err)
+	}
+	for _, egressName := range egressNames {
+		for _, svc := range sgResponse.Value {
+			if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
+				return fmt.Errorf("outbound service %q still exists in Service Gateway after cleanup", egressName)
+			}
+		}
+	}
+	return nil
+}
+
 // verifyAzureResources verifies Public IP, Load Balancer, and Service Gateway for a given service
 func verifyAzureResources(serviceUID string) error {
 	publicIPName := fmt.Sprintf("%s-pip", serviceUID)
@@ -385,4 +442,159 @@ func verifyAzureResources(serviceUID string) error {
 	}
 
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Shared polling helpers
+//
+// These wrap the common "wait until Azure and the Service Gateway converge"
+// checks behind error-returning predicates (suitable for Eventually) and thin
+// Eventually wrappers. They let specs poll for convergence instead of sleeping a
+// fixed, conservative amount of time, which is both faster and far less flaky.
+//
+// Predicates (return nil on success) are composable inside a caller's own
+// Eventually loop (e.g. when polling several services at once); the eventually*
+// wrappers are convenience one-liners for the common single-resource case.
+// ---------------------------------------------------------------------------
+
+// defaultPollInterval is the polling cadence used by the eventually* wrappers.
+const defaultPollInterval = 10 * time.Second
+
+// countRegisteredEndpoints returns the number of Service Gateway address-location
+// entries that reference the given service/egress identifier (its registered pod
+// IP count). It works for both inbound services and outbound egress, since both
+// are referenced by identifier in an address's Services list.
+func countRegisteredEndpoints(serviceID string) (int, error) {
+	alResponse, err := queryServiceGatewayAddressLocations()
+	if err != nil {
+		return 0, fmt.Errorf("query Service Gateway address locations: %w", err)
+	}
+	count := 0
+	for _, location := range alResponse.Value {
+		for _, addr := range location.Addresses {
+			for _, svc := range addr.Services {
+				if svc == serviceID {
+					count++
+				}
+			}
+		}
+	}
+	return count, nil
+}
+
+// serviceReconciledErr returns nil once the inbound service's Azure resources exist
+// (PIP, LB with SKU=Service and a backend pool, and a Service Gateway entry) and,
+// when wantEndpoints >= 0, exactly wantEndpoints pod IPs are registered for it. Pass
+// a negative wantEndpoints to skip the endpoint-count assertion.
+func serviceReconciledErr(serviceUID string, wantEndpoints int) error {
+	if err := verifyAzureResources(serviceUID); err != nil {
+		return err
+	}
+	if wantEndpoints < 0 {
+		return nil
+	}
+	got, err := countRegisteredEndpoints(serviceUID)
+	if err != nil {
+		return err
+	}
+	if got != wantEndpoints {
+		return fmt.Errorf("service %s has %d registered endpoints, want %d", serviceUID, got, wantEndpoints)
+	}
+	return nil
+}
+
+// serviceDeletedErr returns nil once the inbound service is gone from the Service
+// Gateway and no address location still references it.
+func serviceDeletedErr(serviceUID string) error {
+	sgResponse, err := queryServiceGatewayServices()
+	if err != nil {
+		return fmt.Errorf("query Service Gateway services: %w", err)
+	}
+	for _, svc := range sgResponse.Value {
+		if svc.Name == serviceUID {
+			return fmt.Errorf("service %s still registered in Service Gateway", serviceUID)
+		}
+	}
+	got, err := countRegisteredEndpoints(serviceUID)
+	if err != nil {
+		return err
+	}
+	if got > 0 {
+		return fmt.Errorf("service %s still has %d registered endpoint(s)", serviceUID, got)
+	}
+	return nil
+}
+
+// egressRegisteredErr returns nil once the named egress (outbound) service exists in
+// the Service Gateway with a NAT Gateway and, when wantPods >= 0, exactly wantPods pod
+// IPs registered for it. Pass a negative wantPods to skip the pod-count assertion.
+func egressRegisteredErr(egressName string, wantPods int) error {
+	sgResponse, err := queryServiceGatewayServices()
+	if err != nil {
+		return fmt.Errorf("query Service Gateway services: %w", err)
+	}
+	found := false
+	for _, svc := range sgResponse.Value {
+		if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
+			found = true
+			if svc.Properties.PublicNatGatewayID == "" {
+				return fmt.Errorf("egress %s has no NAT Gateway ID yet", egressName)
+			}
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("egress %s not registered in Service Gateway yet", egressName)
+	}
+	if wantPods < 0 {
+		return nil
+	}
+	got, err := countRegisteredEndpoints(egressName)
+	if err != nil {
+		return err
+	}
+	if got != wantPods {
+		return fmt.Errorf("egress %s has %d registered pod(s), want %d", egressName, got, wantPods)
+	}
+	return nil
+}
+
+// eventuallyServiceReconciled polls until the inbound service is fully reconciled in
+// Azure and the Service Gateway. Pass a negative wantEndpoints to skip the count check.
+func eventuallyServiceReconciled(serviceUID string, wantEndpoints int, timeout time.Duration) {
+	Eventually(func() error {
+		return serviceReconciledErr(serviceUID, wantEndpoints)
+	}, timeout, defaultPollInterval).Should(Succeed(),
+		"service %s should be reconciled in Azure and the Service Gateway", serviceUID)
+}
+
+// eventuallyServiceDeleted polls until the inbound service is fully removed from the
+// Service Gateway and its address locations.
+func eventuallyServiceDeleted(serviceUID string, timeout time.Duration) {
+	Eventually(func() error {
+		return serviceDeletedErr(serviceUID)
+	}, timeout, defaultPollInterval).Should(Succeed(),
+		"service %s should be removed from the Service Gateway", serviceUID)
+}
+
+// eventuallyEgressRegistered polls until the egress service is reconciled with its NAT
+// Gateway and registered pods. Pass a negative wantPods to skip the count check.
+func eventuallyEgressRegistered(egressName string, wantPods int, timeout time.Duration) {
+	Eventually(func() error {
+		return egressRegisteredErr(egressName, wantPods)
+	}, timeout, defaultPollInterval).Should(Succeed(),
+		"egress %s should be registered with %d pod(s) in the Service Gateway", egressName, wantPods)
+}
+
+// eventuallyAzureCleanup polls until the Service Gateway and its address locations are
+// free of all test services (only the default outbound service remains). Use it in
+// AfterEach in place of a fixed post-delete sleep.
+func eventuallyAzureCleanup(timeout time.Duration) {
+	Eventually(func() error {
+		if err := serviceGatewayCleanupErr(); err != nil {
+			return err
+		}
+		return addressLocationsCleanupErr()
+	}, timeout, defaultPollInterval).Should(Succeed(),
+		"Service Gateway and address locations should be free of test services after cleanup")
 }

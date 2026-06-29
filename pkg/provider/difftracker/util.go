@@ -71,6 +71,27 @@ func extractAzureErrorInfo(err error) (httpStatus int, errorCode string) {
 	return 0, "unknown"
 }
 
+// serviceOverlayMappingsErrorCode is the NRP ServiceGateway error code returned when an
+// inbound service is unregistered (deleted) while its pod overlay address mappings are
+// still present in NRP. The service entry cannot be removed until those address mappings
+// have been drained from the address locations first.
+const serviceOverlayMappingsErrorCode = "ServiceWithOverlayMappingsCannotBeDeleted"
+
+// isServiceOverlayMappingsError reports whether err is the NRP ServiceGateway rejection
+// that a service still has overlay address mappings and therefore cannot be deleted yet.
+// NRP carries the code in the response body (azcore surfaces the body in Error()), so we
+// match both the typed ErrorCode and the raw error text.
+func isServiceOverlayMappingsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) && strings.EqualFold(respErr.ErrorCode, serviceOverlayMappingsErrorCode) {
+		return true
+	}
+	return strings.Contains(err.Error(), serviceOverlayMappingsErrorCode)
+}
+
 func (operation Operation) String() string {
 	switch operation {
 	case UnknownOperation:

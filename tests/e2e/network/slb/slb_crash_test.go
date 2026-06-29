@@ -76,8 +76,8 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup to complete")
+			eventuallyAzureCleanup(2 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -137,7 +137,7 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 		}
 
 		By("Waiting for pods to be ready")
-		time.Sleep(30 * time.Second)
+		Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
 
 		By("Creating LoadBalancer service")
 		service := &v1.Service{
@@ -165,38 +165,41 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for service to be established")
-		time.Sleep(waitTime)
-
-		By("Verifying Azure resources before crash (PIP, LB, Service Gateway)")
 		svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		serviceUID := string(svc.UID)
 		utils.Logf("Service UID: %s", serviceUID)
-
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred(), "Azure resources should exist before CCM crash")
+		Eventually(func() error {
+			return verifyAzureResources(serviceUID)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"Azure resources should exist before CCM crash")
 
 		By("Crashing CCM and waiting for recovery")
 		err = ccmClient.CrashCCMAndWaitForRecovery(ctx, utils.CCMRecoveryTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for CCM to reconcile service")
-		time.Sleep(30 * time.Second)
+		Eventually(func() error {
+			if err := verifyAzureResources(serviceUID); err != nil {
+				return fmt.Errorf("verify Azure resources after CCM recovery: %w", err)
+			}
 
-		By("Verifying Azure resources after CCM recovery (PIP, LB, Service Gateway)")
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred(), "Azure resources should still exist after CCM recovery")
+			endpoints, err := cs.CoreV1().Endpoints(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("get endpoints %s: %w", serviceName, err)
+			}
 
-		By("Verifying endpoints are correct after CCM recovery")
-		endpoints, err := cs.CoreV1().Endpoints(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		totalAddresses := 0
-		for _, subset := range endpoints.Subsets {
-			totalAddresses += len(subset.Addresses)
-		}
-		utils.Logf("Endpoint count after CCM recovery: %d (expected: %d)", totalAddresses, numPods)
-		Expect(totalAddresses).To(Equal(numPods), "All pods should be in endpoints after CCM recovery")
+			totalAddresses := 0
+			for _, subset := range endpoints.Subsets {
+				totalAddresses += len(subset.Addresses)
+			}
+			utils.Logf("Endpoint count after CCM recovery: %d (expected: %d)", totalAddresses, numPods)
+			if totalAddresses != numPods {
+				return fmt.Errorf("got %d endpoints after CCM recovery, want %d", totalAddresses, numPods)
+			}
+			return nil
+		}, 30*time.Second, 10*time.Second).Should(Succeed(),
+			"Azure resources and endpoints should persist after CCM recovery")
 	})
 
 	It("should handle pod creation during CCM downtime", func() {
@@ -237,7 +240,7 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 		}
 
 		By("Waiting for initial pods to be ready")
-		time.Sleep(30 * time.Second)
+		Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
 
 		By("Creating LoadBalancer service")
 		service := &v1.Service{
@@ -265,14 +268,13 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for service to be established")
-		time.Sleep(waitTime)
-
-		By("Verifying Azure resources before crash")
 		svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		serviceUID := string(svc.UID)
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred(), "Azure resources should exist before CCM crash")
+		Eventually(func() error {
+			return verifyAzureResources(serviceUID)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"Azure resources should exist before CCM crash")
 
 		By("Crashing CCM")
 		err = ccmClient.DeleteAllCCMPods(ctx)
@@ -307,23 +309,28 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for CCM to reconcile endpoints")
-		time.Sleep(60 * time.Second)
-
-		By("Verifying Azure resources after CCM recovery")
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred(), "Azure resources should still exist after CCM recovery")
-
-		By("Verifying all pods are reflected in service endpoints")
-		endpoints, err := cs.CoreV1().Endpoints(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
-		Expect(err).NotTo(HaveOccurred())
-
-		totalAddresses := 0
-		for _, subset := range endpoints.Subsets {
-			totalAddresses += len(subset.Addresses)
-		}
 		expectedPods := initialPods + additionalPods
-		utils.Logf("Expected %d endpoints, found %d", expectedPods, totalAddresses)
-		Expect(totalAddresses).To(Equal(expectedPods), "All pods should be in endpoints after CCM recovery")
+		Eventually(func() error {
+			if err := verifyAzureResources(serviceUID); err != nil {
+				return fmt.Errorf("verify Azure resources after CCM recovery: %w", err)
+			}
+
+			endpoints, err := cs.CoreV1().Endpoints(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("get endpoints %s: %w", serviceName, err)
+			}
+
+			totalAddresses := 0
+			for _, subset := range endpoints.Subsets {
+				totalAddresses += len(subset.Addresses)
+			}
+			utils.Logf("Expected %d endpoints, found %d", expectedPods, totalAddresses)
+			if totalAddresses != expectedPods {
+				return fmt.Errorf("got %d endpoints after CCM recovery, want %d", totalAddresses, expectedPods)
+			}
+			return nil
+		}, 60*time.Second, 10*time.Second).Should(Succeed(),
+			"Azure resources and all endpoints should be reconciled after CCM recovery")
 	})
 
 	It("should maintain consistency after multiple CCM crashes", func() {
@@ -364,7 +371,7 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 		}
 
 		By("Waiting for pods to be ready")
-		time.Sleep(30 * time.Second)
+		Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
 
 		By("Creating LoadBalancer service")
 		service := &v1.Service{
@@ -392,14 +399,13 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for service to be established")
-		time.Sleep(waitTime)
-
-		By("Verifying Azure resources before crashes")
 		svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		serviceUID := string(svc.UID)
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred(), "Azure resources should exist before CCM crashes")
+		Eventually(func() error {
+			return verifyAzureResources(serviceUID)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"Azure resources should exist before CCM crashes")
 
 		By(fmt.Sprintf("Performing %d CCM crashes and recoveries", numCrashes))
 		for i := 1; i <= numCrashes; i++ {
@@ -409,11 +415,10 @@ var _ = Describe("Container Load Balancer Crash Recovery", Label(slbTestLabel, s
 			Expect(err).NotTo(HaveOccurred())
 
 			By(fmt.Sprintf("Waiting for CCM to reconcile after crash %d", i))
-			time.Sleep(30 * time.Second)
-
-			By(fmt.Sprintf("Verifying Azure resources after crash %d", i))
-			err = verifyAzureResources(serviceUID)
-			Expect(err).NotTo(HaveOccurred(), "Azure resources should persist after crash %d", i)
+			Eventually(func() error {
+				return verifyAzureResources(serviceUID)
+			}, 30*time.Second, 10*time.Second).Should(Succeed(),
+				"Azure resources should persist after crash %d", i)
 		}
 
 		By("Verifying Azure resources after all crashes")
@@ -469,8 +474,8 @@ var _ = Describe("Container Load Balancer Outbound Crash Recovery", Label(slbTes
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup to complete")
+			eventuallyAzureCleanup(6 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -528,65 +533,60 @@ var _ = Describe("Container Load Balancer Outbound Crash Recovery", Label(slbTes
 		}
 
 		By("Waiting for NAT Gateway provisioning")
-		time.Sleep(waitTime)
-
-		By("Verifying NAT Gateway and Service Gateway before crash")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
 		var natGatewayID string
-		var foundOutbound bool
-		for _, svc := range sgResponse.Value {
-			if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
-				foundOutbound = true
-				natGatewayID = svc.Properties.PublicNatGatewayID
-				utils.Logf("Found outbound service '%s' with NAT Gateway: %s", egressName, natGatewayID)
-				break
+		Eventually(func() error {
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
 			}
-		}
-		Expect(foundOutbound).To(BeTrue(), "Outbound service should exist before crash")
-		Expect(natGatewayID).NotTo(BeEmpty(), "NAT Gateway ID should not be empty")
+
+			for _, svc := range sgResponse.Value {
+				if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
+					natGatewayID = svc.Properties.PublicNatGatewayID
+					utils.Logf("Found outbound service '%s' with NAT Gateway: %s", egressName, natGatewayID)
+					if natGatewayID == "" {
+						return fmt.Errorf("NAT Gateway ID should not be empty")
+					}
+					return nil
+				}
+			}
+			return fmt.Errorf("outbound service %s should exist before crash", egressName)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"outbound service should exist with a NAT Gateway before crash")
 
 		By("Crashing CCM and waiting for recovery")
-		err = ccmClient.CrashCCMAndWaitForRecovery(ctx, utils.CCMRecoveryTimeout)
+		err := ccmClient.CrashCCMAndWaitForRecovery(ctx, utils.CCMRecoveryTimeout)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for CCM to reconcile NAT Gateway")
-		time.Sleep(30 * time.Second)
-
-		By("Verifying NAT Gateway still exists after CCM recovery")
-		sgResponse, err = queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
-		foundOutbound = false
-		var recoveredNatGatewayID string
-		for _, svc := range sgResponse.Value {
-			if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
-				foundOutbound = true
-				recoveredNatGatewayID = svc.Properties.PublicNatGatewayID
-				utils.Logf("Outbound service still exists after recovery with NAT Gateway: %s", recoveredNatGatewayID)
-				break
+		Eventually(func() error {
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
 			}
-		}
-		Expect(foundOutbound).To(BeTrue(), "Outbound service should still exist after CCM recovery")
-		Expect(recoveredNatGatewayID).To(Equal(natGatewayID), "NAT Gateway ID should remain the same")
 
-		By("Verifying pod registrations in Address Locations")
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
-		registeredPods := 0
-		for _, location := range alResponse.Value {
-			for _, addr := range location.Addresses {
-				for _, svcName := range addr.Services {
-					if svcName == egressName {
-						registeredPods++
+			for _, svc := range sgResponse.Value {
+				if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
+					recoveredNatGatewayID := svc.Properties.PublicNatGatewayID
+					utils.Logf("Outbound service still exists after recovery with NAT Gateway: %s", recoveredNatGatewayID)
+					if recoveredNatGatewayID != natGatewayID {
+						return fmt.Errorf("NAT Gateway ID after recovery = %q, want %q", recoveredNatGatewayID, natGatewayID)
 					}
+
+					registeredPods, err := countRegisteredEndpoints(egressName)
+					if err != nil {
+						return err
+					}
+					utils.Logf("Registered %d pod IPs for egress gateway after recovery", registeredPods)
+					if registeredPods != numPods {
+						return fmt.Errorf("registered pod count after recovery = %d, want %d", registeredPods, numPods)
+					}
+					return nil
 				}
 			}
-		}
-		utils.Logf("Registered %d pod IPs for egress gateway after recovery", registeredPods)
-		Expect(registeredPods).To(Equal(numPods), "All pods should remain registered after CCM recovery")
+			return fmt.Errorf("outbound service %s should still exist after CCM recovery", egressName)
+		}, 30*time.Second, 10*time.Second).Should(Succeed(),
+			"NAT Gateway ID and pod registrations should persist after CCM recovery")
 	})
 
 	It("should handle pod creation during CCM downtime for NAT gateway", func() {
@@ -626,22 +626,13 @@ var _ = Describe("Container Load Balancer Outbound Crash Recovery", Label(slbTes
 		}
 
 		By("Waiting for NAT Gateway provisioning")
-		time.Sleep(waitTime)
-
-		By("Verifying NAT Gateway exists")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-		var foundOutbound bool
-		for _, svc := range sgResponse.Value {
-			if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
-				foundOutbound = true
-				break
-			}
-		}
-		Expect(foundOutbound).To(BeTrue(), "Outbound service should exist")
+		Eventually(func() error {
+			return egressRegisteredErr(egressName, -1)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"outbound service should exist")
 
 		By("Crashing CCM")
-		err = ccmClient.DeleteAllCCMPods(ctx)
+		err := ccmClient.DeleteAllCCMPods(ctx)
 		Expect(err).NotTo(HaveOccurred())
 
 		By(fmt.Sprintf("Creating %d additional pods while CCM is down", additionalPods))
@@ -675,25 +666,19 @@ var _ = Describe("Container Load Balancer Outbound Crash Recovery", Label(slbTes
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for CCM to reconcile")
-		time.Sleep(60 * time.Second)
-
-		By("Verifying all pods registered in Address Locations")
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
-		registeredPods := 0
-		for _, location := range alResponse.Value {
-			for _, addr := range location.Addresses {
-				for _, svcName := range addr.Services {
-					if svcName == egressName {
-						registeredPods++
-					}
-				}
-			}
-		}
 		expectedPods := initialPods + additionalPods
-		utils.Logf("Expected %d pods, found %d registered", expectedPods, registeredPods)
-		Expect(registeredPods).To(Equal(expectedPods), "All pods should be registered after CCM recovery")
+		Eventually(func() error {
+			registeredPods, err := countRegisteredEndpoints(egressName)
+			if err != nil {
+				return err
+			}
+			utils.Logf("Expected %d pods, found %d registered", expectedPods, registeredPods)
+			if registeredPods != expectedPods {
+				return fmt.Errorf("registered pod count after recovery = %d, want %d", registeredPods, expectedPods)
+			}
+			return nil
+		}, 60*time.Second, 10*time.Second).Should(Succeed(),
+			"all pods should be registered after CCM recovery")
 	})
 
 	It("should maintain multiple NAT gateways across CCM crashes", func() {
@@ -735,52 +720,69 @@ var _ = Describe("Container Load Balancer Outbound Crash Recovery", Label(slbTes
 		}
 
 		By("Waiting for NAT Gateways provisioning")
-		time.Sleep(waitTime)
-
-		By("Verifying both NAT Gateways exist")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
 		natGatewayIDs := make(map[string]string)
-		for _, svc := range sgResponse.Value {
-			if svc.Properties.ServiceType == "Outbound" {
-				for _, egressName := range egressGateways {
-					if svc.Name == egressName {
-						natGatewayIDs[egressName] = svc.Properties.PublicNatGatewayID
-						utils.Logf("Found egress gateway '%s' with NAT Gateway: %s", egressName, svc.Properties.PublicNatGatewayID)
+		Eventually(func() error {
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
+			}
+
+			natGatewayIDs = make(map[string]string)
+			for _, svc := range sgResponse.Value {
+				if svc.Properties.ServiceType == "Outbound" {
+					for _, egressName := range egressGateways {
+						if svc.Name == egressName {
+							natGatewayIDs[egressName] = svc.Properties.PublicNatGatewayID
+							utils.Logf("Found egress gateway '%s' with NAT Gateway: %s", egressName, svc.Properties.PublicNatGatewayID)
+						}
 					}
 				}
 			}
-		}
-		Expect(len(natGatewayIDs)).To(Equal(len(egressGateways)), "All egress gateways should exist before crashes")
+			if len(natGatewayIDs) != len(egressGateways) {
+				return fmt.Errorf("found %d egress gateways, want %d", len(natGatewayIDs), len(egressGateways))
+			}
+			for _, egressName := range egressGateways {
+				if natGatewayIDs[egressName] == "" {
+					return fmt.Errorf("egress gateway %s has empty NAT Gateway ID", egressName)
+				}
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"all egress gateways should exist before crashes")
 
 		By(fmt.Sprintf("Performing %d CCM crashes", numCrashes))
 		for i := 1; i <= numCrashes; i++ {
 			utils.Logf("=== CCM Crash iteration %d/%d ===", i, numCrashes)
 
-			err = ccmClient.CrashCCMAndWaitForRecovery(ctx, utils.CCMRecoveryTimeout)
+			err := ccmClient.CrashCCMAndWaitForRecovery(ctx, utils.CCMRecoveryTimeout)
 			Expect(err).NotTo(HaveOccurred())
 
 			By(fmt.Sprintf("Waiting for reconciliation after crash %d", i))
-			time.Sleep(30 * time.Second)
+			Eventually(func() error {
+				sgResponse, err := queryServiceGatewayServices()
+				if err != nil {
+					return fmt.Errorf("query Service Gateway services: %w", err)
+				}
 
-			By(fmt.Sprintf("Verifying both NAT Gateways after crash %d", i))
-			sgResponse, err = queryServiceGatewayServices()
-			Expect(err).NotTo(HaveOccurred())
-
-			foundGateways := 0
-			for _, svc := range sgResponse.Value {
-				if svc.Properties.ServiceType == "Outbound" {
-					for egressName, expectedNatID := range natGatewayIDs {
-						if svc.Name == egressName {
-							foundGateways++
-							Expect(svc.Properties.PublicNatGatewayID).To(Equal(expectedNatID),
-								"NAT Gateway ID should remain the same for %s after crash %d", egressName, i)
+				foundGateways := 0
+				for _, svc := range sgResponse.Value {
+					if svc.Properties.ServiceType == "Outbound" {
+						for egressName, expectedNatID := range natGatewayIDs {
+							if svc.Name == egressName {
+								foundGateways++
+								if svc.Properties.PublicNatGatewayID != expectedNatID {
+									return fmt.Errorf("NAT Gateway ID for %s after crash %d = %q, want %q", egressName, i, svc.Properties.PublicNatGatewayID, expectedNatID)
+								}
+							}
 						}
 					}
 				}
-			}
-			Expect(foundGateways).To(Equal(len(egressGateways)), "All egress gateways should persist after crash %d", i)
+				if foundGateways != len(egressGateways) {
+					return fmt.Errorf("found %d egress gateways after crash %d, want %d", foundGateways, i, len(egressGateways))
+				}
+				return nil
+			}, 30*time.Second, 10*time.Second).Should(Succeed(),
+				"all egress gateways should persist after crash %d", i)
 		}
 
 		By("Verifying final pod registrations")

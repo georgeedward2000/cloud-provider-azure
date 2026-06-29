@@ -216,8 +216,8 @@ var _ = Describe("Container Load Balancer Finalizer Tests", Label(slbTestLabel, 
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup")
+			eventuallyAzureCleanup(2 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -308,8 +308,26 @@ var _ = Describe("Container Load Balancer Finalizer Tests", Label(slbTestLabel, 
 		err := utils.WaitPodsToBeReady(cs, ns.Name)
 		Expect(err).NotTo(HaveOccurred())
 
-		By(fmt.Sprintf("Waiting %v for Azure provisioning", waitTime))
-		time.Sleep(waitTime)
+		By("Waiting for Azure provisioning")
+		Eventually(func() error {
+			for _, serviceName := range serviceNames {
+				svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("get service %s: %w", serviceName, err)
+				}
+				if !hasFinalizer(svc.Finalizers, serviceGatewayServiceFinalizer) {
+					return fmt.Errorf("service %s should have ServiceGateway finalizer (%s)", serviceName, serviceGatewayServiceFinalizer)
+				}
+				if !hasFinalizer(svc.Finalizers, k8sLoadBalancerFinalizer) {
+					return fmt.Errorf("service %s should have K8s LB finalizer (%s)", serviceName, k8sLoadBalancerFinalizer)
+				}
+				if err := serviceReconciledErr(string(svc.UID), podsPerSvc); err != nil {
+					return fmt.Errorf("service %s: %w", serviceName, err)
+				}
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"all services should have finalizers, Azure resources, and registered pod endpoints")
 
 		By("Verifying all services have BOTH finalizers (ServiceGateway + K8s LB)")
 		for _, serviceName := range serviceNames {
@@ -475,8 +493,11 @@ var _ = Describe("Container Load Balancer Finalizer Tests", Label(slbTestLabel, 
 		err := utils.WaitPodsToBeReady(cs, ns.Name)
 		Expect(err).NotTo(HaveOccurred())
 
-		By(fmt.Sprintf("Waiting %v for Azure NAT Gateway provisioning", provisionTime))
-		time.Sleep(provisionTime)
+		By("Waiting for Azure NAT Gateway provisioning")
+		Eventually(func() error {
+			return egressRegisteredErr(egressName, numPods)
+		}, provisionTime, 10*time.Second).Should(Succeed(),
+			"egress service should be reconciled with NAT Gateway and registered pods")
 
 		By("Verifying all pods have ServiceGateway pod finalizer")
 		for _, podName := range podNames {

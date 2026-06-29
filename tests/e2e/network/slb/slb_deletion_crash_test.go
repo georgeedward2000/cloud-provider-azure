@@ -85,12 +85,14 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 			}
 		}
 
-		// Wait for Azure cleanup
-		utils.Logf("Waiting 120 seconds for Azure cleanup...")
-		time.Sleep(120 * time.Second)
+		By("Waiting for Azure cleanup to complete")
+		eventuallyAzureCleanup(6 * time.Minute)
 
 		By("Verifying Service Gateway cleanup")
 		verifyServiceGatewayCleanup()
+
+		By("Verifying Address Locations cleanup")
+		verifyAddressLocationsCleanup()
 
 		cs = nil
 		ccmClient = nil
@@ -169,21 +171,31 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		err := utils.WaitPodsToBeReady(cs, ns.Name)
 		Expect(err).NotTo(HaveOccurred())
 
-		By(fmt.Sprintf("Waiting %v for Azure LoadBalancer provisioning", provisionTime))
-		time.Sleep(provisionTime)
-
-		By("Verifying all services are provisioned in Service Gateway")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
-		inboundCount := 0
-		for _, svc := range sgResponse.Value {
-			if svc.Properties.ServiceType == "Inbound" {
-				inboundCount++
+		By("Waiting for Azure LoadBalancer provisioning")
+		Eventually(func() error {
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
 			}
-		}
-		utils.Logf("Found %d inbound services in Service Gateway before deletion", inboundCount)
-		Expect(inboundCount).To(BeNumerically(">=", serviceCount), "All services should be provisioned")
+
+			inboundCount := 0
+			for _, svc := range sgResponse.Value {
+				if svc.Properties.ServiceType == "Inbound" {
+					inboundCount++
+				}
+			}
+			utils.Logf("Found %d inbound services in Service Gateway before deletion", inboundCount)
+			if inboundCount < serviceCount {
+				return fmt.Errorf("found %d inbound services, want at least %d", inboundCount, serviceCount)
+			}
+			for _, serviceUID := range serviceUIDs {
+				if err := serviceReconciledErr(serviceUID, 1); err != nil {
+					return err
+				}
+			}
+			return nil
+		}, provisionTime, 10*time.Second).Should(Succeed(),
+			"all services should be provisioned")
 
 		By("Verifying Load Balancers exist")
 		initialLBCount, err := countAzureLoadBalancers()
@@ -217,8 +229,36 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		Expect(err).NotTo(HaveOccurred())
 		utils.Logf("CCM recovered")
 
-		By("Waiting for CCM to complete deletions (180s)")
-		time.Sleep(180 * time.Second)
+		By("Waiting for CCM to complete deletions")
+		Eventually(func() error {
+			services, err := cs.CoreV1().Services(ns.Name).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("list services: %w", err)
+			}
+			lbServiceCount := 0
+			for _, svc := range services.Items {
+				if svc.Spec.Type == v1.ServiceTypeLoadBalancer {
+					lbServiceCount++
+				}
+			}
+			if lbServiceCount != 0 {
+				return fmt.Errorf("%d LoadBalancer services still exist", lbServiceCount)
+			}
+			for _, serviceUID := range serviceUIDs {
+				if err := serviceDeletedErr(serviceUID); err != nil {
+					return err
+				}
+			}
+			finalLBCount, err := countAzureLoadBalancers()
+			if err != nil {
+				return err
+			}
+			if finalLBCount >= initialLBCount {
+				return fmt.Errorf("final LB count %d should be less than initial count %d", finalLBCount, initialLBCount)
+			}
+			return nil
+		}, 180*time.Second, 10*time.Second).Should(Succeed(),
+			"services and Service Gateway entries should be deleted after CCM recovery")
 
 		By("Verifying all K8s services are deleted (finalizers removed)")
 		services, err := cs.CoreV1().Services(ns.Name).List(ctx, metav1.ListOptions{})
@@ -234,10 +274,10 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		utils.Logf("✓ All K8s services deleted (finalizers removed)")
 
 		By("Verifying Service Gateway has no inbound services")
-		sgResponse, err = queryServiceGatewayServices()
+		sgResponse, err := queryServiceGatewayServices()
 		Expect(err).NotTo(HaveOccurred())
 
-		inboundCount = 0
+		inboundCount := 0
 		for _, svc := range sgResponse.Value {
 			if svc.Properties.ServiceType == "Inbound" {
 				inboundCount++
@@ -309,25 +349,27 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		err := utils.WaitPodsToBeReady(cs, ns.Name)
 		Expect(err).NotTo(HaveOccurred())
 
-		By(fmt.Sprintf("Waiting %v for Azure NAT Gateway provisioning", provisionTime))
-		time.Sleep(provisionTime)
-
-		By("Verifying NAT Gateway exists in Service Gateway")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
-		var foundEgress bool
+		By("Waiting for Azure NAT Gateway provisioning")
 		var natGatewayID string
-		for _, svc := range sgResponse.Value {
-			if svc.Name == egressName && svc.Properties.ServiceType == "Outbound" {
-				foundEgress = true
-				natGatewayID = svc.Properties.PublicNatGatewayID
-				break
+		Eventually(func() error {
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
 			}
-		}
-		Expect(foundEgress).To(BeTrue(), "Egress service should exist")
-		Expect(natGatewayID).NotTo(BeEmpty(), "NAT Gateway should be provisioned")
-		utils.Logf("Found NAT Gateway: %s", natGatewayID)
+
+			for _, svc := range sgResponse.Value {
+				if svc.Name == egressName && svc.Properties.ServiceType == "Outbound" {
+					natGatewayID = svc.Properties.PublicNatGatewayID
+					if natGatewayID == "" {
+						return fmt.Errorf("NAT Gateway should be provisioned")
+					}
+					utils.Logf("Found NAT Gateway: %s", natGatewayID)
+					return nil
+				}
+			}
+			return fmt.Errorf("egress service %s should exist", egressName)
+		}, provisionTime, 10*time.Second).Should(Succeed(),
+			"egress service should exist with a NAT Gateway")
 
 		By("Verifying all pods have finalizers")
 		for _, podName := range podNames {
@@ -371,8 +413,20 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		Expect(err).NotTo(HaveOccurred())
 		utils.Logf("CCM recovered")
 
-		By("Waiting for CCM to complete cleanup (180s)")
-		time.Sleep(180 * time.Second)
+		By("Waiting for CCM to complete cleanup")
+		Eventually(func() error {
+			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("%s=%s", egressLabel, egressName),
+			})
+			if err != nil {
+				return fmt.Errorf("list egress pods: %w", err)
+			}
+			if len(pods.Items) != 0 {
+				return fmt.Errorf("%d egress pod(s) still exist", len(pods.Items))
+			}
+			return natGatewayCleanupErr([]string{egressName})
+		}, 180*time.Second, 10*time.Second).Should(Succeed(),
+			"egress pods and Service Gateway entry should be cleaned up after CCM recovery")
 
 		By("Verifying all pods are deleted (finalizers removed)")
 		pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
@@ -383,10 +437,10 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		utils.Logf("✓ All pods deleted (finalizers removed)")
 
 		By("Verifying egress service removed from Service Gateway")
-		sgResponse, err = queryServiceGatewayServices()
+		sgResponse, err := queryServiceGatewayServices()
 		Expect(err).NotTo(HaveOccurred())
 
-		foundEgress = false
+		foundEgress := false
 		for _, svc := range sgResponse.Value {
 			if svc.Name == egressName && svc.Properties.ServiceType == "Outbound" {
 				foundEgress = true
@@ -423,6 +477,7 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 
 		By(fmt.Sprintf("Creating %d inbound services", inboundServiceCount))
 		serviceNames := make([]string, inboundServiceCount)
+		serviceUIDs := make([]string, inboundServiceCount)
 		for i := 0; i < inboundServiceCount; i++ {
 			serviceName := fmt.Sprintf("mixed-crash-svc-%d", i)
 			serviceNames[i] = serviceName
@@ -446,8 +501,9 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 					},
 				},
 			}
-			_, err := cs.CoreV1().Services(ns.Name).Create(ctx, service, metav1.CreateOptions{})
+			createdSvc, err := cs.CoreV1().Services(ns.Name).Create(ctx, service, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
+			serviceUIDs[i] = string(createdSvc.UID)
 
 			// Backend pod
 			pod := &v1.Pod{
@@ -492,25 +548,40 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		err := utils.WaitPodsToBeReady(cs, ns.Name)
 		Expect(err).NotTo(HaveOccurred())
 
-		By(fmt.Sprintf("Waiting %v for Azure provisioning", provisionTime))
-		time.Sleep(provisionTime)
-
-		By("Verifying initial Azure state")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
-		inboundCount := 0
-		outboundCount := 0
-		for _, svc := range sgResponse.Value {
-			if svc.Properties.ServiceType == "Inbound" {
-				inboundCount++
-			} else if svc.Properties.ServiceType == "Outbound" && svc.Name != "default-natgw" {
-				outboundCount++
+		By("Waiting for Azure provisioning")
+		Eventually(func() error {
+			sgResponse, err := queryServiceGatewayServices()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway services: %w", err)
 			}
-		}
-		utils.Logf("Initial SGW state: %d inbound, %d outbound (non-default)", inboundCount, outboundCount)
-		Expect(inboundCount).To(BeNumerically(">=", inboundServiceCount))
-		Expect(outboundCount).To(BeNumerically(">=", 1))
+
+			inboundCount := 0
+			outboundCount := 0
+			for _, svc := range sgResponse.Value {
+				if svc.Properties.ServiceType == "Inbound" {
+					inboundCount++
+				} else if svc.Properties.ServiceType == "Outbound" && svc.Name != "default-natgw" {
+					outboundCount++
+				}
+			}
+			utils.Logf("Initial SGW state: %d inbound, %d outbound (non-default)", inboundCount, outboundCount)
+			if inboundCount < inboundServiceCount {
+				return fmt.Errorf("found %d inbound services, want at least %d", inboundCount, inboundServiceCount)
+			}
+			if outboundCount < 1 {
+				return fmt.Errorf("found %d non-default outbound services, want at least 1", outboundCount)
+			}
+			for _, serviceUID := range serviceUIDs {
+				if err := serviceReconciledErr(serviceUID, 1); err != nil {
+					return err
+				}
+			}
+			if err := egressRegisteredErr(egressName, egressPodCount); err != nil {
+				return err
+			}
+			return nil
+		}, provisionTime, 10*time.Second).Should(Succeed(),
+			"initial Azure state should be provisioned")
 
 		initialLBCount, _ := countAzureLoadBalancers()
 		initialPIPCount, _ := countAzurePublicIPs()
@@ -544,8 +615,38 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		Expect(err).NotTo(HaveOccurred())
 		utils.Logf("CCM recovered")
 
-		By("Waiting for CCM to complete all deletions (240s)")
-		time.Sleep(240 * time.Second)
+		By("Waiting for CCM to complete all deletions")
+		Eventually(func() error {
+			services, err := cs.CoreV1().Services(ns.Name).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("list services: %w", err)
+			}
+			lbCount := 0
+			for _, svc := range services.Items {
+				if svc.Spec.Type == v1.ServiceTypeLoadBalancer {
+					lbCount++
+				}
+			}
+			if lbCount != 0 {
+				return fmt.Errorf("%d LoadBalancer service(s) still exist", lbCount)
+			}
+			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("%s=%s", egressLabel, egressName),
+			})
+			if err != nil {
+				return fmt.Errorf("list egress pods: %w", err)
+			}
+			if len(pods.Items) != 0 {
+				return fmt.Errorf("%d egress pod(s) still exist", len(pods.Items))
+			}
+			for _, serviceUID := range serviceUIDs {
+				if err := serviceDeletedErr(serviceUID); err != nil {
+					return err
+				}
+			}
+			return natGatewayCleanupErr([]string{egressName})
+		}, 240*time.Second, 10*time.Second).Should(Succeed(),
+			"all inbound services and egress pods should be cleaned up after CCM recovery")
 
 		By("Verifying all K8s services deleted")
 		services, err := cs.CoreV1().Services(ns.Name).List(ctx, metav1.ListOptions{})
@@ -568,11 +669,11 @@ var _ = Describe("Container Load Balancer Deletion Crash Recovery Tests", Label(
 		utils.Logf("✓ All egress pods deleted")
 
 		By("Verifying Service Gateway cleaned up")
-		sgResponse, err = queryServiceGatewayServices()
+		sgResponse, err := queryServiceGatewayServices()
 		Expect(err).NotTo(HaveOccurred())
 
-		inboundCount = 0
-		outboundCount = 0
+		inboundCount := 0
+		outboundCount := 0
 		for _, svc := range sgResponse.Value {
 			if svc.Properties.ServiceType == "Inbound" {
 				inboundCount++

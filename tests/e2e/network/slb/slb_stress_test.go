@@ -53,8 +53,7 @@ var _ = Describe("Container Load Balancer Stress Tests", Label(slbTestLabel), fu
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			eventuallyAzureCleanup(6 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -138,20 +137,10 @@ var _ = Describe("Container Load Balancer Stress Tests", Label(slbTestLabel), fu
 			err = utils.WaitPodsToBeReady(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			time.Sleep(waitTime)
-
-			// Verify service exists in Service Gateway
-			sgResponse, err := queryServiceGatewayServices()
-			Expect(err).NotTo(HaveOccurred())
-
-			found := false
-			for _, svc := range sgResponse.Value {
-				if svc.Name == serviceUID {
-					found = true
-					break
-				}
-			}
-			Expect(found).To(BeTrue(), fmt.Sprintf("Service %s should exist in Service Gateway", serviceUID))
+			Eventually(func() error {
+				return serviceReconciledErr(serviceUID, -1)
+			}, waitTime, 10*time.Second).Should(Succeed(),
+				"service %s should exist in Service Gateway", serviceUID)
 
 			By(fmt.Sprintf("Cycle %d/%d: Deleting service", cycle, cycles))
 
@@ -167,20 +156,10 @@ var _ = Describe("Container Load Balancer Stress Tests", Label(slbTestLabel), fu
 			}
 
 			// Wait for cleanup
-			time.Sleep(waitTime)
-
-			// Verify service removed from Service Gateway
-			sgResponseAfter, err := queryServiceGatewayServices()
-			Expect(err).NotTo(HaveOccurred())
-
-			foundAfter := false
-			for _, svc := range sgResponseAfter.Value {
-				if svc.Name == serviceUID {
-					foundAfter = true
-					break
-				}
-			}
-			Expect(foundAfter).To(BeFalse(), fmt.Sprintf("Service %s should be removed from Service Gateway", serviceUID))
+			Eventually(func() error {
+				return serviceDeletedErr(serviceUID)
+			}, waitTime, 10*time.Second).Should(Succeed(),
+				"service %s should be removed from Service Gateway", serviceUID)
 
 			utils.Logf("  ✓ Cycle %d/%d complete", cycle, cycles)
 		}
@@ -277,22 +256,22 @@ var _ = Describe("Container Load Balancer Stress Tests", Label(slbTestLabel), fu
 		time.Sleep(30 * time.Second) // Let some crashes happen
 
 		By("Waiting for Azure provisioning")
-		time.Sleep(waitTime)
-
-		By("Verifying Service Gateway only registers healthy/ready pods")
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
-		registeredPods := 0
-		for _, location := range alResponse.Value {
-			for _, addr := range location.Addresses {
-				for _, svc := range addr.Services {
-					if svc == serviceUID {
-						registeredPods++
-					}
-				}
+		var registeredPods int
+		Eventually(func() error {
+			count, err := countRegisteredEndpoints(serviceUID)
+			if err != nil {
+				return err
 			}
-		}
+			registeredPods = count
+			if registeredPods < healthyPods {
+				return fmt.Errorf("registered pods %d, want at least %d", registeredPods, healthyPods)
+			}
+			if registeredPods > healthyPods+5 {
+				return fmt.Errorf("registered pods %d, want at most %d", registeredPods, healthyPods+5)
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"Service Gateway should only register healthy/ready pods")
 
 		utils.Logf("Registered pods: %d (expected approximately %d healthy pods)", registeredPods, healthyPods)
 		// Allow some tolerance - crashing pods might briefly become ready
@@ -344,20 +323,10 @@ var _ = Describe("Container Load Balancer Stress Tests", Label(slbTestLabel), fu
 			err := utils.WaitPodsToBeReady(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			time.Sleep(waitTime)
-
-			// Verify NAT Gateway in Service Gateway
-			sgResponse, err := queryServiceGatewayServices()
-			Expect(err).NotTo(HaveOccurred())
-
-			found := false
-			for _, svc := range sgResponse.Value {
-				if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
-					found = true
-					break
-				}
-			}
-			Expect(found).To(BeTrue(), fmt.Sprintf("NAT Gateway for '%s' should exist", egressName))
+			Eventually(func() error {
+				return egressRegisteredErr(egressName, -1)
+			}, waitTime, 10*time.Second).Should(Succeed(),
+				"NAT Gateway for '%s' should exist", egressName)
 
 			By(fmt.Sprintf("Cycle %d/%d: Deleting egress pods", cycle, cycles))
 
@@ -367,24 +336,17 @@ var _ = Describe("Container Load Balancer Stress Tests", Label(slbTestLabel), fu
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			time.Sleep(waitTime)
-
-			// Verify cleanup - NAT Gateway should still exist but Address Locations should be empty
-			alResponse, err := queryServiceGatewayAddressLocations()
-			Expect(err).NotTo(HaveOccurred())
-
-			egressPodCount := 0
-			for _, location := range alResponse.Value {
-				for _, addr := range location.Addresses {
-					for _, svc := range addr.Services {
-						if svc == egressName {
-							egressPodCount++
-						}
-					}
+			Eventually(func() error {
+				egressPodCount, err := countRegisteredEndpoints(egressName)
+				if err != nil {
+					return err
 				}
-			}
-
-			Expect(egressPodCount).To(Equal(0), fmt.Sprintf("No pods should remain for egress '%s'", egressName))
+				if egressPodCount != 0 {
+					return fmt.Errorf("egress %s has %d pod(s), want 0", egressName, egressPodCount)
+				}
+				return nil
+			}, waitTime, 10*time.Second).Should(Succeed(),
+				"no pods should remain for egress '%s'", egressName)
 
 			utils.Logf("  ✓ Cycle %d/%d complete", cycle, cycles)
 		}

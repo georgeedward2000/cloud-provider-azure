@@ -54,8 +54,7 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			eventuallyAzureCleanup(2 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -133,11 +132,10 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 		utils.Logf("First service created with UID: %s", firstServiceUID)
 
 		By("Waiting for Azure to provision initial resources")
-		time.Sleep(waitTime)
-
-		By("Verifying initial Service Gateway registration")
-		err = verifyAzureResources(firstServiceUID)
-		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() error {
+			return serviceReconciledErr(firstServiceUID, -1)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"initial service should be reconciled in Azure and the Service Gateway")
 
 		By("Deleting service")
 		err = cs.CoreV1().Services(ns.Name).Delete(context.TODO(), serviceName, metav1.DeleteOptions{})
@@ -145,20 +143,18 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 		utils.Logf("Service deleted")
 
 		By("Waiting for service cleanup")
-		time.Sleep(90 * time.Second)
-
-		By("Verifying first service UID cleaned up from Service Gateway")
-		sgResponse, err := queryServiceGatewayServices()
-		Expect(err).NotTo(HaveOccurred())
-
-		firstServiceFound := false
-		for _, svc := range sgResponse.Value {
-			if svc.Name == firstServiceUID {
-				firstServiceFound = true
-				break
+		Eventually(func() error {
+			// The K8s Service object keeps our ServiceGateway finalizer until Azure cleanup
+			// completes, so it outlives the SGW unregister by ~the PIP-delete duration. Wait
+			// for the object to be fully gone (not just unregistered from the SGW) before
+			// recreating with the same name, otherwise the Create races the in-progress
+			// deletion ("object is being deleted: ... already exists").
+			if _, err := cs.CoreV1().Services(ns.Name).Get(context.TODO(), serviceName, metav1.GetOptions{}); err == nil {
+				return fmt.Errorf("service %s still exists in K8s (deletion in progress)", serviceName)
 			}
-		}
-		Expect(firstServiceFound).To(BeFalse(), "First service UID should not exist after deletion")
+			return serviceDeletedErr(firstServiceUID)
+		}, 90*time.Second, 10*time.Second).Should(Succeed(),
+			"first service should be fully deleted from K8s and the Service Gateway")
 
 		By("Recreating service with same name")
 		recreatedService, err := cs.CoreV1().Services(ns.Name).Create(context.TODO(), service, metav1.CreateOptions{})
@@ -169,11 +165,10 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 		Expect(secondServiceUID).NotTo(Equal(firstServiceUID), "Recreated service should have different UID")
 
 		By("Waiting for Azure to provision new resources")
-		time.Sleep(waitTime)
-
-		By("Verifying new Service Gateway registration")
-		err = verifyAzureResources(secondServiceUID)
-		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() error {
+			return serviceReconciledErr(secondServiceUID, -1)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"new service should be reconciled in Azure and the Service Gateway")
 
 		utils.Logf("\n✓ Service deletion and recreation test passed")
 		utils.Logf("  First service UID: %s (cleaned up)", firstServiceUID)
@@ -245,11 +240,10 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 		serviceUID := string(createdService.UID)
 
 		By("Waiting for initial Azure provisioning")
-		time.Sleep(waitTime)
-
-		By("Verifying initial Service Gateway state")
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() error {
+			return serviceReconciledErr(serviceUID, -1)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"service should be reconciled in Azure and the Service Gateway with the initial port")
 
 		By(fmt.Sprintf("Updating service port from %d to %d", initialPort, updatedPort))
 		retrievedService, err := cs.CoreV1().Services(ns.Name).Get(context.TODO(), serviceName, metav1.GetOptions{})
@@ -261,11 +255,10 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 		utils.Logf("Service port updated to %d", updatedPort)
 
 		By("Waiting for Azure to process update")
-		time.Sleep(waitTime)
-
-		By("Verifying service still registered in Service Gateway after port update")
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() error {
+			return serviceReconciledErr(serviceUID, -1)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"service should still be registered in the Service Gateway after port update")
 
 		utils.Logf("\n✓ Service port update test passed: %d → %d", initialPort, updatedPort)
 	})
@@ -360,25 +353,25 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 		time.Sleep(30 * time.Second)
 
 		By("Waiting for Azure provisioning")
-		time.Sleep(waitTime)
-
-		By("Verifying Service Gateway only registers healthy pods")
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred())
-
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
-		registeredPods := 0
-		for _, location := range alResponse.Value {
-			for _, addr := range location.Addresses {
-				for _, svc := range addr.Services {
-					if svc == serviceUID {
-						registeredPods++
-					}
-				}
+		var registeredPods int
+		Eventually(func() error {
+			if err := serviceReconciledErr(serviceUID, -1); err != nil {
+				return err
 			}
-		}
+			count, err := countRegisteredEndpoints(serviceUID)
+			if err != nil {
+				return err
+			}
+			registeredPods = count
+			if registeredPods < totalPods-crashPods {
+				return fmt.Errorf("registered pods %d, want at least %d", registeredPods, totalPods-crashPods)
+			}
+			if registeredPods > totalPods {
+				return fmt.Errorf("registered pods %d, want at most %d", registeredPods, totalPods)
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"Service Gateway should only register healthy pods")
 
 		utils.Logf("Registered pods: %d (expected: %d healthy pods)", registeredPods, totalPods-crashPods)
 		// Note: Crashing pods may briefly get IPs and be registered before crashing.
@@ -460,11 +453,10 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 		By("Waiting for pods and Azure provisioning")
 		err = utils.WaitPodsToBeReady(cs, ns.Name)
 		Expect(err).NotTo(HaveOccurred())
-		time.Sleep(waitTime)
-
-		By("Verifying v1 pods registered")
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() error {
+			return serviceReconciledErr(serviceUID, -1)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"v1 service should be reconciled in Azure and the Service Gateway")
 
 		By("Creating v2 pods")
 		for i := 0; i < numNewPods; i++ {
@@ -502,22 +494,19 @@ var _ = Describe("Container Load Balancer Lifecycle", Label(slbTestLabel), func(
 		utils.Logf("Service selector updated from v1 to v2")
 
 		By("Waiting for Service Gateway to update")
-		time.Sleep(waitTime)
-
-		By("Verifying Service Gateway switched to v2 pods")
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
-		registeredPods := 0
-		for _, location := range alResponse.Value {
-			for _, addr := range location.Addresses {
-				for _, svc := range addr.Services {
-					if svc == serviceUID {
-						registeredPods++
-					}
-				}
+		var registeredPods int
+		Eventually(func() error {
+			count, err := countRegisteredEndpoints(serviceUID)
+			if err != nil {
+				return err
 			}
-		}
+			registeredPods = count
+			if registeredPods != numNewPods {
+				return fmt.Errorf("registered pods %d, want %d v2 pods", registeredPods, numNewPods)
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"Service Gateway should switch to v2 pods")
 
 		utils.Logf("After selector update: %d pods registered (expected %d v2 pods)", registeredPods, numNewPods)
 		Expect(registeredPods).To(Equal(numNewPods), "Should have switched to v2 pods")

@@ -653,6 +653,36 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			dt.checkInitializationCompleteLocked()
 		} else {
 			dt.logger.V(4).Info("Could not delete service", "err", err, "service", serviceUID)
+
+			// A ServiceWithOverlayMappingsCannotBeDeleted rejection means NRP still has the
+			// service's pod overlay address mappings. This happens in a race: an in-flight
+			// endpoint sync pushes addresses to NRP just after DeleteService gated on
+			// serviceHasLocationsInNRP (which was momentarily false) and jumped straight to
+			// the unregister. Retrying the unregister directly cannot help and storms NRP
+			// (the orphaned addresses never get drained). Instead, re-gate the deletion
+			// behind a fresh locations drain: clear the service from K8s state, mark it
+			// pending-on-locations, and trigger the LocationsUpdater. Its sync removes the
+			// orphaned NRP addresses, then CheckPendingServiceDeletions retriggers the
+			// delete once the overlay mappings are actually gone.
+			if isServiceOverlayMappingsError(err) {
+				_, errCode := extractAzureErrorInfo(err)
+				recordServiceOperation("delete", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
+				opState.RetryCount++
+				opState.LastAttempt = time.Now().Format(time.RFC3339)
+				recordServiceOperationRetry("delete", opState.Config.IsInbound, opState.RetryCount)
+
+				opState.State = StateDeletionPending
+				dt.removeServiceFromK8sStateLocked(serviceUID, opState.Config.IsInbound)
+				dt.pendingServiceDeletions[serviceUID] = &PendingServiceDeletion{
+					ServiceUID: serviceUID,
+					IsInbound:  opState.Config.IsInbound,
+					Timestamp:  time.Now().Format(time.RFC3339),
+				}
+				dt.logger.V(4).Info("Re-draining locations before retrying service deletion blocked by overlay mappings", "service", serviceUID, "attempt", opState.RetryCount)
+				dt.triggerLocationsUpdater()
+				return
+			}
+
 			_, errCode := extractAzureErrorInfo(err)
 			recordServiceOperation("delete", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
 			opState.RetryCount++

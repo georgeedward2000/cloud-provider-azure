@@ -572,8 +572,8 @@ func TestBuildServiceGatewayRemovalDTO(t *testing.T) {
 	})
 }
 
-// The umbrella retains the newIgnoreCaseSetFromSlice helper (used by the
-// service updater and other later-PR callers), so its coverage stays here.
+// newIgnoreCaseSetFromSlice is used by the service updater and resource builders, so its
+// coverage stays here.
 func TestNewIgnoreCaseSetFromSlice_Empty(t *testing.T) {
 	set := newIgnoreCaseSetFromSlice([]string{})
 	assert.NotNil(t, set)
@@ -632,4 +632,52 @@ func TestBuildInboundServiceResources_NamedTargetPortRejected(t *testing.T) {
 	}})
 	_, _, _, err := buildInboundServiceResources("svc", cfg, testConfig())
 	assert.Error(t, err, "a named targetPort must be rejected for PodIP backend pools")
+}
+
+// Two service ports that resolve to the same protocol + backend port collide on the shared
+// PodIP backend pool (floating IP is always disabled), which Azure rejects with
+// RulesUseSameBackendPortProtocolAndPool. The build must fail terminally rather than emit an
+// LB the Azure PUT can never accept.
+func TestBuildInboundServiceResources_DuplicateBackendPortRejected(t *testing.T) {
+	cfg := ExtractInboundConfigFromService(&v1.Service{Spec: v1.ServiceSpec{
+		Ports: []v1.ServicePort{
+			{Port: 80, Protocol: v1.ProtocolTCP, TargetPort: intstr.FromInt(8080)},
+			{Port: 443, Protocol: v1.ProtocolTCP, TargetPort: intstr.FromInt(8080)},
+		},
+	}})
+	_, _, _, err := buildInboundServiceResources("svc", cfg, testConfig())
+	assert.Error(t, err, "two ports sharing a backend port and protocol must be rejected")
+	assert.Contains(t, err.Error(), "RulesUseSameBackendPortProtocolAndPool")
+}
+
+// Distinct backend ports (or differing protocol) are a valid multi-port LB and must build two
+// rules without error. This is the shape the add/remove e2e exercises.
+func TestBuildInboundServiceResources_DistinctBackendPortsAllowed(t *testing.T) {
+	cfg := ExtractInboundConfigFromService(&v1.Service{Spec: v1.ServiceSpec{
+		Ports: []v1.ServicePort{
+			{Port: 80, Protocol: v1.ProtocolTCP, TargetPort: intstr.FromInt(8080)},
+			{Port: 443, Protocol: v1.ProtocolTCP, TargetPort: intstr.FromInt(8443)},
+		},
+	}})
+	_, lb, _, err := buildInboundServiceResources("svc", cfg, testConfig())
+	assert.NoError(t, err, "distinct backend ports must build a valid multi-rule LB")
+	assert.Len(t, lb.Properties.LoadBalancingRules, 2)
+}
+
+// Same backend port but different protocol (TCP vs UDP) does not collide: Azure scopes the
+// constraint per protocol, so this must build two rules.
+func TestBuildInboundServiceResources_SameBackendPortDifferentProtocolAllowed(t *testing.T) {
+	cfg := &InboundConfig{
+		FrontendPorts: []PortMapping{
+			{Port: 80, Protocol: "TCP"},
+			{Port: 80, Protocol: "UDP"},
+		},
+		BackendPorts: []PortMapping{
+			{Port: 8080, Protocol: "TCP"},
+			{Port: 8080, Protocol: "UDP"},
+		},
+	}
+	_, lb, _, err := buildInboundServiceResources("svc", cfg, testConfig())
+	assert.NoError(t, err, "same backend port over different protocols must be allowed")
+	assert.Len(t, lb.Properties.LoadBalancingRules, 2)
 }

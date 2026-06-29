@@ -84,11 +84,14 @@ var _ = Describe("Container Load Balancer Creation Crash Recovery Tests", Label(
 		}
 
 		// Wait for Azure cleanup
-		utils.Logf("Waiting 120 seconds for Azure cleanup...")
-		time.Sleep(120 * time.Second)
+		By("Waiting for Azure cleanup")
+		eventuallyAzureCleanup(6 * time.Minute)
 
 		By("Verifying Service Gateway cleanup")
 		verifyServiceGatewayCleanup()
+
+		By("Verifying Address Locations cleanup")
+		verifyAddressLocationsCleanup()
 
 		cs = nil
 		ccmClient = nil
@@ -351,7 +354,30 @@ var _ = Describe("Container Load Balancer Creation Crash Recovery Tests", Label(
 		Expect(err).NotTo(HaveOccurred())
 
 		By(fmt.Sprintf("Waiting for CCM to complete NAT Gateway provisioning (%v)", recoveryTimeout))
-		time.Sleep(recoveryTimeout)
+		Eventually(func() error {
+			if err := egressRegisteredErr(egressName, podCount); err != nil {
+				return err
+			}
+			podsWithFinalizer := 0
+			for _, podName := range podNames {
+				pod, err := cs.CoreV1().Pods(ns.Name).Get(ctx, podName, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("get pod %s: %w", podName, err)
+				}
+
+				for _, f := range pod.Finalizers {
+					if f == serviceGatewayPodFinalizer {
+						podsWithFinalizer++
+						break
+					}
+				}
+			}
+			if podsWithFinalizer != podCount {
+				return fmt.Errorf("got %d pods with ServiceGateway finalizer, want %d", podsWithFinalizer, podCount)
+			}
+			return nil
+		}, recoveryTimeout, 10*time.Second).Should(Succeed(),
+			"egress service should be registered with NAT Gateway and all pod finalizers after CCM recovery")
 
 		By("Verifying all pods have ServiceGateway finalizer")
 		podsWithFinalizer := 0
@@ -581,8 +607,23 @@ var _ = Describe("Container Load Balancer Creation Crash Recovery Tests", Label(
 		Expect(podsWithFinalizer).To(Equal(egressPodCount), "All egress pods should have finalizer")
 		utils.Logf("✓ All %d egress pods have ServiceGateway finalizer", egressPodCount)
 
-		By("Waiting for CCM to complete NAT Gateway provisioning (15s)")
-		time.Sleep(15 * time.Second)
+		By("Waiting for CCM to complete NAT Gateway provisioning")
+		Eventually(func() error {
+			for _, serviceName := range serviceNames {
+				svc, err := cs.CoreV1().Services(ns.Name).Get(ctx, serviceName, metav1.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("get service %s: %w", serviceName, err)
+				}
+				if err := serviceReconciledErr(string(svc.UID), 1); err != nil {
+					return fmt.Errorf("service %s: %w", serviceName, err)
+				}
+			}
+			if err := egressRegisteredErr(egressName, egressPodCount); err != nil {
+				return err
+			}
+			return nil
+		}, 15*time.Second, 10*time.Second).Should(Succeed(),
+			"mixed inbound services and egress should be registered in the Service Gateway")
 
 		By("Verifying Service Gateway state")
 		sgResponse, err := queryServiceGatewayServices()

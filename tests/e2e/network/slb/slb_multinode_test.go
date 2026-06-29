@@ -55,12 +55,14 @@ var _ = Describe("Container Load Balancer Multi-Node Tests", Label(slbTestLabel,
 			utils.DeleteNamespace(cs, ns.Name)
 		}
 
-		// Wait for Azure cleanup
-		utils.Logf("Waiting 120 seconds for Azure cleanup...")
-		time.Sleep(120 * time.Second)
+		By("Waiting for Azure cleanup")
+		eventuallyAzureCleanup(2 * time.Minute)
 
 		By("Verifying Service Gateway cleanup")
 		verifyServiceGatewayCleanup()
+
+		By("Verifying Address Locations cleanup")
+		verifyAddressLocationsCleanup()
 
 		cs = nil
 		ns = nil
@@ -119,8 +121,9 @@ var _ = Describe("Container Load Balancer Multi-Node Tests", Label(slbTestLabel,
 				},
 			},
 		}
-		_, err = cs.CoreV1().Services(ns.Name).Create(ctx, service, metav1.CreateOptions{})
+		createdService, err := cs.CoreV1().Services(ns.Name).Create(ctx, service, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		serviceUID := string(createdService.UID)
 		utils.Logf("Created service %s", serviceName)
 
 		By(fmt.Sprintf("Creating %d pods per node, spread across %d nodes", podsPerNode, len(nodeNames)))
@@ -188,8 +191,11 @@ var _ = Describe("Container Load Balancer Multi-Node Tests", Label(slbTestLabel,
 			utils.Logf("Pod %s: Node=%s, HostIP=%s, PodIP=%s", podName, nodeName, hostIP, podIP)
 		}
 
-		By(fmt.Sprintf("Waiting %v for Azure LoadBalancer provisioning", provisionTime))
-		time.Sleep(provisionTime)
+		By("Waiting for Azure LoadBalancer provisioning")
+		Eventually(func() error {
+			return serviceReconciledErr(serviceUID, len(createdPods))
+		}, provisionTime, 10*time.Second).Should(Succeed(),
+			"service should be reconciled with Azure LoadBalancer resources and registered pod endpoints")
 
 		By("Verifying Service Gateway has correct address locations")
 		addrResponse, err := queryServiceGatewayAddressLocations()
@@ -334,8 +340,11 @@ var _ = Describe("Container Load Balancer Multi-Node Tests", Label(slbTestLabel,
 			utils.Logf("Pod %s: HostIP=%s, PodIP=%s", podName, hostIP, podIP)
 		}
 
-		By(fmt.Sprintf("Waiting %v for Azure NAT Gateway provisioning", provisionTime))
-		time.Sleep(provisionTime)
+		By("Waiting for Azure NAT Gateway provisioning")
+		Eventually(func() error {
+			return egressRegisteredErr(egressName, len(createdPods))
+		}, provisionTime, 10*time.Second).Should(Succeed(),
+			"egress service should be reconciled with NAT Gateway and registered pods")
 
 		By("Verifying all pods have ServiceGateway finalizer")
 		for _, podName := range createdPods {
@@ -481,8 +490,9 @@ var _ = Describe("Container Load Balancer Multi-Node Tests", Label(slbTestLabel,
 				},
 			},
 		}
-		_, err = cs.CoreV1().Services(ns.Name).Create(ctx, service, metav1.CreateOptions{})
+		createdService, err := cs.CoreV1().Services(ns.Name).Create(ctx, service, metav1.CreateOptions{})
 		Expect(err).NotTo(HaveOccurred())
+		serviceUID := string(createdService.UID)
 
 		By("Creating pods on two nodes")
 		podsOnNode0 := make([]string, 0)
@@ -530,8 +540,11 @@ var _ = Describe("Container Load Balancer Multi-Node Tests", Label(slbTestLabel,
 		err = utils.WaitPodsToBeReady(cs, ns.Name)
 		Expect(err).NotTo(HaveOccurred())
 
-		By(fmt.Sprintf("Waiting %v for initial Azure provisioning", provisionTime))
-		time.Sleep(provisionTime)
+		By("Waiting for initial Azure provisioning")
+		Eventually(func() error {
+			return serviceReconciledErr(serviceUID, len(podsOnNode0)+len(podsOnNode1))
+		}, provisionTime, 10*time.Second).Should(Succeed(),
+			"service should be reconciled with initial pod endpoints")
 
 		By("Verifying initial address locations (should have 2 nodes)")
 		addrResponse, err := queryServiceGatewayAddressLocations()
@@ -555,24 +568,29 @@ var _ = Describe("Container Load Balancer Multi-Node Tests", Label(slbTestLabel,
 			utils.Logf("Deleted pod %s", podName)
 		}
 
-		By("Waiting for address locations to update (30s)")
-		time.Sleep(30 * time.Second)
-
-		By("Verifying address locations updated (should still have pods on node 1)")
-		addrResponse, err = queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
+		By("Waiting for address locations to update")
 		finalAddresses := 0
-		for _, loc := range addrResponse.Value {
-			finalAddresses += len(loc.Addresses)
-		}
-		utils.Logf("After drain: %d total addresses (was %d)", finalAddresses, initialAddresses)
+		Eventually(func() error {
+			addrResponse, err = queryServiceGatewayAddressLocations()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway address locations: %w", err)
+			}
 
-		// Should have fewer addresses now (node 0 pods removed)
-		Expect(finalAddresses).To(BeNumerically("<", initialAddresses),
-			"Address count should decrease after deleting pods from one node")
-		Expect(finalAddresses).To(BeNumerically(">=", len(podsOnNode1)),
-			"Should still have addresses for pods on node 1")
+			finalAddresses = 0
+			for _, loc := range addrResponse.Value {
+				finalAddresses += len(loc.Addresses)
+			}
+			if finalAddresses >= initialAddresses {
+				return fmt.Errorf("address count should decrease after deleting pods from one node: got %d, want less than %d", finalAddresses, initialAddresses)
+			}
+			if finalAddresses < len(podsOnNode1) {
+				return fmt.Errorf("should still have addresses for pods on node 1: got %d, want at least %d", finalAddresses, len(podsOnNode1))
+			}
+			return nil
+		}, 30*time.Second, 10*time.Second).Should(Succeed(),
+			"address locations should update after deleting pods from one node")
+
+		utils.Logf("After drain: %d total addresses (was %d)", finalAddresses, initialAddresses)
 
 		utils.Logf("\n✓ Node drain simulation test passed!")
 		utils.Logf("  - Initial addresses: %d", initialAddresses)

@@ -53,8 +53,8 @@ var _ = Describe("Container Load Balancer Mixed Workload", Label(slbTestLabel), 
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup")
+			eventuallyAzureCleanup(2 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -164,8 +164,15 @@ var _ = Describe("Container Load Balancer Mixed Workload", Label(slbTestLabel), 
 		utils.Logf("All %d pods are ready", totalPods)
 
 		By("Waiting for Azure to provision all resources")
-		utils.Logf("Waiting %v for Azure provisioning...", waitTime)
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			for _, svcConfig := range services {
+				if err := serviceReconciledErr(serviceUIDs[svcConfig.name], svcConfig.podCount); err != nil {
+					return fmt.Errorf("service %s: %w", svcConfig.name, err)
+				}
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"all services should be reconciled in Azure and the Service Gateway")
 
 		By("Verifying all services in Service Gateway")
 		sgResponse, err := queryServiceGatewayServices()
@@ -342,7 +349,15 @@ var _ = Describe("Container Load Balancer Mixed Workload", Label(slbTestLabel), 
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for Azure provisioning")
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			for svcName, uid := range serviceUIDs {
+				if err := serviceReconciledErr(uid, podsPerService); err != nil {
+					return fmt.Errorf("service %s: %w", svcName, err)
+				}
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"all services should be reconciled in Azure and the Service Gateway")
 
 		By("Verifying all services registered in Service Gateway")
 		sgResponse, err := queryServiceGatewayServices()
@@ -479,8 +494,15 @@ var _ = Describe("Container Load Balancer Mixed Workload", Label(slbTestLabel), 
 		utils.Logf("All 120 pods are ready")
 
 		By("Waiting for Azure to provision all resources")
-		utils.Logf("Waiting %v for Azure provisioning...", waitTime)
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			for _, svcConfig := range services {
+				if err := serviceReconciledErr(serviceUIDs[svcConfig.name], svcConfig.podCount); err != nil {
+					return fmt.Errorf("service %s: %w", svcConfig.name, err)
+				}
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"all services should be reconciled in Azure and the Service Gateway")
 
 		By("Verifying all services in Service Gateway")
 		sgResponse, err := queryServiceGatewayServices()

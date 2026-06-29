@@ -54,8 +54,8 @@ var _ = Describe("Container Load Balancer Scale Operations", Label(slbTestLabel)
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup")
+			eventuallyAzureCleanup(2 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -137,29 +137,24 @@ var _ = Describe("Container Load Balancer Scale Operations", Label(slbTestLabel)
 		Expect(err).NotTo(HaveOccurred())
 		utils.Logf("All %d initial pods are ready", initialPods)
 
-		By("Waiting for Azure to provision initial resources")
-		utils.Logf("Waiting %v for Azure provisioning...", waitTime)
-		time.Sleep(waitTime)
-
-		By("Verifying initial Service Gateway state")
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred())
-
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
 		initialPodIPs := 0
-		for _, location := range alResponse.Value {
-			for _, addr := range location.Addresses {
-				for _, svc := range addr.Services {
-					if svc == serviceUID {
-						initialPodIPs++
-					}
-				}
+		By("Waiting for Azure to provision initial resources")
+		Eventually(func() error {
+			if err := verifyAzureResources(serviceUID); err != nil {
+				return err
 			}
-		}
+			c, err := countRegisteredEndpoints(serviceUID)
+			if err != nil {
+				return err
+			}
+			if c != initialPods {
+				return fmt.Errorf("expected %d pod IPs, got %d", initialPods, c)
+			}
+			initialPodIPs = c
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"initial Service Gateway state should have Azure resources and registered pod endpoints")
 		utils.Logf("Initial state: %d pod IPs registered in Service Gateway", initialPodIPs)
-		Expect(initialPodIPs).To(Equal(initialPods))
 
 		By(fmt.Sprintf("Upscaling: Creating additional %d pods (total %d)", finalPods-initialPods, finalPods))
 		for i := initialPods; i < finalPods; i++ {
@@ -189,26 +184,21 @@ var _ = Describe("Container Load Balancer Scale Operations", Label(slbTestLabel)
 		Expect(err).NotTo(HaveOccurred())
 		utils.Logf("All %d pods are ready after upscale", finalPods)
 
-		By("Waiting for Service Gateway to register new pods")
-		utils.Logf("Waiting %v for Service Gateway updates...", waitTime)
-		time.Sleep(waitTime)
-
-		By("Verifying all pods registered in Service Gateway after upscale")
-		alResponseFinal, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
 		finalPodIPs := 0
-		for _, location := range alResponseFinal.Value {
-			for _, addr := range location.Addresses {
-				for _, svc := range addr.Services {
-					if svc == serviceUID {
-						finalPodIPs++
-					}
-				}
+		By("Waiting for Service Gateway to register new pods")
+		Eventually(func() error {
+			c, err := countRegisteredEndpoints(serviceUID)
+			if err != nil {
+				return err
 			}
-		}
+			if c != finalPods {
+				return fmt.Errorf("expected %d pod IPs, got %d", finalPods, c)
+			}
+			finalPodIPs = c
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"all pods should be registered in Service Gateway after upscale")
 		utils.Logf("After upscale: %d pod IPs registered in Service Gateway", finalPodIPs)
-		Expect(finalPodIPs).To(Equal(finalPods), fmt.Sprintf("Expected %d pod IPs, got %d", finalPods, finalPodIPs))
 
 		utils.Logf("\n✓ Upscale test passed: %d → %d pods", initialPods, finalPods)
 	})
@@ -280,28 +270,24 @@ var _ = Describe("Container Load Balancer Scale Operations", Label(slbTestLabel)
 		err = utils.WaitPodsToBeReady(cs, ns.Name)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("Waiting for Azure to provision resources")
-		time.Sleep(waitTime)
-
-		By("Verifying initial Service Gateway state")
-		err = verifyAzureResources(serviceUID)
-		Expect(err).NotTo(HaveOccurred())
-
-		alResponse, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
 		initialPodIPs := 0
-		for _, location := range alResponse.Value {
-			for _, addr := range location.Addresses {
-				for _, svc := range addr.Services {
-					if svc == serviceUID {
-						initialPodIPs++
-					}
-				}
+		By("Waiting for Azure to provision resources")
+		Eventually(func() error {
+			if err := verifyAzureResources(serviceUID); err != nil {
+				return err
 			}
-		}
+			c, err := countRegisteredEndpoints(serviceUID)
+			if err != nil {
+				return err
+			}
+			if c != initialPods {
+				return fmt.Errorf("expected %d pod IPs, got %d", initialPods, c)
+			}
+			initialPodIPs = c
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"initial Service Gateway state should have Azure resources and registered pod endpoints")
 		utils.Logf("Initial state: %d pod IPs registered", initialPodIPs)
-		Expect(initialPodIPs).To(Equal(initialPods))
 
 		By(fmt.Sprintf("Downscaling: Deleting %d pods (keeping %d)", initialPods-finalPods, finalPods))
 		for i := finalPods; i < initialPods; i++ {
@@ -310,29 +296,21 @@ var _ = Describe("Container Load Balancer Scale Operations", Label(slbTestLabel)
 			Expect(err).NotTo(HaveOccurred())
 		}
 
-		By("Waiting for pod deletions to complete")
-		time.Sleep(30 * time.Second)
-
 		By("Waiting for Service Gateway to deregister deleted pods")
-		utils.Logf("Waiting %v for Service Gateway updates...", waitTime)
-		time.Sleep(waitTime)
-
-		By("Verifying Service Gateway cleaned up deleted pod IPs")
-		alResponseFinal, err := queryServiceGatewayAddressLocations()
-		Expect(err).NotTo(HaveOccurred())
-
 		finalPodIPs := 0
-		for _, location := range alResponseFinal.Value {
-			for _, addr := range location.Addresses {
-				for _, svc := range addr.Services {
-					if svc == serviceUID {
-						finalPodIPs++
-					}
-				}
+		Eventually(func() error {
+			c, err := countRegisteredEndpoints(serviceUID)
+			if err != nil {
+				return err
 			}
-		}
+			if c != finalPods {
+				return fmt.Errorf("expected %d pod IPs, got %d", finalPods, c)
+			}
+			finalPodIPs = c
+			return nil
+		}, waitTime+30*time.Second, 10*time.Second).Should(Succeed(),
+			"Service Gateway should clean up deleted pod IPs")
 		utils.Logf("After downscale: %d pod IPs registered in Service Gateway", finalPodIPs)
-		Expect(finalPodIPs).To(Equal(finalPods), fmt.Sprintf("Expected %d pod IPs, got %d", finalPods, finalPodIPs))
 
 		utils.Logf("\n✓ Downscale test passed: %d → %d pods", initialPods, finalPods)
 	})
@@ -418,26 +396,22 @@ var _ = Describe("Container Load Balancer Scale Operations", Label(slbTestLabel)
 			err = utils.WaitPodsToBeReady(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Waiting for Service Gateway to update")
-			time.Sleep(waitTime)
-
-			By("Verifying Service Gateway state")
-			alResponse, err := queryServiceGatewayAddressLocations()
-			Expect(err).NotTo(HaveOccurred())
-
 			registeredPods := 0
-			for _, location := range alResponse.Value {
-				for _, addr := range location.Addresses {
-					for _, svc := range addr.Services {
-						if svc == serviceUID {
-							registeredPods++
-						}
-					}
+			By("Waiting for Service Gateway to update")
+			Eventually(func() error {
+				c, err := countRegisteredEndpoints(serviceUID)
+				if err != nil {
+					return err
 				}
-			}
+				if c != targetPods {
+					return fmt.Errorf("scale step %d failed: expected %d pods, got %d", stepIdx+1, targetPods, c)
+				}
+				registeredPods = c
+				return nil
+			}, waitTime, 10*time.Second).Should(Succeed(),
+				"Service Gateway state should match scale step %d", stepIdx+1)
 
 			utils.Logf("Step %d: Expected %d pods, Service Gateway has %d", stepIdx+1, targetPods, registeredPods)
-			Expect(registeredPods).To(Equal(targetPods), fmt.Sprintf("Scale step %d failed: expected %d pods, got %d", stepIdx+1, targetPods, registeredPods))
 		}
 
 		utils.Logf("\n✓ Rapid scale test passed: %v", scaleSteps)

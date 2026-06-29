@@ -61,8 +61,8 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup to complete (egress gateway cleanup is slower)")
+			eventuallyAzureCleanup(6 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -117,8 +117,10 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		utils.Logf("All %d egress pods are ready", numPods)
 
 		By("Waiting for Azure to provision NAT Gateway and PIP")
-		utils.Logf("Waiting %v for NAT Gateway provisioning...", waitTime)
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			return egressRegisteredErr(egressName, numPods)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"egress service should be registered with NAT Gateway and pod IPs")
 
 		By("Querying Service Gateway for outbound service")
 		sgResponse, err := queryServiceGatewayServices()
@@ -252,8 +254,15 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		utils.Logf("All %d egress pods are ready", totalPods)
 
 		By("Waiting for Azure to provision all NAT Gateways")
-		utils.Logf("Waiting %v for NAT Gateway provisioning...", waitTime)
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			for _, egressName := range egressGateways {
+				if err := egressRegisteredErr(egressName, podsPerGateway); err != nil {
+					return err
+				}
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"all egress gateways should be registered with NAT Gateways and pod IPs")
 
 		By("Verifying all egress gateways in Service Gateway")
 		sgResponse, err := queryServiceGatewayServices()
@@ -340,7 +349,10 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for NAT Gateway provisioning")
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			return egressRegisteredErr(egressName, initialPods)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"egress service should be registered with initial pod IPs")
 
 		By("Verifying initial state")
 		alResponse, err := queryServiceGatewayAddressLocations()
@@ -391,7 +403,10 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for Address Locations update")
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			return egressRegisteredErr(egressName, finalPods)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"egress service should be updated with scaled pod IPs")
 
 		By("Verifying scaled state")
 		alResponseFinal, err := queryServiceGatewayAddressLocations()
@@ -454,7 +469,10 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Waiting for NAT Gateway provisioning")
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			return egressRegisteredErr(egressName, initialPods)
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"egress service should be registered with initial pod IPs")
 
 		By("Verifying initial state")
 		alResponse, err := queryServiceGatewayAddressLocations()
@@ -486,7 +504,17 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		time.Sleep(30 * time.Second)
 
 		By("Waiting for Address Locations cleanup")
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			got, err := countRegisteredEndpoints(egressName)
+			if err != nil {
+				return err
+			}
+			if got != remainPods {
+				return fmt.Errorf("egress %s has %d registered pod(s), want %d", egressName, got, remainPods)
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"egress service should be updated after pod deletion")
 
 		By("Verifying cleanup")
 		alResponseFinal, err := queryServiceGatewayAddressLocations()
@@ -601,7 +629,16 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		utils.Logf("All %d pods ready (%d egress + %d inbound)", egressPods+inboundPods, egressPods, inboundPods)
 
 		By("Waiting for Azure provisioning")
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			if err := egressRegisteredErr(egressName, egressPods); err != nil {
+				return err
+			}
+			if err := serviceReconciledErr(serviceUID, inboundPods); err != nil {
+				return err
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"inbound service and egress service should be registered with pod IPs")
 
 		By("Verifying Service Gateway has both service types")
 		sgResponse, err := queryServiceGatewayServices()
@@ -726,7 +763,16 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		utils.Logf("All %d dual-traffic pods ready", dualPods)
 
 		By("Waiting for Azure provisioning")
-		time.Sleep(waitTime)
+		Eventually(func() error {
+			if err := egressRegisteredErr(egressName, dualPods); err != nil {
+				return err
+			}
+			if err := serviceReconciledErr(serviceUID, dualPods); err != nil {
+				return err
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"inbound service and egress service should both include all dual-traffic pods")
 
 		By("Verifying Service Gateway has both inbound and outbound services")
 		sgResponse, err := queryServiceGatewayServices()
@@ -795,7 +841,52 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 		}
 
 		By("Waiting for deletion to propagate")
-		time.Sleep(waitTime)
+		expectedRemaining := dualPods - podsToDelete
+		Eventually(func() error {
+			alResponse, err := queryServiceGatewayAddressLocations()
+			if err != nil {
+				return fmt.Errorf("query Service Gateway address locations: %w", err)
+			}
+
+			remainingEgress := 0
+			remainingInbound := 0
+			remainingDual := 0
+			remainingEgressIPs := make(map[string]bool)
+			remainingInboundIPs := make(map[string]bool)
+
+			for _, location := range alResponse.Value {
+				for _, addr := range location.Addresses {
+					for _, svcName := range addr.Services {
+						if svcName == egressName {
+							remainingEgress++
+							remainingEgressIPs[addr.Address] = true
+						}
+						if svcName == serviceUID {
+							remainingInbound++
+							remainingInboundIPs[addr.Address] = true
+						}
+					}
+				}
+			}
+
+			for ip := range remainingEgressIPs {
+				if remainingInboundIPs[ip] {
+					remainingDual++
+				}
+			}
+
+			if remainingEgress != expectedRemaining {
+				return fmt.Errorf("got %d pods in outbound after deletion, want %d", remainingEgress, expectedRemaining)
+			}
+			if remainingInbound != expectedRemaining {
+				return fmt.Errorf("got %d pods in inbound after deletion, want %d", remainingInbound, expectedRemaining)
+			}
+			if remainingDual != expectedRemaining {
+				return fmt.Errorf("got %d pods in both services after deletion, want %d", remainingDual, expectedRemaining)
+			}
+			return nil
+		}, waitTime, 10*time.Second).Should(Succeed(),
+			"remaining dual-traffic pods should stay registered in both services after deletion")
 
 		By("Verifying remaining pods are still in both services")
 		alResponse, err = queryServiceGatewayAddressLocations()
@@ -828,7 +919,6 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 			}
 		}
 
-		expectedRemaining := dualPods - podsToDelete
 		utils.Logf("After deletion: %d pods in outbound, %d pods in inbound, %d in both", remainingEgress, remainingInbound, remainingDual)
 
 		Expect(remainingEgress).To(Equal(expectedRemaining), fmt.Sprintf("Expected %d pods in outbound after deletion, got %d", expectedRemaining, remainingEgress))

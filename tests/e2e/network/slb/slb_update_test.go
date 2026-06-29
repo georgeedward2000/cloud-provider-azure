@@ -127,8 +127,8 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 			err := utils.DeleteNamespace(cs, ns.Name)
 			Expect(err).NotTo(HaveOccurred())
 
-			utils.Logf("Waiting 120 seconds for Azure cleanup...")
-			time.Sleep(120 * time.Second)
+			By("Waiting for Azure cleanup to complete")
+			eventuallyAzureCleanup(4 * time.Minute)
 
 			By("Verifying Service Gateway cleanup")
 			verifyServiceGatewayCleanup()
@@ -198,17 +198,22 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 		serviceUID := string(created.UID)
 		utils.Logf("Service created with UID=%s", serviceUID)
 
-		By("Waiting for Azure provisioning")
-		time.Sleep(provision)
-
-		By("Verifying initial Azure resources exist")
-		Expect(verifyAzureResources(serviceUID)).To(Succeed())
-
-		By(fmt.Sprintf("Verifying LB rule frontend port == %d initially", initialPort))
-		ports, err := getLoadBalancerFrontendPorts(serviceUID)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(ports).To(Equal([]int32{initialPort}),
-			"LB should have exactly one rule on the initial port before update")
+		By("Waiting for initial Azure provisioning")
+		// Poll initial state instead of a fixed sleep.
+		Eventually(func() error {
+			if err := verifyAzureResources(serviceUID); err != nil {
+				return err
+			}
+			ports, err := getLoadBalancerFrontendPorts(serviceUID)
+			if err != nil {
+				return err
+			}
+			if len(ports) != 1 || ports[0] != initialPort {
+				return fmt.Errorf("LB frontend ports = %v, want [%d]", ports, initialPort)
+			}
+			return nil
+		}, provision, 5*time.Second).Should(Succeed(),
+			"initial LB rule should exist on the initial port before update")
 
 		By("Recording SGW backend-pool ID before the update")
 		backendPoolBefore, err := getServiceGatewayBackendPoolID(serviceUID)
@@ -221,9 +226,6 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 		retrieved.Spec.Ports[0].Port = updatedPort
 		_, err = cs.CoreV1().Services(ns.Name).Update(context.TODO(), retrieved, metav1.UpdateOptions{})
 		Expect(err).NotTo(HaveOccurred())
-
-		By("Waiting for Azure to apply the update")
-		time.Sleep(updateWait)
 
 		By("Verifying the LB still exists under the SAME UID (no recreation)")
 		// verifyAzureResources looks up LB by name == serviceUID; if the engine had
@@ -304,8 +306,9 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 		utils.Logf("Service created with UID=%s", serviceUID)
 
 		By("Waiting for initial Azure provisioning")
-		time.Sleep(provision)
-		Expect(verifyAzureResources(serviceUID)).To(Succeed())
+		Eventually(func() error {
+			return verifyAzureResources(serviceUID)
+		}, provision, 5*time.Second).Should(Succeed(), "initial service should be provisioned in Azure")
 
 		By(fmt.Sprintf("Issuing rapid edits: %d -> %d -> %d", portA, portB, portC))
 		for _, p := range []int32{portB, portC} {
@@ -337,12 +340,13 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 	// and the LB ARM resource is re-PUT (UID preserved) on each transition.
 	It("should reconcile the LB rule set when ports are added and removed", func() {
 		const (
-			numPods    = 4
-			portA      = int32(80)
-			portB      = int32(443)
-			targetPort = 8080
-			provision  = 60 * time.Second
-			updateWait = 75 * time.Second
+			numPods     = 4
+			portA       = int32(80)
+			portB       = int32(443)
+			targetPort  = 8080
+			targetPortB = 8443
+			provision   = 60 * time.Second
+			updateWait  = 75 * time.Second
 		)
 
 		serviceLabels := map[string]string{"app": serviceName}
@@ -390,8 +394,9 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 		utils.Logf("Service created with UID=%s", serviceUID)
 
 		By("Waiting for initial Azure provisioning")
-		time.Sleep(provision)
-		Expect(verifyAzureResources(serviceUID)).To(Succeed())
+		Eventually(func() error {
+			return verifyAzureResources(serviceUID)
+		}, provision, 5*time.Second).Should(Succeed(), "initial service should be provisioned in Azure")
 
 		By(fmt.Sprintf("Verifying LB rule set == [%d]", portA))
 		Eventually(func() ([]int32, error) {
@@ -407,7 +412,7 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 		Expect(err).NotTo(HaveOccurred())
 		retrieved.Spec.Ports = []v1.ServicePort{
 			{Name: "http", Port: portA, TargetPort: intstr.FromInt(targetPort), Protocol: v1.ProtocolTCP},
-			{Name: "https", Port: portB, TargetPort: intstr.FromInt(targetPort), Protocol: v1.ProtocolTCP},
+			{Name: "https", Port: portB, TargetPort: intstr.FromInt(targetPortB), Protocol: v1.ProtocolTCP},
 		}
 		_, err = cs.CoreV1().Services(ns.Name).Update(context.TODO(), retrieved, metav1.UpdateOptions{})
 		Expect(err).NotTo(HaveOccurred())
@@ -426,7 +431,7 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 		retrieved, err = cs.CoreV1().Services(ns.Name).Get(context.TODO(), serviceName, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		retrieved.Spec.Ports = []v1.ServicePort{
-			{Name: "https", Port: portB, TargetPort: intstr.FromInt(targetPort), Protocol: v1.ProtocolTCP},
+			{Name: "https", Port: portB, TargetPort: intstr.FromInt(targetPortB), Protocol: v1.ProtocolTCP},
 		}
 		_, err = cs.CoreV1().Services(ns.Name).Update(context.TODO(), retrieved, metav1.UpdateOptions{})
 		Expect(err).NotTo(HaveOccurred())
@@ -616,8 +621,9 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 		utils.Logf("Service created with UID=%s", serviceUID)
 
 		By("Waiting for initial Azure provisioning")
-		time.Sleep(provision)
-		Expect(verifyAzureResources(serviceUID)).To(Succeed())
+		Eventually(func() error {
+			return verifyAzureResources(serviceUID)
+		}, provision, 5*time.Second).Should(Succeed(), "initial service should be provisioned in Azure")
 
 		backendPoolBefore, err := getServiceGatewayBackendPoolID(serviceUID)
 		Expect(err).NotTo(HaveOccurred())
@@ -657,9 +663,6 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 
 		By("Waiting for all pods to become Ready (endpoint set settles)")
 		Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
-
-		By("Waiting for engine to converge on the final LB+endpoint state")
-		time.Sleep(settle)
 
 		By(fmt.Sprintf("Verifying LB rule converges on [%d] (port edit applied)", portAfter))
 		Eventually(func() ([]int32, error) {
