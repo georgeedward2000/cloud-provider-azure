@@ -1092,10 +1092,13 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 		}
 	}
 
-	// Track pending pod deletion for finalizer removal - ONLY for last pods
-	// Non-last pods: Caller removes finalizer immediately after DeletePod returns
-	// Last pod: Track here, finalizer removed after NAT Gateway deletion in RemoveLastPodFinalizers
-	if isLastPod && namespace != "" && name != "" {
+	// Track the pod for finalizer removal. The finalizer is removed only after the pod's
+	// overlay address has actually been drained from NRP, never inline on the delete event:
+	//   - Non-last pod: CheckPendingPodDeletions removes it once isAddressInNRPLocked is false.
+	//   - Last pod: RemoveLastPodFinalizers removes it after the NAT Gateway is deleted.
+	// Removing the finalizer before the NRP drain would let the pod (and its IP) be reclaimed
+	// while NRP still maps the address to this service's NAT Gateway.
+	if namespace != "" && name != "" {
 		podKey := fmt.Sprintf("%s/%s", namespace, name)
 		dt.pendingPodDeletions[podKey] = &PendingPodDeletion{
 			Namespace:  namespace,
@@ -1103,10 +1106,10 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address, namespace, name 
 			ServiceUID: serviceUID,
 			Address:    address,
 			Location:   location,
-			IsLastPod:  true,
+			IsLastPod:  isLastPod,
 			Timestamp:  time.Now().Format(time.RFC3339),
 		}
-		dt.logger.V(5).Info("Added pending last pod deletion", "pod", podKey)
+		dt.logger.V(5).Info("Added pending pod deletion", "pod", podKey, "isLastPod", isLastPod)
 	}
 	// Note: Counter is managed by UpdateK8sPod for both last pod and non-last pod cases
 

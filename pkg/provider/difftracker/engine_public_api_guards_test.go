@@ -306,11 +306,12 @@ func TestGuardDeletePod_InvalidParamsIsNoOp(t *testing.T) {
 	assert.False(t, res.IsLastPod)
 }
 
-// TestGuardDeletePod_NonLastDoesNotEnqueuePendingPodDeletion verifies the
-// contract that non-last DeletePod is "fire-and-forget" — the caller removes
-// the finalizer immediately. A regression that starts queueing every pod into
-// pendingPodDeletions would explode that map.
-func TestGuardDeletePod_NonLastDoesNotEnqueuePendingPodDeletion(t *testing.T) {
+// TestGuardDeletePod_NonLastEnqueuesPendingPodDeletion verifies the contract that a
+// non-last DeletePod enqueues a drain-gated PendingPodDeletion (IsLastPod=false) instead of
+// stripping the finalizer inline, so the finalizer is removed by CheckPendingPodDeletions only
+// after the pod's address has left NRP. CheckPendingPodDeletions' Phase 3 cleanup keeps the map
+// bounded.
+func TestGuardDeletePod_NonLastEnqueuesPendingPodDeletion(t *testing.T) {
 	dt := newTestDiffTracker()
 	uid := "egress-nonlast"
 	dt.NRPResources.NATGateways.Insert(uid)
@@ -324,7 +325,12 @@ func TestGuardDeletePod_NonLastDoesNotEnqueuePendingPodDeletion(t *testing.T) {
 
 	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "a")
 	assert.False(t, res.IsLastPod)
-	assert.Empty(t, dt.pendingPodDeletions, "non-last DeletePod must NOT enqueue a PendingPodDeletion")
+	ppd, ok := dt.pendingPodDeletions["ns/a"]
+	if assert.True(t, ok, "non-last DeletePod must enqueue a drain-gated PendingPodDeletion") {
+		assert.False(t, ppd.IsLastPod, "non-last entry must have IsLastPod=false")
+		assert.Equal(t, "10.244.0.1", ppd.Address)
+		assert.Equal(t, "10.0.0.1", ppd.Location)
+	}
 }
 
 // TestGuardDeletePod_LastPodWithNamespaceNameTracksLastPodEntry verifies the

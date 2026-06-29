@@ -230,18 +230,54 @@ func (dt *DiffTracker) getPodByNamespaceName(ctx context.Context, namespace, nam
 // AddPodFinalizer adds the ServiceGateway pod cleanup finalizer to the pod.
 // This is called from pod informer before registering the pod with the engine.
 // It prevents Kubernetes from deleting the pod until location is synced to NRP.
+// It runs during the pod's IP-assignment status burst, so it gets a fresh copy and retries with
+// exponential backoff to survive the resulting 409/transient conflicts (mirroring the other
+// finalizer mutators); a missing pod is treated as success.
 func (dt *DiffTracker) AddPodFinalizer(ctx context.Context, pod *v1.Pod) error {
 	if hasPodFinalizer(pod) {
 		return nil
 	}
 
-	// Make a copy so we don't mutate the shared informer cache
-	updated := pod.DeepCopy()
-	updated.ObjectMeta.Finalizers = append(updated.ObjectMeta.Finalizers, ServiceGatewayPodCleanupFinalizer)
+	namespace := pod.Namespace
+	name := pod.Name
+	var lastErr error
 
-	dt.logger.V(5).Info("Adding ServiceGateway pod finalizer to pod", "namespace", pod.Namespace, "name", pod.Name)
-	_, err := dt.kubeClient.CoreV1().Pods(pod.Namespace).Update(ctx, updated, metav1.UpdateOptions{})
-	return err
+	retryErr := wait.ExponentialBackoff(finalizerRetryBackoff, func() (bool, error) {
+		// Get fresh pod to avoid conflicts with concurrent status updates
+		currentPod, err := dt.kubeClient.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				// Pod deleted, nothing to do
+				return true, nil
+			}
+			lastErr = err
+			dt.logger.V(4).Info("Transient error getting pod, will retry", "namespace", namespace, "name", name, "err", err)
+			return false, nil // Retry
+		}
+
+		// Check if already has finalizer (may have been added by a concurrent operation)
+		if hasPodFinalizer(currentPod) {
+			return true, nil
+		}
+
+		// Make a copy so we don't mutate the shared informer cache
+		updated := currentPod.DeepCopy()
+		updated.ObjectMeta.Finalizers = append(updated.ObjectMeta.Finalizers, ServiceGatewayPodCleanupFinalizer)
+
+		dt.logger.V(5).Info("Adding ServiceGateway pod finalizer to pod", "namespace", namespace, "name", name)
+		if _, err = dt.kubeClient.CoreV1().Pods(namespace).Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+			lastErr = err
+			dt.logger.V(4).Info("Transient error updating pod, will retry", "namespace", namespace, "name", name, "err", err)
+			return false, nil // Retry
+		}
+
+		return true, nil // Success
+	})
+
+	if retryErr != nil {
+		return fmt.Errorf("failed to add pod finalizer after retries: %v (last error: %v)", retryErr, lastErr)
+	}
+	return nil
 }
 
 // removePodFinalizer removes the ServiceGateway pod cleanup finalizer from the pod
@@ -275,13 +311,6 @@ func (dt *DiffTracker) removePodFinalizer(ctx context.Context, pod *v1.Pod) erro
 		_, err = dt.kubeClient.CoreV1().Pods(namespace).Update(ctx, updated, metav1.UpdateOptions{})
 		return err
 	})
-}
-
-// RemovePodFinalizerByPod removes the finalizer from a pod object directly.
-// This is used for non-last pods where we remove the finalizer immediately without tracking.
-// For last pods, use RemoveLastPodFinalizers after NAT Gateway deletion.
-func (dt *DiffTracker) RemovePodFinalizerByPod(ctx context.Context, pod *v1.Pod) error {
-	return dt.removePodFinalizer(ctx, pod)
 }
 
 // ================================================================================================

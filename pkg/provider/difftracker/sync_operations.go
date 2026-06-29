@@ -142,6 +142,20 @@ func (dt *DiffTracker) getSyncLocationsAddressesLocked() LocationData {
 	return result
 }
 
+// countTrackedLocationsAndAddresses returns the total number of locations (nodes) and pod IP
+// addresses currently tracked in NRP. These back the locations_total / addresses_total gauges,
+// which are documented and alerted on as live totals (not per-sync diff sizes). It acquires
+// dt.mu, so callers must not already hold it.
+func (dt *DiffTracker) countTrackedLocationsAndAddresses() (locations int, addresses int) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	locations = len(dt.NRPResources.Locations)
+	for _, loc := range dt.NRPResources.Locations {
+		addresses += len(loc.Addresses)
+	}
+	return locations, addresses
+}
+
 // Helper function to initialize Location based on existence in NRP
 func initializeLocation(exists bool) Location {
 	if !exists {

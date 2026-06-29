@@ -236,10 +236,13 @@ func (az *Cloud) podInformerAddPod(pod *v1.Pod) {
 
 // podInformerRemovePod handles pod deletion events for egress.
 // It calls Engine.DeletePod() which handles last-pod deletion logic:
-//   - Not last pod → Engine removes pod, decrements counter, triggers LocationsUpdater
-//     Finalizer is removed immediately here (no need to wait for NRP sync)
-//   - Last pod → Engine removes pod, marks service for deletion, triggers ServiceUpdater
-//     Finalizer is tracked and removed after NAT Gateway/PIP deletion completes
+//   - Not last pod → Engine removes pod, decrements counter, triggers LocationsUpdater.
+//     The finalizer is removed by CheckPendingPodDeletions once the address is drained from NRP.
+//   - Last pod → Engine removes pod, marks service for deletion, triggers ServiceUpdater.
+//     The finalizer is removed after NAT Gateway/PIP deletion completes.
+//
+// In both cases the finalizer is removed only after NRP has drained the pod's overlay address,
+// never inline here, so the pod (and its IP) is not reclaimed while NRP still maps the address.
 func (az *Cloud) podInformerRemovePod(pod *v1.Pod) {
 	// Validate pod has egress label
 	if pod.Labels == nil || pod.Labels[consts.PodLabelServiceEgressGateway] == "" {
@@ -260,20 +263,10 @@ func (az *Cloud) podInformerRemovePod(pod *v1.Pod) {
 	klog.V(2).Infof("podInformerRemovePod: Pod %s removed from egress %s (HostIP=%s, PodIP=%s)",
 		podKey, egressName, pod.Status.HostIP, pod.Status.PodIP)
 
-	// Call Engine.DeletePod - returns whether this was the last pod
-	result := az.diffTracker.DeletePod(egressName, pod.Status.HostIP, pod.Status.PodIP, pod.Namespace, pod.Name)
-
-	// For non-last pods, remove finalizer immediately (no need to wait for NRP sync)
-	// For last pods, finalizer is removed after NAT Gateway deletion (handled by RemoveLastPodFinalizers)
-	if !result.IsLastPod {
-		ctx := context.Background()
-		if err := az.diffTracker.RemovePodFinalizerByPod(ctx, pod); err != nil {
-			klog.Warningf("podInformerRemovePod: Failed to remove finalizer from non-last pod %s: %v", podKey, err)
-			// Best effort - pod will eventually be cleaned up
-		} else {
-			klog.V(2).Infof("podInformerRemovePod: Removed finalizer from non-last pod %s", podKey)
-		}
-	} else {
-		klog.V(2).Infof("podInformerRemovePod: Last pod %s, finalizer will be removed after NAT Gateway deletion", podKey)
-	}
+	// Call Engine.DeletePod. The pod's finalizer is intentionally NOT removed here: the engine
+	// records the pod in pendingPodDeletions, and the finalizer is stripped only after the pod's
+	// overlay address has been drained from NRP (CheckPendingPodDeletions for non-last pods,
+	// RemoveLastPodFinalizers after NAT Gateway deletion for the last pod). Removing it inline
+	// would let the pod (and its IP) be reclaimed while NRP still maps the address.
+	az.diffTracker.DeletePod(egressName, pod.Status.HostIP, pod.Status.PodIP, pod.Namespace, pod.Name)
 }

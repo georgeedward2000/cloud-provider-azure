@@ -206,7 +206,7 @@ rate(difftracker_engine_locations_update_duration_seconds_count[5m])
 
 #### `difftracker_engine_locations_total`
 - **Type**: Gauge
-- **Description**: Total number of locations tracked in NRP Service Gateway
+- **Description**: Total number of locations (nodes) currently tracked in NRP Service Gateway. Refreshed on every reconcile cycle (including no-change cycles) to reflect the live total, not the per-sync diff size.
 
 **Example Query**:
 ```promql
@@ -216,7 +216,7 @@ difftracker_engine_locations_total > 1000
 
 #### `difftracker_engine_addresses_total`
 - **Type**: Gauge
-- **Description**: Total number of addresses tracked across all locations
+- **Description**: Total number of pod IP addresses currently tracked across all locations in NRP. Refreshed on every reconcile cycle (including no-change cycles) to reflect the live total, not the per-sync diff size.
 
 **Example Query**:
 ```promql

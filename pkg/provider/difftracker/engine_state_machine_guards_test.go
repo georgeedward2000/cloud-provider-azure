@@ -171,7 +171,6 @@ func TestGuardStateTransitions_DeleteServiceDispatch(t *testing.T) {
 
 // Unknown states in UpdateService should be handled without panic.
 func TestGuardStateTransitions_UpdateService_UnknownStateNoPanic(t *testing.T) {
-	t.Skip("pending: updatePendingServiceOperationsMetric panics on unknown ResourceState")
 	dt := newTestDiffTracker()
 	uid := "svc-bad-state"
 	dt.pendingServiceOps[uid] = &ServiceOperationState{
@@ -188,7 +187,6 @@ func TestGuardStateTransitions_UpdateService_UnknownStateNoPanic(t *testing.T) {
 
 // Unknown states in DeleteService should be handled without panic.
 func TestGuardStateTransitions_DeleteService_UnknownStateNoPanic(t *testing.T) {
-	t.Skip("pending: updatePendingServiceOperationsMetric panics on unknown ResourceState")
 	dt := newTestDiffTracker()
 	uid := "svc-bad-state-delete"
 	dt.pendingServiceOps[uid] = &ServiceOperationState{

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -227,89 +228,74 @@ func (s *ServiceUpdater) processBatch() {
 		case StateCreationInProgress:
 			s.wg.Add(1)
 			go func(uid string, cfg ServiceConfig, corrID string, podNS string, podName string) {
-				defer s.wg.Done()
-				defer s.requeueIfMoreWork(uid)
-				defer func() {
-					s.mu.Lock()
-					delete(s.activeOps, uid)
-					s.mu.Unlock()
-				}()
-
-				// Acquire semaphore with context awareness
-				select {
-				case s.semaphore <- struct{}{}:
-					defer func() {
-						<-s.semaphore
-					}()
-				case <-s.ctx.Done():
-					s.logger.V(4).Info("Skipped service because context was canceled before acquiring semaphore", "serviceUID", uid)
-					return
-				}
-
-				if cfg.IsInbound {
-					s.createInboundService(uid, cfg.InboundConfig, corrID)
-				} else {
-					s.createOutboundService(uid, cfg.OutboundConfig, corrID, podNS, podName)
-				}
+				s.runWorker(uid, func() {
+					if cfg.IsInbound {
+						s.createInboundService(uid, cfg.InboundConfig, corrID)
+					} else {
+						s.createOutboundService(uid, cfg.OutboundConfig, corrID, podNS, podName)
+					}
+				})
 			}(work.serviceUID, work.config, work.correlationID, work.triggeringPodNamespace, work.triggeringPodName)
 		case StateDeletionInProgress:
 			s.wg.Add(1)
 			go func(uid string, cfg ServiceConfig, corrID string) {
-				defer s.wg.Done()
-				defer s.requeueIfMoreWork(uid)
-				defer func() {
-					s.mu.Lock()
-					delete(s.activeOps, uid)
-					s.mu.Unlock()
-				}()
-
-				// Acquire semaphore with context awareness
-				select {
-				case s.semaphore <- struct{}{}:
-					defer func() {
-						<-s.semaphore
-					}()
-				case <-s.ctx.Done():
-					s.logger.V(4).Info("Skipped service because context was canceled before acquiring semaphore", "serviceUID", uid)
-					return
-				}
-
-				if cfg.IsInbound {
-					s.deleteInboundService(uid, corrID)
-				} else {
-					s.deleteOutboundService(uid, corrID)
-				}
+				s.runWorker(uid, func() {
+					if cfg.IsInbound {
+						s.deleteInboundService(uid, corrID)
+					} else {
+						s.deleteOutboundService(uid, corrID)
+					}
+				})
 			}(work.serviceUID, work.config, work.correlationID)
 		case StateUpdateInProgress:
 			s.wg.Add(1)
 			go func(uid string, cfg ServiceConfig, corrID string) {
-				defer s.wg.Done()
-				defer s.requeueIfMoreWork(uid)
-				defer func() {
-					s.mu.Lock()
-					delete(s.activeOps, uid)
-					s.mu.Unlock()
-				}()
-
-				select {
-				case s.semaphore <- struct{}{}:
-					defer func() {
-						<-s.semaphore
-					}()
-				case <-s.ctx.Done():
-					s.logger.V(4).Info("Skipped service because context was canceled before acquiring semaphore", "serviceUID", uid)
-					return
-				}
-
-				if cfg.IsInbound {
-					s.updateInboundService(uid, cfg.InboundConfig, corrID)
-				} else {
-					s.logger.V(4).Info("Skipped unsupported outbound service update", "serviceUID", uid)
-					s.onComplete(uid, true, nil)
-				}
+				s.runWorker(uid, func() {
+					if cfg.IsInbound {
+						s.updateInboundService(uid, cfg.InboundConfig, corrID)
+					} else {
+						s.logger.V(4).Info("Skipped unsupported outbound service update", "serviceUID", uid)
+						s.onComplete(uid, true, nil)
+					}
+				})
 			}(work.serviceUID, work.config, work.correlationID)
 		}
 	}
+}
+
+// runWorker executes a single service operation with the shared worker lifecycle: it manages the
+// wait group, active-op cleanup, and the follow-up requeue, bounds concurrency with the semaphore,
+// and recovers panics. A panicking operation is reported as a failed op via onComplete (so the
+// existing retry path handles it) instead of crashing the whole process. op is only invoked once
+// the semaphore is acquired; if the context is cancelled first, the op is skipped.
+func (s *ServiceUpdater) runWorker(uid string, op func()) {
+	defer s.wg.Done()
+	defer s.requeueIfMoreWork(uid)
+	defer func() {
+		s.mu.Lock()
+		delete(s.activeOps, uid)
+		s.mu.Unlock()
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error(fmt.Errorf("%v", r), "Recovered from panic in ServiceUpdater worker",
+				"serviceUID", uid, "stack", string(debug.Stack()))
+			s.onComplete(uid, false, fmt.Errorf("panic in service worker: %v", r))
+		}
+	}()
+
+	// Acquire semaphore with context awareness
+	select {
+	case s.semaphore <- struct{}{}:
+		defer func() {
+			<-s.semaphore
+		}()
+	case <-s.ctx.Done():
+		s.logger.V(4).Info("Skipped service because context was canceled before acquiring semaphore", "serviceUID", uid)
+		return
+	}
+
+	op()
 }
 
 // createInboundService creates LoadBalancer resources for inbound service
@@ -321,8 +307,17 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 	// Step 0: Add finalizer to K8s service to prevent deletion until Azure resources are cleaned up
 	svc, err := s.diffTracker.getServiceByUID(ctx, serviceUID)
 	if err != nil {
-		s.logger.V(4).Info("Could not get service for finalizer", "serviceUID", serviceUID, "correlationID", correlationID, "err", err)
-		// Continue - service may have been deleted or this is initialization cleanup
+		if !apierrors.IsNotFound(err) {
+			// A transient lookup failure (e.g. an apiserver List error) is NOT "service gone":
+			// proceeding would create the PIP/LB/SGW without ever adding the K8s cleanup
+			// finalizers, leaving Azure resources with no anchor for EnsureLoadBalancerDeleted.
+			// Fail the operation so it is retried once the apiserver recovers.
+			s.logger.V(4).Info("Could not get service for finalizer, will retry", "serviceUID", serviceUID, "correlationID", correlationID, "err", err)
+			s.onComplete(serviceUID, false, fmt.Errorf("failed to get service for finalizer: %w", err))
+			return
+		}
+		// Typed NotFound: the service is genuinely gone, so there is nothing to anchor; continue.
+		s.logger.V(4).Info("Service not found for finalizer, continuing", "serviceUID", serviceUID, "correlationID", correlationID)
 	} else {
 		if err := s.diffTracker.addServiceGatewayFinalizer(ctx, svc); err != nil {
 			s.logger.V(4).Info("Could not add finalizer to service", "serviceUID", serviceUID, "err", err)

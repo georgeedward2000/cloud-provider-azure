@@ -24,11 +24,17 @@ You may obtain a copy of the License at
 package difftracker
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	"k8s.io/component-base/metrics/testutil"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient/mock_servicegatewayclient"
+	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
 // TestGuardMetrics_ServiceOperationTotal_IncrementsOnce verifies that
@@ -148,8 +154,99 @@ func TestGuardMetrics_PendingServiceOperationsGauge_NeverNegative(t *testing.T) 
 	assert.GreaterOrEqual(t, v, 0.0)
 }
 
+// TestGuardMetrics_PendingServiceOperationsGauge_OutOfRangeStateNoPanic verifies that an
+// out-of-range ResourceState does not panic updatePendingServiceOperationsMetric (which runs in a
+// deferred metric path on the caller's goroutine, where a panic would crash the CCM) and that the
+// op is counted under the "unknown" state label.
+func TestGuardMetrics_PendingServiceOperationsGauge_OutOfRangeStateNoPanic(t *testing.T) {
+	RegisterMetrics()
+	pendingServiceOperations.Reset()
+	dt := newTestDiffTracker()
+
+	dt.pendingServiceOps["bad"] = &ServiceOperationState{
+		ServiceUID: "bad",
+		Config:     NewInboundServiceConfig("bad", nil),
+		State:      ResourceState(99), // out of the seeded enum range
+	}
+
+	assert.NotPanics(t, func() {
+		updatePendingServiceOperationsMetric(dt)
+	}, "an out-of-range ResourceState must not panic the metric update")
+
+	v, err := testutil.GetGaugeMetricValue(pendingServiceOperations.WithLabelValues("unknown", "inbound"))
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, v, "an out-of-range state must be counted under the 'unknown' label")
+}
+
 // assertErrorForMetrics is a tiny error type used only by the error-series
 // assertion above (we don't want to depend on a specific Azure-SDK error).
 type assertErrorForMetrics struct{}
 
 func (assertErrorForMetrics) Error() string { return "metrics-test-error" }
+
+// TestGuardMetrics_LocationsAndAddressesTotals_ReflectNRPTotalsEveryCycle verifies that the
+// locations_total / addresses_total gauges report the live NRP-tracked totals on every reconcile
+// cycle — both a no-change cycle (no diff to sync) and a changed cycle — rather than the per-sync
+// diff size. They are documented and alerted on as totals, so a no-change cycle must still publish
+// the full totals and a changed cycle must publish the post-sync totals (not just the diff).
+func TestGuardMetrics_LocationsAndAddressesTotals_ReflectNRPTotalsEveryCycle(t *testing.T) {
+	RegisterMetrics()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockFactory := mock_azclient.NewMockClientFactory(ctrl)
+	mockSGW := mock_servicegatewayclient.NewMockInterface(ctrl)
+	mockFactory.EXPECT().GetServiceGatewayClient().Return(mockSGW).AnyTimes()
+	mockSGW.EXPECT().UpdateAddressLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	dt := newTestDiffTracker()
+	dt.config = testConfig()
+	dt.networkClientFactory = mockFactory
+	dt.pendingServiceOps["svc"] = &ServiceOperationState{ServiceUID: "svc", State: StateCreated}
+	dt.NRPResources.LoadBalancers.Insert("svc")
+
+	// In-sync state: one location (node 10.0.0.1) with one address (10.244.0.1) present in BOTH
+	// K8s and NRP, so GetSyncLocationsAddresses produces no diff.
+	podA := newPod()
+	podA.InboundIdentities = utilsets.NewString("svc")
+	nodeA := newNode()
+	nodeA.Pods["10.244.0.1"] = podA
+	dt.K8sResources.Nodes["10.0.0.1"] = nodeA
+	dt.NRPResources.Locations["10.0.0.1"] = NRPLocation{
+		Addresses: map[string]NRPAddress{
+			"10.244.0.1": {Services: utilsets.NewString("svc")},
+		},
+	}
+
+	lu := NewLocationsUpdater(context.Background(), dt)
+
+	// No-change cycle: there is no diff to sync, but the gauges must still report the totals
+	// (1 location, 1 address). Seed a deliberately-wrong sentinel first to prove process() sets
+	// them on this path (the old code returned early without touching them).
+	updateLocationsAndAddressesMetric(999, 999)
+	lu.process(context.Background())
+	gotLoc, err := testutil.GetGaugeMetricValue(locationsTotal)
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, gotLoc, "locations_total must equal the NRP total on a no-change cycle")
+	gotAddr, err := testutil.GetGaugeMetricValue(addressesTotal)
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, gotAddr, "addresses_total must equal the NRP total on a no-change cycle")
+
+	// Changed cycle: add a second pod on a new node. The diff is only 1 location/1 address, but
+	// the gauges must report the post-sync TOTAL of 2 locations / 2 addresses.
+	podB := newPod()
+	podB.InboundIdentities = utilsets.NewString("svc")
+	nodeB := newNode()
+	nodeB.Pods["10.244.0.2"] = podB
+	dt.K8sResources.Nodes["10.0.0.2"] = nodeB
+
+	updateLocationsAndAddressesMetric(999, 999)
+	lu.process(context.Background())
+	gotLoc, err = testutil.GetGaugeMetricValue(locationsTotal)
+	assert.NoError(t, err)
+	assert.Equal(t, 2.0, gotLoc, "locations_total must equal the post-sync NRP total, not the diff size")
+	gotAddr, err = testutil.GetGaugeMetricValue(addressesTotal)
+	assert.NoError(t, err)
+	assert.Equal(t, 2.0, gotAddr, "addresses_total must equal the post-sync NRP total, not the diff size")
+}

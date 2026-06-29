@@ -104,6 +104,16 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 			lu.diffTracker.checkInitializationComplete()
 		}
 	}()
+
+	// The locations_total / addresses_total gauges are documented and alerted on as live totals,
+	// so refresh them from the current NRP-tracked counts on every cycle — including the no-diff
+	// early return and error returns. numLocations/numAddresses (the per-sync diff sizes) are kept
+	// only for the log line and the operation-metric dimensions.
+	defer func() {
+		locations, addresses := lu.diffTracker.countTrackedLocationsAndAddresses()
+		updateLocationsAndAddressesMetric(locations, addresses)
+	}()
+
 	startTime := time.Now()
 
 	// Get locations and addresses diff from DiffTracker
@@ -146,9 +156,6 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	duration := time.Since(startTime)
 	lu.logger.V(2).Info("Synced locations to NRP", "locations", numLocations, "addresses", numAddresses, "duration", duration)
 
-	// Update location and address metrics
-	updateLocationsAndAddressesMetric(numLocations, numAddresses)
-
 	// Update NRPResources to reflect the sync
 	lu.diffTracker.UpdateLocationsAddresses(locationData)
 
@@ -156,11 +163,10 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	// Services waiting for their locations to clear can now be deleted
 	lu.diffTracker.CheckPendingServiceDeletions()
 
-	// Check pending pod deletions after location sync
-	// This handles pods recovered during restart (via recoverStuckFinalizers)
-	// whose addresses need to be synced out of NRP before removing their finalizers.
-	// Note: During normal operation, non-last pod finalizers are removed immediately
-	// in podInformerRemovePod(), not here.
+	// Check pending pod deletions after location sync. The address removals were just synced
+	// to NRP and reflected in NRPResources above, so any non-last pod whose address has now
+	// left NRP gets its finalizer removed here. Last-pod entries are skipped (their finalizers
+	// are removed after NAT Gateway deletion by RemoveLastPodFinalizers).
 	lu.diffTracker.CheckPendingPodDeletions(ctx)
 
 	if lu.initPodFinalizersStillPending() {

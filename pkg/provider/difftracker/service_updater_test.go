@@ -18,10 +18,18 @@ package difftracker
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipaddressclient/mock_publicipaddressclient"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -35,6 +43,88 @@ func newTestServiceUpdater(dt *DiffTracker) *ServiceUpdater {
 		ctx:         context.Background(),
 		semaphore:   make(chan struct{}, 10),
 		activeOps:   make(map[string]bool),
+	}
+}
+
+// TestCreateInboundService_TransientServiceLookupErrorDoesNotCreatePIP verifies that a transient
+// (non-NotFound) error when looking up the Service in Step 0 aborts the create and reports a
+// retryable failure, rather than proceeding to create the PIP/LB/SGW with no K8s cleanup-finalizer
+// anchor. A genuine NotFound is handled separately (the service is gone).
+func TestCreateInboundService_TransientServiceLookupErrorDoesNotCreatePIP(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// The Service List fails transiently, so getServiceByUID returns a generic wrapped error
+	// (not a typed NotFound).
+	kube := fake.NewSimpleClientset()
+	kube.PrependReactor("list", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("transient apiserver error")
+	})
+
+	// The PIP must never be created on this path; Times(0) fails the test if it is.
+	pip := mock_publicipaddressclient.NewMockInterface(ctrl)
+	pip.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	factory := mock_azclient.NewMockClientFactory(ctrl)
+	factory.EXPECT().GetPublicIPAddressClient().Return(pip).AnyTimes()
+
+	dt := newTestDiffTracker()
+	dt.config = testConfig()
+	dt.kubeClient = kube
+	dt.networkClientFactory = factory
+
+	var gotSuccess *bool
+	var gotErr error
+	su := newTestServiceUpdater(dt)
+	su.onComplete = func(_ string, ok bool, err error) {
+		v := ok
+		gotSuccess = &v
+		gotErr = err
+	}
+
+	su.createInboundService("uid-x", makeInboundConfig(80), "corr-x")
+
+	if assert.NotNil(t, gotSuccess, "onComplete must be called") {
+		assert.False(t, *gotSuccess, "a transient service-lookup error must fail the op for retry")
+	}
+	assert.Error(t, gotErr, "the transient error must be propagated")
+}
+
+// TestServiceUpdaterWorker_RecoversFromPanic verifies that a panic inside a worker operation is
+// recovered (so the CCM process survives) and reported as a failed op via onComplete, rather than
+// crashing the whole process.
+func TestServiceUpdaterWorker_RecoversFromPanic(t *testing.T) {
+	// A panicking fake client: the Service List panics, so createInboundService Step 0 panics.
+	kube := fake.NewSimpleClientset()
+	kube.PrependReactor("list", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		panic("simulated apiserver client panic")
+	})
+
+	dt := newTestDiffTracker()
+	dt.config = testConfig()
+	dt.kubeClient = kube
+
+	var gotSuccess *bool
+	var gotErr error
+	su := newTestServiceUpdater(dt)
+	su.onComplete = func(_ string, ok bool, err error) {
+		v := ok
+		gotSuccess = &v
+		gotErr = err
+	}
+
+	su.wg.Add(1)
+	assert.NotPanics(t, func() {
+		su.runWorker("uid-panic", func() {
+			su.createInboundService("uid-panic", makeInboundConfig(80), "corr-panic")
+		})
+	}, "a panic in a worker operation must be recovered, not propagated")
+	su.wg.Wait()
+
+	if assert.NotNil(t, gotSuccess, "onComplete must be called after a recovered panic") {
+		assert.False(t, *gotSuccess, "a panicking op must be reported as a failed operation")
+	}
+	if assert.Error(t, gotErr) {
+		assert.Contains(t, gotErr.Error(), "panic", "the failure must carry the panic info")
 	}
 }
 
@@ -74,7 +164,7 @@ func TestServiceUpdaterProcessBatchFlow(t *testing.T) {
 		},
 		pendingEndpoints:        make(map[string][]PendingEndpointUpdate),
 		pendingPods:             make(map[string][]PendingPodUpdate),
-		pendingServiceDeletions:        make(map[string]*PendingServiceDeletion),
+		pendingServiceDeletions: make(map[string]*PendingServiceDeletion),
 		serviceUpdaterTrigger:   make(chan bool, 1),
 		locationsUpdaterTrigger: make(chan bool, 1),
 	}

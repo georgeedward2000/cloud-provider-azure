@@ -227,22 +227,37 @@ func updatePendingServiceOperationsMetric(dt *DiffTracker) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 
-	stateCounts := make(map[ResourceState]map[string]int)
+	// Key the buckets by the same resourceStateToString label used when publishing, and seed every
+	// known state plus an "unknown" catch-all. resourceStateToString maps any out-of-range
+	// ResourceState to "unknown" (seeded below), so the inner map is always non-nil and an
+	// unrecognized state can never nil-map panic here. This matters because this runs in a deferred
+	// metric path on the caller's goroutine (AddService/UpdateService/DeleteService/
+	// OnServiceCreationComplete), where a panic would crash the CCM.
+	stateCounts := make(map[string]map[string]int)
 	for state := StateNotStarted; state <= StateUpdateInProgress; state++ {
-		stateCounts[state] = map[string]int{"inbound": 0, "outbound": 0}
+		stateCounts[resourceStateToString(state)] = map[string]int{"inbound": 0, "outbound": 0}
 	}
+	stateCounts["unknown"] = map[string]int{"inbound": 0, "outbound": 0}
 
 	for _, opState := range dt.pendingServiceOps {
 		serviceType := "outbound"
 		if opState.Config.IsInbound {
 			serviceType = "inbound"
 		}
-		stateCounts[opState.State][serviceType]++
+		stateLabel := resourceStateToString(opState.State)
+		counts, ok := stateCounts[stateLabel]
+		if !ok {
+			// Defensive: resourceStateToString already collapses unknowns to the seeded "unknown"
+			// bucket, but never index a nil inner map even if its label set changes.
+			counts = map[string]int{"inbound": 0, "outbound": 0}
+			stateCounts[stateLabel] = counts
+		}
+		counts[serviceType]++
 	}
 
-	for state, typeCounts := range stateCounts {
+	for stateLabel, typeCounts := range stateCounts {
 		for serviceType, count := range typeCounts {
-			pendingServiceOperations.WithLabelValues(resourceStateToString(state), serviceType).Set(float64(count))
+			pendingServiceOperations.WithLabelValues(stateLabel, serviceType).Set(float64(count))
 		}
 	}
 }

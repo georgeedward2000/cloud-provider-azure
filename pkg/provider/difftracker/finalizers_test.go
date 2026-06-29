@@ -2,14 +2,19 @@ package difftracker
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -702,6 +707,170 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 		// Should not panic
 		dt.CheckPendingPodDeletions(ctx)
 	})
+}
+
+// TestGuardNonLastPodFinalizerRemovedOnlyAfterNRPDrain verifies the end-to-end contract for a
+// non-last egress pod deletion: DeletePod enqueues a drain-gated PendingPodDeletion (it does not
+// strip the finalizer inline), CheckPendingPodDeletions keeps the finalizer while the pod's
+// address is still in NRP, and removes it only once the address has been drained. This guards the
+// ordering that prevents the pod (and its IP) from being reclaimed while NRP still maps the
+// address to the service's NAT Gateway.
+func TestGuardNonLastPodFinalizerRemovedOnlyAfterNRPDrain(t *testing.T) {
+	ctx := context.Background()
+	uid := "egress-drain-gate"
+
+	// Pod "a" is the non-last pod we delete; pod "b" keeps the service (NAT Gateway) alive.
+	podA := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "a",
+			Namespace:  "ns",
+			Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
+		},
+	}
+	kube := fake.NewSimpleClientset(podA)
+
+	dt := newTestDiffTracker()
+	dt.kubeClient = kube
+	dt.NRPResources.NATGateways.Insert(uid)
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewOutboundServiceConfig(uid, nil),
+		State:      StateCreated,
+	}
+	dt.AddPod(uid, "ns/a", "10.0.0.1", "10.244.0.1")
+	dt.AddPod(uid, "ns/b", "10.0.0.1", "10.244.0.2")
+
+	// NRP currently still maps both addresses (the location sync has not drained "a" yet).
+	dt.NRPResources.Locations["10.0.0.1"] = NRPLocation{
+		Addresses: map[string]NRPAddress{
+			"10.244.0.1": {Services: utilsets.NewString(uid)},
+			"10.244.0.2": {Services: utilsets.NewString(uid)},
+		},
+	}
+
+	// Delete the non-last pod "a".
+	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "a")
+	assert.False(t, res.IsLastPod, "deleting one of two pods is not the last-pod case")
+
+	// It must be enqueued for drain-gated finalizer removal, not stripped inline.
+	ppd, ok := dt.pendingPodDeletions["ns/a"]
+	if assert.True(t, ok, "non-last pod must be enqueued for drain-gated finalizer removal") {
+		assert.False(t, ppd.IsLastPod)
+	}
+
+	// While the address is still in NRP, the finalizer must remain.
+	dt.CheckPendingPodDeletions(ctx)
+	got, err := kube.CoreV1().Pods("ns").Get(ctx, "a", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.True(t, hasPodFinalizer(got), "finalizer must NOT be removed before NRP drains the address")
+	assert.Len(t, dt.pendingPodDeletions, 1)
+
+	// Simulate the LocationsUpdater draining "a" from NRP.
+	loc := dt.NRPResources.Locations["10.0.0.1"]
+	delete(loc.Addresses, "10.244.0.1")
+	dt.NRPResources.Locations["10.0.0.1"] = loc
+
+	// Now the finalizer is removed and the tracking entry is cleaned up.
+	dt.CheckPendingPodDeletions(ctx)
+	got, err = kube.CoreV1().Pods("ns").Get(ctx, "a", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.False(t, hasPodFinalizer(got), "finalizer must be removed after NRP drains the address")
+	assert.Empty(t, dt.pendingPodDeletions)
+}
+
+// TestGuardNonLastPodFinalizerRetriesOnTransientUpdateError verifies that a transient
+// (non-conflict) failure while removing a non-last pod's finalizer does not strand the pod in
+// Terminating. removePodFinalizer only retries on 409 Conflict, so durability comes from the
+// per-cycle retry in CheckPendingPodDeletions: the pod stays enqueued and the finalizer is
+// removed on a later cycle once the API call succeeds.
+func TestGuardNonLastPodFinalizerRetriesOnTransientUpdateError(t *testing.T) {
+	ctx := context.Background()
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "p",
+			Namespace:  "ns",
+			Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
+		},
+	}
+	kube := fake.NewSimpleClientset(pod)
+
+	// Fail only the first finalizer-removing Update with a transient server error (HTTP 500),
+	// which is NOT a 409 Conflict and so is not retried inside removePodFinalizer.
+	failedOnce := false
+	kube.PrependReactor("update", "pods", func(_ ktesting.Action) (bool, runtime.Object, error) {
+		if !failedOnce {
+			failedOnce = true
+			return true, nil, apierrors.NewInternalError(fmt.Errorf("transient server error"))
+		}
+		return false, nil, nil
+	})
+
+	dt := &DiffTracker{
+		kubeClient:          kube,
+		pendingPodDeletions: make(map[string]*PendingPodDeletion),
+		NRPResources: NRPState{
+			Locations: make(map[string]NRPLocation), // address already drained from NRP
+		},
+	}
+	dt.pendingPodDeletions["ns/p"] = &PendingPodDeletion{
+		Namespace:  "ns",
+		Name:       "p",
+		ServiceUID: "egress-1",
+		Address:    "10.244.0.1",
+		Location:   "10.0.0.1",
+		IsLastPod:  false,
+		Timestamp:  time.Now().Format(time.RFC3339),
+	}
+
+	// First cycle: the Update fails transiently. The finalizer must remain and the pod must stay
+	// enqueued for retry rather than being stranded.
+	dt.CheckPendingPodDeletions(ctx)
+	got, err := kube.CoreV1().Pods("ns").Get(ctx, "p", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.True(t, hasPodFinalizer(got), "finalizer must remain after a transient Update error")
+	assert.Len(t, dt.pendingPodDeletions, 1, "pod must stay enqueued for retry after a transient error")
+
+	// Second cycle: the Update now succeeds, so the finalizer is removed and tracking cleared.
+	dt.CheckPendingPodDeletions(ctx)
+	got, err = kube.CoreV1().Pods("ns").Get(ctx, "p", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.False(t, hasPodFinalizer(got), "finalizer must be removed once the Update succeeds on retry")
+	assert.Empty(t, dt.pendingPodDeletions)
+}
+
+// TestGuardAddPodFinalizerRetriesOnConflict verifies that AddPodFinalizer survives a transient
+// 409 Conflict (which is expected because it runs during the pod's IP-assignment status burst)
+// by getting a fresh copy and retrying, rather than giving up and registering the pod for egress
+// with no finalizer.
+func TestGuardAddPodFinalizerRetriesOnConflict(t *testing.T) {
+	ctx := context.Background()
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "p",
+			Namespace: "ns",
+		},
+	}
+	kube := fake.NewSimpleClientset(pod)
+
+	// Fail the first Update with a 409 Conflict (stale resourceVersion), then allow it.
+	failedOnce := false
+	kube.PrependReactor("update", "pods", func(_ ktesting.Action) (bool, runtime.Object, error) {
+		if !failedOnce {
+			failedOnce = true
+			return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, "p", fmt.Errorf("stale resourceVersion"))
+		}
+		return false, nil, nil
+	})
+
+	dt := &DiffTracker{kubeClient: kube}
+
+	// Pass the stale informer copy (no finalizer); the implementation must Get-fresh and retry.
+	err := dt.AddPodFinalizer(ctx, pod.DeepCopy())
+	assert.NoError(t, err, "AddPodFinalizer must succeed after a transient conflict")
+
+	got, err := kube.CoreV1().Pods("ns").Get(ctx, "p", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.True(t, hasPodFinalizer(got), "finalizer must be present after the conflict is retried")
 }
 
 // ================================================================================================
