@@ -243,6 +243,16 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 //   - If StateDeletionPending/InProgress: ignore — deletion wins.
 //
 // Outbound services are not currently supported by this path.
+// resetRetryStateLocked clears a transient-failure park so a fresh external intent (a spec-changing
+// UpdateService, or a DeleteService) gets a clean retry budget instead of inheriting an exhausted or
+// still-backing-off one. Without this, a service parked after maxServiceRetries transient failures
+// would stay stranded until the CCM process restarts. Must be called with dt.mu held.
+func resetRetryStateLocked(op *ServiceOperationState) {
+	op.RetryCount = 0
+	op.RetriesExhausted = false
+	op.NextRetryAt = time.Time{}
+}
+
 func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 	defer func() {
 		updatePendingServiceOperationsMetric(dt)
@@ -316,7 +326,7 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 			dt.logger.V(5).Info("Reattempted service creation after terminal failure and spec change", "service", serviceUID)
 			opState.Config = config
 			opState.CreationFailedTerminal = false
-			opState.RetryCount = 0
+			resetRetryStateLocked(opState)
 			opState.State = StateNotStarted
 			opState.LastAttempt = time.Now().Format(time.RFC3339)
 			dt.mu.Unlock()
@@ -324,8 +334,20 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 			return
 		}
 		dt.logger.V(5).Info("Overwrote desired service config", "service", serviceUID, "state", opState.State)
+		recoverPark := false
+		if !configsEqualForUpdate(&opState.Config, &config) {
+			// A genuine spec change is fresh intent: clear any transient-failure park so the new
+			// config starts with a clean retry budget rather than inheriting an exhausted one.
+			recoverPark = opState.RetriesExhausted
+			resetRetryStateLocked(opState)
+		}
 		opState.Config = config
 		dt.mu.Unlock()
+		if recoverPark {
+			// The op had stopped dispatching after exhausting its budget; nudge the updater so the
+			// recovered op is picked up promptly instead of waiting for an unrelated trigger.
+			dt.triggerServiceUpdater()
+		}
 
 	case StateCreated:
 		if opState.LastAppliedConfig != nil &&
@@ -338,7 +360,7 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 		dt.logger.V(5).Info("Scheduled service update", "service", serviceUID)
 		opState.Config = config
 		opState.State = StateUpdateInProgress
-		opState.RetryCount = 0
+		resetRetryStateLocked(opState)
 		opState.LastAttempt = time.Now().Format(time.RFC3339)
 		dt.mu.Unlock()
 		dt.triggerServiceUpdater()
@@ -463,6 +485,12 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 			dt.logger.V(4).Info("Found unknown service operation state while deleting service", "state", state, "service", serviceUID)
 			return
 		}
+
+		// A delete is fresh external intent: clear any transient-failure park so the deletion gets
+		// a clean retry budget instead of inheriting an exhausted create budget. Otherwise a service
+		// parked after repeated create failures would never run its delete, leaking the Azure load
+		// balancer and public IP and leaving the Service stuck Terminating until the CCM restarts.
+		resetRetryStateLocked(opState)
 	}
 
 	// Clear any buffered endpoints/pods for this service

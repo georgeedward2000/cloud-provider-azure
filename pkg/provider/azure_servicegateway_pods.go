@@ -225,11 +225,13 @@ func (az *Cloud) podInformerAddPod(pod *v1.Pod) {
 		podKey, egressName, pod.Status.HostIP, pod.Status.PodIP)
 
 	// Add pod finalizer before registering with engine. AddPodFinalizer already retries with
-	// backoff, so a failure here means a sustained apiserver outage during the pod's IP burst.
-	// We deliberately still register the pod (returning would silently kill its egress), but the
-	// pod is now synced into NRP WITHOUT the cleanup finalizer, so it lacks NRP-drain protection
-	// on a later delete. Make that rare, unprotected state observable via a metric + warning Event
-	// rather than only a log line.
+	// backoff; this runs synchronously on the dedicated, label-filtered egress informer, so the
+	// bounded (~1.5s) wait can only delay other egress pod events, never the main CCM informers.
+	// A failure here means a sustained apiserver outage during the pod's IP burst. We deliberately
+	// still register the pod (returning would silently kill its egress), but the pod is now synced
+	// into NRP WITHOUT the cleanup finalizer, so it lacks NRP-drain protection on a later delete.
+	// Make that rare, unprotected state observable via a metric + warning Event rather than only a
+	// log line.
 	if err := az.diffTracker.AddPodFinalizer(context.Background(), pod); err != nil {
 		klog.Warningf("podInformerAddPod: registering egress pod %s WITHOUT cleanup finalizer after retries: %v", podKey, err)
 		difftracker.RecordPodFinalizerAddFailed()
