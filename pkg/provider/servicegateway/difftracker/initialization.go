@@ -16,6 +16,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	utilnet "k8s.io/utils/net"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
@@ -68,8 +69,10 @@ func InitializeFromCluster(
 		return nil, err
 	}
 
-	// Build K8s state from cluster (also returns lists for reuse by recoverStuckFinalizers)
-	k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, nodeNameToIPMap, err := buildK8sState(ctx, kubeClient)
+	// Build K8s state from cluster (also returns lists for reuse by recoverStuckFinalizers).
+	// The node-IPs map is consumed inside buildK8sState (for family-matched location keys) and is
+	// not needed again here.
+	k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, _, err := buildK8sState(ctx, kubeClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build K8s state: %w", err)
 	}
@@ -97,7 +100,7 @@ func InitializeFromCluster(
 	// Recover resources stuck with finalizers from a previous crash
 	// This must happen BEFORE informers start to avoid race conditions
 	// Reuse lists from buildK8sState (avoids duplicate API calls)
-	recoverStuckFinalizers(ctx, diffTracker, nodeNameToIPMap, serviceList, egressPodList, endpointSliceList, currentLoadBalancersInNRP, currentNATGatewaysInNRP, pipNameToIP)
+	recoverStuckFinalizers(ctx, diffTracker, serviceList, egressPodList, endpointSliceList, currentLoadBalancersInNRP, currentNATGatewaysInNRP, pipNameToIP)
 
 	// Counter already initialized from K8s state during buildK8sState
 	// After initialization sync completes, NRP will match K8s, so counter reflects final state
@@ -122,10 +125,10 @@ func InitializeFromCluster(
 	diffTracker.reconcileServices(syncOperations, serviceUIDToService)
 
 	// Schedule deletion of orphaned Azure resources via ServiceUpdater.
-	// Orphaned resources are LBs/NATs that exist in Azure but NOT in ServiceGateway.
+	// Orphaned resources are LBs/NATs/PIPs that exist in Azure but NOT in ServiceGateway.
 	// This happens when services are deleted while CCM is down, or from failed operations.
 	// We add them to NRPResources and call DeleteService to use the standard async deletion flow.
-	scheduleOrphanedResourceDeletions(diffTracker, currentLoadBalancersInNRP, currentNATGatewaysInNRP)
+	scheduleOrphanedResourceDeletions(diffTracker, currentLoadBalancersInNRP, currentNATGatewaysInNRP, pipNameToIP)
 
 	// Trigger initial location sync if needed:
 	// - For deletions: Clear orphaned locations so services can be deleted
@@ -195,20 +198,21 @@ func validateInitializationInputs(kubeClient kubernetes.Interface, networkClient
 	return nil
 }
 
-// buildK8sState fetches and constructs the complete K8s state (services, endpoints, egresses)
-// Also returns nodeNameToIPMap for reuse in recovery operations.
+// buildK8sState fetches and constructs the complete K8s state (services, endpoints, egresses).
+// Also returns the node-name -> all-internal-IPs map (used internally for family-matched location
+// keys); callers may ignore it.
 func buildK8sState(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
-) (K8sState, *v1.ServiceList, map[string]*v1.Service, *discoveryv1.EndpointSliceList, *v1.PodList, map[string]string, error) {
+) (K8sState, *v1.ServiceList, map[string]*v1.Service, *discoveryv1.EndpointSliceList, *v1.PodList, map[string][]string, error) {
 	k8s := K8sState{
 		Services: utilsets.NewString(),
 		Egresses: utilsets.NewString(),
 		Nodes:    make(map[string]Node),
 	}
 
-	// Build node name to IP mapping
-	nodeNameToIPMap, err := buildNodeNameToIPMap(ctx, kubeClient)
+	// Build node name to IPs mapping (all internal IPs per node, both families on dual-stack)
+	nodeNameToIPsMap, err := buildNodeNameToIPsMap(ctx, kubeClient)
 	if err != nil {
 		return K8sState{}, nil, nil, nil, nil, nil, err
 	}
@@ -220,22 +224,26 @@ func buildK8sState(
 	}
 
 	// Fetch and process endpoint slices
-	endpointSliceList, err := processK8sEndpoints(ctx, kubeClient, &k8s, nodeNameToIPMap)
+	endpointSliceList, err := processK8sEndpoints(ctx, kubeClient, &k8s, nodeNameToIPsMap)
 	if err != nil {
 		return K8sState{}, nil, nil, nil, nil, nil, err
 	}
 
 	// Fetch and process egress pods
-	egressPodList, err := processK8sEgresses(ctx, kubeClient, &k8s, nodeNameToIPMap)
+	egressPodList, err := processK8sEgresses(ctx, kubeClient, &k8s)
 	if err != nil {
 		return K8sState{}, nil, nil, nil, nil, nil, err
 	}
 
-	return k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, nodeNameToIPMap, nil
+	return k8s, serviceList, serviceUIDToService, endpointSliceList, egressPodList, nodeNameToIPsMap, nil
 }
 
-// buildNodeNameToIPMap creates a mapping from node names to their internal IPs
-func buildNodeNameToIPMap(ctx context.Context, kubeClient kubernetes.Interface) (map[string]string, error) {
+// buildNodeNameToIPsMap maps each node name to ALL of its NodeInternalIPs. On a dual-stack node
+// this includes both the IPv4 and IPv6 internal IP. Keeping every family (rather than only the
+// first one) lets init pick the IP-family-matched location key, mirroring the runtime EndpointSlice
+// path (getPodIPToNodeIPMapFromEndpointSlice) so init and runtime agree on the location key for the
+// same pod. A mismatch would orphan IPv6 (or IPv4) locations across a CCM restart.
+func buildNodeNameToIPsMap(ctx context.Context, kubeClient kubernetes.Interface) (map[string][]string, error) {
 	logger := log.FromContextOrBackground(ctx)
 	nodeList, err := kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -243,18 +251,41 @@ func buildNodeNameToIPMap(ctx context.Context, kubeClient kubernetes.Interface) 
 	}
 	logger.V(2).Info("Listed Kubernetes nodes", "nodes", len(nodeList.Items))
 
-	nodeNameToIPMap := make(map[string]string, len(nodeList.Items))
+	nodeNameToIPsMap := make(map[string][]string, len(nodeList.Items))
 	for i := range nodeList.Items {
 		n := &nodeList.Items[i]
 		for _, addr := range n.Status.Addresses {
 			if addr.Type == v1.NodeInternalIP {
-				nodeNameToIPMap[n.Name] = addr.Address
-				break
+				nodeNameToIPsMap[n.Name] = append(nodeNameToIPsMap[n.Name], addr.Address)
 			}
 		}
 	}
-	logger.V(4).Info("Built node IP map", "nodes", len(nodeNameToIPMap))
-	return nodeNameToIPMap, nil
+	logger.V(4).Info("Built node IPs map", "nodes", len(nodeNameToIPsMap))
+	return nodeNameToIPsMap, nil
+}
+
+// nodeIPForEndpointSlice returns the node InternalIP whose IP family matches the EndpointSlice's
+// AddressType, mirroring the runtime getPodIPToNodeIPMapFromEndpointSlice selection. ok is false
+// for an unsupported AddressType (e.g. FQDN — not a PodIP backend address) or when the node has no
+// internal IP of the required family. This keeps the init-time location key identical to the
+// runtime key so the restart diff is empty for an unchanged dual-stack cluster.
+func nodeIPForEndpointSlice(nodeIPs []string, addressType discoveryv1.AddressType) (string, bool) {
+	var wantIPv6 bool
+	switch addressType {
+	case discoveryv1.AddressTypeIPv4:
+		wantIPv6 = false
+	case discoveryv1.AddressTypeIPv6:
+		wantIPv6 = true
+	default:
+		// FQDN or unknown AddressType: not a PodIP backend address, skip.
+		return "", false
+	}
+	for _, ip := range nodeIPs {
+		if utilnet.IsIPv6String(ip) == wantIPv6 {
+			return ip, true
+		}
+	}
+	return "", false
 }
 
 // ================================================================================================
@@ -283,7 +314,6 @@ func buildNodeNameToIPMap(ctx context.Context, kubeClient kubernetes.Interface) 
 func recoverStuckFinalizers(
 	ctx context.Context,
 	dt *DiffTracker,
-	nodeNameToIPMap map[string]string,
 	services *v1.ServiceList,
 	egressPods *v1.PodList,
 	endpointSlices *discoveryv1.EndpointSliceList,
@@ -395,12 +425,11 @@ func recoverStuckFinalizers(
 				continue
 			}
 
-			// Get addresses - may be empty if pod was already terminating
+			// Get addresses - may be empty if pod was already terminating. Use pod.Status.HostIP as
+			// the location, matching the runtime egress path (AddPod/DeletePod) and processK8sEgresses,
+			// so the drain-gated finalizer entry targets the same NRP location runtime uses.
 			podIP := pod.Status.PodIP
-			nodeIP := ""
-			if pod.Spec.NodeName != "" {
-				nodeIP = nodeNameToIPMap[pod.Spec.NodeName]
-			}
+			nodeIP := pod.Status.HostIP
 
 			// If we don't have addresses, we can't track for sync through DeletePod
 			// (DeletePod rejects empty location/address). Directly remove finalizer since
@@ -510,7 +539,7 @@ func processK8sEndpoints(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
 	k8s *K8sState,
-	nodeNameToIPMap map[string]string,
+	nodeNameToIPsMap map[string][]string,
 ) (*discoveryv1.EndpointSliceList, error) {
 	logger := log.FromContextOrBackground(ctx)
 	endpointSliceList, err := kubeClient.DiscoveryV1().EndpointSlices(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
@@ -546,9 +575,13 @@ func processK8sEndpoints(
 				continue
 			}
 
-			nodeIP, exists := nodeNameToIPMap[*endpoint.NodeName]
-			if !exists {
-				logger.V(5).Info("Could not find node IP", "node", *endpoint.NodeName)
+			// Use the node InternalIP whose family matches the EndpointSlice AddressType,
+			// matching the runtime path (getPodIPToNodeIPMapFromEndpointSlice). Without this an
+			// IPv6 slice would be keyed under the node's IPv4 InternalIP at init while runtime
+			// keys it under the IPv6 InternalIP, orphaning the IPv6 location across a restart.
+			nodeIP, ok := nodeIPForEndpointSlice(nodeNameToIPsMap[*endpoint.NodeName], endpointSlice.AddressType)
+			if !ok {
+				logger.V(5).Info("Skipped endpoint: no family-matched node IP or unsupported AddressType", "node", *endpoint.NodeName, "addressType", endpointSlice.AddressType)
 				continue
 			}
 
@@ -571,7 +604,6 @@ func processK8sEgresses(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
 	k8s *K8sState,
-	nodeNameToIPMap map[string]string,
 ) (*v1.PodList, error) {
 	logger := log.FromContextOrBackground(ctx)
 	egressPods, err := kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
@@ -590,18 +622,19 @@ func processK8sEgresses(
 		}
 
 		egressVal := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
-		if egressVal == "" || pod.Status.PodIP == "" || pod.Spec.NodeName == "" || !IsValidEgressIdentity(egressVal) {
-			logger.V(5).Info("Skipped invalid egress pod", "namespace", pod.Namespace, "pod", pod.Name, "label", egressVal, "podIP", pod.Status.PodIP, "node", pod.Spec.NodeName)
+		if egressVal == "" || pod.Status.PodIP == "" || pod.Status.HostIP == "" || pod.Spec.NodeName == "" || !IsValidEgressIdentity(egressVal) {
+			logger.V(5).Info("Skipped invalid egress pod", "namespace", pod.Namespace, "pod", pod.Name, "label", egressVal, "podIP", pod.Status.PodIP, "hostIP", pod.Status.HostIP, "node", pod.Spec.NodeName)
 			continue
 		}
 
 		k8s.Egresses.Insert(egressVal)
 
-		nodeIP, exists := nodeNameToIPMap[pod.Spec.NodeName]
-		if !exists {
-			logger.V(5).Info("Could not find node IP", "node", pod.Spec.NodeName)
-			continue
-		}
+		// Use pod.Status.HostIP as the location key, matching the runtime egress path
+		// (podInformerAddPod -> AddPod(egressName, podKey, pod.Status.HostIP, pod.Status.PodIP)).
+		// Keying by a node-list InternalIP instead would diverge from runtime on dual-stack nodes
+		// (where HostIP may be a different family than the node's first InternalIP), orphaning the
+		// egress location across a CCM restart.
+		nodeIP := pod.Status.HostIP
 
 		ensureNodeExists(k8s, nodeIP)
 		addOutboundIdentityToPod(k8s, nodeIP, pod.Status.PodIP, egressVal)
@@ -861,11 +894,11 @@ func performReconciliation(
 	diffTracker.reconcileServices(syncOps, serviceUIDToService)
 
 	// Reconcile inbound endpoints
-	nodeNameToIPMap, err := buildNodeNameToIPMap(context.Background(), diffTracker.kubeClient)
+	nodeNameToIPsMap, err := buildNodeNameToIPsMap(context.Background(), diffTracker.kubeClient)
 	if err != nil {
 		return fmt.Errorf("failed to rebuild node name map: %w", err)
 	}
-	diffTracker.reconcileInboundEndpoints(nrp, endpointSliceList, nodeNameToIPMap)
+	diffTracker.reconcileInboundEndpoints(nrp, endpointSliceList, nodeNameToIPsMap)
 
 	// Reconcile outbound pods
 	diffTracker.reconcileOutboundPods(nrp, k8sNodes)
@@ -967,10 +1000,10 @@ func recoverServiceExternalIPs(ctx context.Context, diffTracker *DiffTracker, se
 //
 // If a resource exists in K8s, reconcileServices will handle it - don't delete it!
 // This uses the Engine's DeleteService flow with isOrphan=true to bypass the NRP existence check.
-func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzure, currentNATsInAzure *utilsets.IgnoreCaseSet) {
+func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzure, currentNATsInAzure *utilsets.IgnoreCaseSet, pipNameToIP map[string]string) {
 	logger := log.Background().WithName("difftracker")
 
-	var orphanedLBs, orphanedNATs []string
+	var orphanedLBs, orphanedNATs, orphanedPIPOnly []string
 
 	diffTracker.mu.Lock()
 
@@ -1013,15 +1046,53 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 		}
 	}
 
+	// Find orphaned PIP-ONLY services: a "<uid>-pip" Public IP exists in Azure with NO associated
+	// LoadBalancer or NAT Gateway anywhere (NRP or Azure) and the service is not desired in K8s.
+	// This is the crash-after-PIP-before-LB case: recoverStuckFinalizers KEEPS the stuck Service's
+	// finalizer because the PIP exists, expecting orphan cleanup to delete the resource AND remove
+	// the finalizer. cleanupOrphanedPublicIPs deletes the PIP but does NOT remove the finalizer, so
+	// without scheduling a real deletion here the Service would strand in Terminating forever.
+	// Routing through DeleteService(isOrphan) runs deleteInboundService, which deletes the PIP
+	// (Step 4) AND removes the finalizer (Step 6); the missing LB/SGW steps are 404-safe no-ops.
+	orphanLBSet := utilsets.NewString(orphanedLBs...)
+	for pipName := range pipNameToIP {
+		if !strings.HasSuffix(pipName, "-pip") || pipName == "default-natgw-pip" {
+			continue
+		}
+		uid := strings.TrimSuffix(pipName, "-pip")
+		// Only our managed UUID-named services own a "<uid>-pip".
+		if !isValidServiceUUID(uid) {
+			continue
+		}
+		// Desired in K8s (inbound or egress) → reconcileServices re-creates idempotently; not orphaned.
+		if diffTracker.K8sResources.Services.Has(uid) || diffTracker.K8sResources.Egresses.Has(uid) {
+			continue
+		}
+		// Has an LB/NAT registered in NRP or present in Azure → not PIP-only (handled elsewhere,
+		// and those deletion paths delete the PIP themselves).
+		if diffTracker.NRPResources.LoadBalancers.Has(uid) || diffTracker.NRPResources.NATGateways.Has(uid) {
+			continue
+		}
+		if (currentLBsInAzure != nil && currentLBsInAzure.Has(uid)) ||
+			(currentNATsInAzure != nil && currentNATsInAzure.Has(uid)) {
+			continue
+		}
+		// Already scheduled as an orphaned LB (its deletion deletes the PIP too) → don't double-schedule.
+		if orphanLBSet.Has(uid) {
+			continue
+		}
+		orphanedPIPOnly = append(orphanedPIPOnly, uid)
+	}
+
 	diffTracker.mu.Unlock()
 
-	totalOrphans := len(orphanedLBs) + len(orphanedNATs)
+	totalOrphans := len(orphanedLBs) + len(orphanedNATs) + len(orphanedPIPOnly)
 	if totalOrphans == 0 {
 		logger.V(2).Info("Found no orphaned Azure resources")
 		return
 	}
 
-	logger.V(2).Info("Found orphaned Azure resources", "loadBalancers", len(orphanedLBs), "natGateways", len(orphanedNATs))
+	logger.V(2).Info("Found orphaned Azure resources", "loadBalancers", len(orphanedLBs), "natGateways", len(orphanedNATs), "pipOnly", len(orphanedPIPOnly))
 
 	// Schedule orphaned LBs for deletion
 	for _, lbName := range orphanedLBs {
@@ -1034,6 +1105,16 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 	for _, natName := range orphanedNATs {
 		logger.V(5).Info("Scheduled orphaned NAT gateway deletion", "natGateway", natName)
 		diffTracker.DeleteService(natName, false, true) // outbound, isOrphan=true
+		recordOrphanedResourceCleaned()
+	}
+
+	// Schedule orphaned PIP-only services for deletion. Use the inbound path: deleteInboundService
+	// deletes the "<uid>-pip" Public IP and removes the service finalizer, which is the anchor a
+	// crash-after-PIP left stranded. (An egress service's finalizer lives on its pods, handled by
+	// the pod-finalizer recovery; an inbound service's finalizer is on the Service object.)
+	for _, uid := range orphanedPIPOnly {
+		logger.V(5).Info("Scheduled orphaned PIP-only service deletion", "service", uid)
+		diffTracker.DeleteService(uid, true, true) // inbound, isOrphan=true
 		recordOrphanedResourceCleaned()
 	}
 
@@ -1266,7 +1347,7 @@ func extractOldEndpointsFromNRP(serviceUID string, nrp NRPState) map[string]stri
 
 // extractNewEndpointsFromK8s extracts endpoint state from K8s endpointslices for a given service
 // Returns map[podIP]nodeIP
-func extractNewEndpointsFromK8s(serviceUID string, endpointSliceList *discoveryv1.EndpointSliceList, nodeNameToIPMap map[string]string) map[string]string {
+func extractNewEndpointsFromK8s(serviceUID string, endpointSliceList *discoveryv1.EndpointSliceList, nodeNameToIPsMap map[string][]string) map[string]string {
 	logger := log.Background().WithName("difftracker")
 	newEndpoints := make(map[string]string)
 
@@ -1290,9 +1371,11 @@ func extractNewEndpointsFromK8s(serviceUID string, endpointSliceList *discoveryv
 				continue
 			}
 
-			nodeIP, exists := nodeNameToIPMap[*endpoint.NodeName]
-			if !exists {
-				logger.V(5).Info("Could not find node IP", "node", *endpoint.NodeName)
+			// Family-matched node IP keyed by the EndpointSlice AddressType, matching the runtime
+			// path so the restart diff is empty for an unchanged dual-stack cluster.
+			nodeIP, ok := nodeIPForEndpointSlice(nodeNameToIPsMap[*endpoint.NodeName], endpointSlice.AddressType)
+			if !ok {
+				logger.V(5).Info("Skipped endpoint: no family-matched node IP or unsupported AddressType", "node", *endpoint.NodeName, "addressType", endpointSlice.AddressType)
 				continue
 			}
 
@@ -1444,7 +1527,7 @@ func (dt *DiffTracker) reconcileServices(syncOps *SyncDiffTrackerReturnType, ser
 //
 // reconcileInboundEndpoints reconciles endpoints for all inbound (LoadBalancer) services
 // Calls UpdateEndpoints with old state from NRP and new state from K8s
-func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRPState, endpointSliceList *discoveryv1.EndpointSliceList, nodeNameToIPMap map[string]string) {
+func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRPState, endpointSliceList *discoveryv1.EndpointSliceList, nodeNameToIPsMap map[string][]string) {
 	logger.Infof("reconcileInboundEndpoints: starting endpoint reconciliation")
 
 	// Build union of all services: K8s services + NRP services
@@ -1466,7 +1549,7 @@ func (dt *DiffTracker) reconcileInboundEndpoints(nrp NRPState, endpointSliceList
 		oldEndpoints := extractOldEndpointsFromNRP(serviceUID, nrp)
 
 		// Extract new endpoints from K8s
-		newEndpoints := extractNewEndpointsFromK8s(serviceUID, endpointSliceList, nodeNameToIPMap)
+		newEndpoints := extractNewEndpointsFromK8s(serviceUID, endpointSliceList, nodeNameToIPsMap)
 
 		// Only call UpdateEndpoints if there's a difference
 		if len(oldEndpoints) > 0 || len(newEndpoints) > 0 {

@@ -13,6 +13,7 @@ You may obtain a copy of the License at
 package difftracker
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -364,4 +365,104 @@ func TestUpdateService_RecreateAfterDeletionReplays(t *testing.T) {
 	default:
 		t.Fatal("replay path MUST nudge the ServiceUpdater so the fresh create dispatches")
 	}
+}
+
+// TestUpdateService_RecreateAfterDeletionPreservesEndpoints verifies that a
+// LoadBalancer->ClusterIP->LoadBalancer toggle caught mid-deletion keeps its backend endpoints. When
+// IsServiceRecreating is true the provider re-seeds endpoints via UpdateEndpoints; the engine buffers
+// them during the deletion window (RecreateAfterDeletion) and promotePendingEndpointsLocked replays
+// them when the recreate's create completes, instead of bringing the LB back with an empty pool.
+func TestUpdateService_RecreateAfterDeletionPreservesEndpoints(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-recreate-endpoints"
+	const node, addr = "10.0.0.2", "10.244.0.2"
+
+	cfg := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	applied := cfg
+	dt.NRPResources.LoadBalancers.Insert(uid)
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:        uid,
+		Config:            cfg,
+		LastAppliedConfig: &applied,
+		State:             StateCreated,
+	}
+	// One live endpoint backing the service, present in both K8s and NRP.
+	pod := newPod()
+	pod.InboundIdentities.Insert(uid)
+	n := newNode()
+	n.Pods[addr] = pod
+	dt.K8sResources.Nodes[node] = n
+	dt.NRPResources.Locations[node] = NRPLocation{
+		Addresses: map[string]NRPAddress{addr: {Services: utilsets.NewString(uid)}},
+	}
+
+	// Service -> ClusterIP: delete (locations present -> StateDeletionPending, K8s state scrubbed).
+	dt.DeleteService(uid, true, false)
+	// Service -> LoadBalancer again while deleting: UpdateService queues the recreate.
+	dt.UpdateService(NewInboundServiceConfig(uid, makeInboundConfig(80)))
+	assert.True(t, dt.IsServiceRecreating(uid), "the recreate must be queued so the provider re-seeds endpoints")
+
+	// The provider re-seeds the current endpoints; the engine buffers them (RecreateAfterDeletion).
+	dt.UpdateEndpoints(uid, nil, map[string]string{addr: node})
+
+	// Locations drain; CheckPendingServiceDeletions promotes the op and the delete dispatches.
+	delete(dt.NRPResources.Locations, node)
+	dt.CheckPendingServiceDeletions()
+	// Delete completes -> deletion-success replays the create (StateNotStarted).
+	dt.OnServiceCreationComplete(uid, true, nil)
+	// Create dispatch + success -> promotePendingEndpointsLocked replays the buffered endpoints.
+	dt.mu.Lock()
+	dt.pendingServiceOps[uid].State = StateCreationInProgress
+	dt.mu.Unlock()
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	got, ok := dt.K8sResources.Nodes[node]
+	if !assert.True(t, ok, "the recreated service must retain its backing node/endpoints") {
+		return
+	}
+	p, ok := got.Pods[addr]
+	if !assert.True(t, ok, "the recreated service must retain its backing pod address") {
+		return
+	}
+	assert.True(t, p.InboundIdentities.Has(uid),
+		"the recreated service's backend identity must be preserved, not dropped on recreate")
+}
+
+// TestUpdateEndpoints_TerminalUpdateKeepsApplyingToLiveLB verifies that after a terminal update
+// failure parks the op in StateNotStarted while its LB stays live in NRP, a later endpoint change is
+// applied to the live backend pool rather than buffered behind the parked op (which would let the
+// pool go stale until an unrelated spec change un-parks the op).
+func TestUpdateEndpoints_TerminalUpdateKeepsApplyingToLiveLB(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-terminal-update-live-lb"
+	const node, addr = "10.0.0.5", "10.244.0.5"
+
+	cfg := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	applied := cfg
+	dt.NRPResources.LoadBalancers.Insert(uid) // the LB exists and stays live
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:        uid,
+		Config:            cfg,
+		LastAppliedConfig: &applied,
+		InFlightConfig:    &applied,
+		State:             StateUpdateInProgress,
+	}
+
+	// A terminal update failure parks the op in StateNotStarted while the LB remains in NRP.
+	dt.OnServiceCreationComplete(uid, false, newTerminalError(fmt.Errorf("dual-stack not supported")))
+	assert.Equal(t, StateNotStarted, dt.pendingServiceOps[uid].State, "a terminal update must park the op in StateNotStarted")
+
+	// A later endpoint update must still be applied to the live LB, not buffered.
+	dt.UpdateEndpoints(uid, nil, map[string]string{addr: node})
+
+	assert.Empty(t, dt.pendingEndpoints[uid],
+		"with a live LB in NRP, an endpoint update must be applied, not buffered behind the parked update")
+	n, ok := dt.K8sResources.Nodes[node]
+	if !assert.True(t, ok, "the endpoint update must be applied to K8s state while the LB is live") {
+		return
+	}
+	p, ok := n.Pods[addr]
+	assert.True(t, ok && p.InboundIdentities.Has(uid), "the applied endpoint must back the live LB")
 }

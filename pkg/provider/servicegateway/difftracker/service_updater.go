@@ -145,26 +145,20 @@ const parkReArmCooldown = 5 * time.Minute
 func (s *ServiceUpdater) retryGate(serviceUID string, opState *ServiceOperationState) bool {
 	// Terminal ceiling: stop re-dispatching after exhausting the retry budget.
 	if opState.RetryCount >= maxServiceRetries {
-		// A parked delete has no external driver to re-arm it: the upstream service controller removes
-		// its own load-balancer finalizer on the first (async) delete and then stops calling
-		// EnsureLoadBalancerDeleted, so unlike create/update (which its periodic resync re-drives via
-		// UpdateService) a parked delete would otherwise strand the Service in Terminating until the
-		// CCM restarts. Self-arm it: park for a cooldown, schedule a self-driven revisit, then re-arm
-		// once the cooldown elapses.
-		isDelete := opState.State == StateDeletionInProgress
+		// A parked op has no external driver on a stable cluster, so it must self-arm or it strands
+		// until CCM restart: the controller does not re-drive an unchanged Service (resync's
+		// UpdateFunc(obj, obj) -> needsUpdate=false; UpdateLoadBalancer is a no-op in ServiceGateway
+		// mode), and a parked delete also loses its caller once the controller drops its own
+		// load-balancer finalizer. Park for a cooldown, schedule a revisit, then re-arm once it
+		// elapses; a still-failing op re-parks, bounding retries to one burst per cooldown.
 		if !opState.RetriesExhausted {
 			opState.RetriesExhausted = true
-			// Record when the op may be re-armed so a resync (or, for a delete, the self-driven
-			// revisit below) can recover it after the outage.
 			opState.NextRetryAt = time.Now().Add(parkReArmCooldown)
 			s.logger.Info("Giving up service operation after exhausting retries",
 				"serviceUID", serviceUID, "state", opState.State, "retries", opState.RetryCount)
-			if isDelete {
-				time.AfterFunc(parkReArmCooldown, s.diffTracker.triggerServiceUpdater)
-			}
-		} else if isDelete && !opState.NextRetryAt.IsZero() && time.Now().After(opState.NextRetryAt) {
-			// The cooldown since the delete parked has elapsed: re-arm it once so the deletion (and
-			// SGW finalizer removal) dispatches again this pass.
+			time.AfterFunc(parkReArmCooldown, s.diffTracker.triggerServiceUpdater)
+		} else if !opState.NextRetryAt.IsZero() && time.Now().After(opState.NextRetryAt) {
+			// Cooldown elapsed: re-arm once so the op dispatches again this pass.
 			resetRetryStateLocked(opState)
 			return false
 		}

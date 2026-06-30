@@ -251,11 +251,14 @@ func TestParkedDelete_SelfReArmsAfterCooldown(t *testing.T) {
 	assert.Equal(t, 0, op.RetryCount, "the parked delete must get a fresh retry budget")
 }
 
-// TestParkedCreate_NotSelfReArmedByRetryGate verifies that the self-rearm is delete-only: a parked
-// create past its cooldown stays gated in retryGate, because create/update recover through the
-// upstream controller's periodic resync via UpdateService (covered by
-// TestGuardRetriesExhaustedPark_CreateRecoversAfterCooldown), which a delete has no equivalent of.
-func TestParkedCreate_NotSelfReArmedByRetryGate(t *testing.T) {
+// TestParkedCreate_SelfReArmsAfterCooldown verifies that a create parked after exhausting its retry
+// budget re-arms itself in retryGate once the cooldown has elapsed, without depending on any external
+// driver. On a stable cluster the upstream controller does NOT re-drive an unchanged Service - its
+// periodic resync calls UpdateFunc(obj, obj) -> needsUpdate=false, and UpdateLoadBalancer is a no-op
+// in ServiceGateway mode - so without this self-rearm the parked create strands until a CCM restart
+// and its load balancer and public IP are never provisioned. Within the cooldown it must stay gated,
+// to bound retries to one burst per cooldown.
+func TestParkedCreate_SelfReArmsAfterCooldown(t *testing.T) {
 	dt := newTestDiffTracker()
 	su := newTestServiceUpdater(dt)
 	uid := "svc-parked-create-cooldown"
@@ -266,13 +269,45 @@ func TestParkedCreate_NotSelfReArmedByRetryGate(t *testing.T) {
 		State:            StateNotStarted,
 		RetryCount:       maxServiceRetries,
 		RetriesExhausted: true,
+		NextRetryAt:      time.Now().Add(time.Hour), // cooldown still pending
+	}
+
+	// While the cooldown is pending the parked create stays gated (no per-resync storm).
+	assert.True(t, gatedByRetry(su, dt, uid),
+		"a parked create within its cooldown must stay gated")
+	assert.True(t, dt.pendingServiceOps[uid].RetriesExhausted, "the create must remain parked during the cooldown")
+
+	// Once the cooldown elapses, retryGate must re-arm the parked create itself.
+	dt.pendingServiceOps[uid].NextRetryAt = time.Now().Add(-time.Minute)
+	assert.False(t, gatedByRetry(su, dt, uid),
+		"a parked create past its cooldown must self-rearm in retryGate (no external driver re-drives it on a stable cluster)")
+	op := dt.pendingServiceOps[uid]
+	assert.False(t, op.RetriesExhausted, "the parked create must be re-armed (park cleared)")
+	assert.Equal(t, 0, op.RetryCount, "the parked create must get a fresh retry budget")
+}
+
+// TestParkedUpdate_SelfReArmsAfterCooldown covers the update path: an op parked while updating
+// re-arms itself in retryGate once the cooldown elapses, so a stable Service applies its pending
+// config instead of serving stale config until a CCM restart.
+func TestParkedUpdate_SelfReArmsAfterCooldown(t *testing.T) {
+	dt := newTestDiffTracker()
+	su := newTestServiceUpdater(dt)
+	uid := "svc-parked-update-cooldown"
+
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:       uid,
+		Config:           NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:            StateUpdateInProgress,
+		RetryCount:       maxServiceRetries,
+		RetriesExhausted: true,
 		NextRetryAt:      time.Now().Add(-time.Minute), // cooldown elapsed
 	}
 
-	assert.True(t, gatedByRetry(su, dt, uid),
-		"retryGate must not self-rearm a parked create; it recovers via UpdateService on the next resync")
+	assert.False(t, gatedByRetry(su, dt, uid),
+		"a parked update past its cooldown must self-rearm in retryGate")
 	op := dt.pendingServiceOps[uid]
-	assert.True(t, op.RetriesExhausted, "the parked create must stay parked in retryGate")
+	assert.False(t, op.RetriesExhausted, "the parked update must be re-armed (park cleared)")
+	assert.Equal(t, 0, op.RetryCount, "the parked update must get a fresh retry budget")
 }
 
 // TestParkedDelete_SkippedDuringCooldown verifies that a delete which has exhausted its retry budget

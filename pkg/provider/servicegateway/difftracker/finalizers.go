@@ -287,6 +287,12 @@ func (dt *DiffTracker) AddPodFinalizer(ctx context.Context, pod *v1.Pod) error {
 func (dt *DiffTracker) removePodFinalizer(ctx context.Context, pod *v1.Pod) error {
 	namespace := pod.Namespace
 	name := pod.Name
+	// Capture the UID of the pod we were asked to act on. A namespace/name can be reused by a
+	// same-name replacement pod after the original is deleted (UIDs are unique in time and space),
+	// so the Get-fresh below may return a different pod instance. Stripping that replacement's
+	// finalizer would drop its NRP-drain protection. An empty intendedUID preserves the legacy
+	// ns/name behaviour for callers that do not carry a UID.
+	intendedUID := string(pod.UID)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Always get the latest version of the pod to avoid conflicts
@@ -298,6 +304,14 @@ func (dt *DiffTracker) removePodFinalizer(ctx context.Context, pod *v1.Pod) erro
 				return nil
 			}
 			return err
+		}
+
+		// The named pod is now a different instance (the original target was deleted and a
+		// same-name pod recreated). Do not strip the replacement's finalizer; the original's
+		// finalizer left with it when it was deleted.
+		if intendedUID != "" && string(currentPod.UID) != intendedUID {
+			dt.logger.V(4).Info("Pod UID changed (replacement pod); not stripping finalizer", "namespace", namespace, "name", name, "wantUID", intendedUID, "gotUID", string(currentPod.UID))
+			return nil
 		}
 
 		if !hasPodFinalizer(currentPod) {

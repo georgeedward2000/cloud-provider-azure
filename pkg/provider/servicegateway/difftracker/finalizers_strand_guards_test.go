@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
 // TestGuardCheckPendingPodDeletions_TransientGetErrorKeepsEntryForRetry verifies that in
@@ -163,4 +164,57 @@ func TestGuardLocationsUpdaterReschedulesOnReadyFinalizerRemovalFailure(t *testi
 
 	assert.Equal(t, 1, lu.failureCount,
 		"a ready non-last finalizer removal that fails transiently post-init must reschedule a retry (backoffAndRetry), not report success")
+}
+
+// TestGuardOrphanCleanup_PIPOnlyServiceScheduledForDeletion verifies that scheduleOrphanedResourceDeletions
+// schedules a PIP-only orphan (a "<uid>-pip" with no LB/NAT in NRP or Azure and not desired in K8s)
+// through the inbound orphan-delete path. deleteInboundService then deletes the PIP and removes the
+// stuck Service finalizer, so the Service no longer strands in Terminating after a restart.
+func TestGuardOrphanCleanup_PIPOnlyServiceScheduledForDeletion(t *testing.T) {
+	uid := "11111111-1111-1111-1111-111111111111" // must be a valid service UUID
+	dt := newTestDiffTracker()
+
+	scheduleOrphanedResourceDeletions(dt, utilsets.NewString(), utilsets.NewString(), map[string]string{
+		uid + "-pip": "52.0.0.10",
+	})
+
+	op, ok := dt.pendingServiceOps[uid]
+	if !assert.True(t, ok, "a PIP-only orphan must be scheduled for deletion, not ignored") {
+		return
+	}
+	assert.Equal(t, StateDeletionInProgress, op.State,
+		"a PIP-only orphan with no locations must go straight to StateDeletionInProgress so deleteInboundService runs")
+	assert.True(t, op.IsOrphan, "the scheduled deletion must be marked as an orphan cleanup")
+}
+
+// TestGuardOrphanCleanup_PIPNotScheduledWhenDesiredOrHasLB guards the exclusions so the PIP-only path
+// never deletes a live service's PIP: a service desired in K8s, or one with a registered NRP
+// LoadBalancer, must not be scheduled by the PIP path, and an orphaned LB is scheduled exactly once
+// via the LB path (its PIP is deleted there, not double-scheduled).
+func TestGuardOrphanCleanup_PIPNotScheduledWhenDesiredOrHasLB(t *testing.T) {
+	uidDesired := "22222222-2222-2222-2222-222222222222"
+	uidHasLB := "33333333-3333-3333-3333-333333333333"
+	uidHasNRPLB := "44444444-4444-4444-4444-444444444444"
+
+	dt := newTestDiffTracker()
+	dt.K8sResources.Services.Insert(uidDesired)       // desired in K8s -> reconcileServices owns it
+	dt.NRPResources.LoadBalancers.Insert(uidHasNRPLB) // registered LB -> not orphaned
+
+	scheduleOrphanedResourceDeletions(dt, utilsets.NewString(uidHasLB), utilsets.NewString(), map[string]string{
+		uidDesired + "-pip":  "52.0.0.1",
+		uidHasLB + "-pip":    "52.0.0.2", // its LB is the orphan; the LB path deletes the PIP
+		uidHasNRPLB + "-pip": "52.0.0.3",
+	})
+
+	_, desiredScheduled := dt.pendingServiceOps[uidDesired]
+	assert.False(t, desiredScheduled, "a PIP whose service is desired in K8s must not be scheduled for deletion")
+
+	_, nrpLBScheduled := dt.pendingServiceOps[uidHasNRPLB]
+	assert.False(t, nrpLBScheduled, "a PIP whose service has a registered NRP LoadBalancer must not be scheduled by the PIP path")
+
+	op, ok := dt.pendingServiceOps[uidHasLB]
+	assert.True(t, ok, "an orphaned LB (with its PIP) must still be scheduled via the LB path")
+	if ok {
+		assert.True(t, op.IsOrphan)
+	}
 }

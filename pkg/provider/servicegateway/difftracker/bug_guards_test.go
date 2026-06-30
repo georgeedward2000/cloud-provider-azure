@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
 // RemoveLastPodFinalizers should surface retry exhaustion and keep the entry pending.
@@ -110,4 +111,54 @@ func TestDeleteService_DuringUpdateNoLocations_DispatchesDelete(t *testing.T) {
 	assert.True(t, stillTracked || pending,
 		"after delete-during-update fast-path + update completion, "+
 			"engine MUST still drive the Azure LB delete (either via pendingServiceOps or pendingServiceDeletions)")
+}
+
+// TestDeleteService_DuringUpdatePreemptKeepsPendingDeletion verifies that when a delete arrives
+// during an in-flight update via the fast path (no NRP locations yet -> StateDeletionInProgress) and
+// the in-flight LocationsUpdater then republishes the pod address, the completion callback's
+// delete-preempt branch routes the op back to StateDeletionPending AND re-adds its
+// pendingServiceDeletions entry. Without that entry CheckPendingServiceDeletions returns early on an
+// empty map and never drives the deletion, leaking the LB/PIP and leaving the Service Terminating.
+func TestDeleteService_DuringUpdatePreemptKeepsPendingDeletion(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-del-during-update"
+	const node, addr = "10.0.0.1", "10.244.0.1"
+
+	inflight := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	dt.NRPResources.LoadBalancers.Insert(uid)
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:     uid,
+		Config:         inflight,
+		InFlightConfig: &inflight,
+		State:          StateUpdateInProgress,
+	}
+
+	// Delete fast path: no NRP locations yet -> StateDeletionInProgress, pendingServiceDeletions cleared.
+	dt.DeleteService(uid, true, false)
+
+	// The in-flight LocationsUpdater publishes the pod address just after the delete gated on
+	// serviceHasLocationsInNRP.
+	dt.NRPResources.Locations[node] = NRPLocation{
+		Addresses: map[string]NRPAddress{addr: {Services: utilsets.NewString(uid)}},
+	}
+
+	// The in-flight update completes and is routed through the delete-preempt branch.
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	op := dt.pendingServiceOps[uid]
+	if !assert.NotNil(t, op, "the op must remain tracked after the delete-preempt routing") {
+		return
+	}
+	assert.Equal(t, StateDeletionPending, op.State, "locations reappeared, so the op must wait in StateDeletionPending")
+	_, pending := dt.pendingServiceDeletions[uid]
+	assert.True(t, pending,
+		"an op routed to StateDeletionPending must have a pendingServiceDeletions entry so CheckPendingServiceDeletions can drive it")
+
+	// Drain the locations: CheckPendingServiceDeletions must promote the op to dispatch.
+	delete(dt.NRPResources.Locations, node)
+	dt.CheckPendingServiceDeletions()
+	assert.Equal(t, StateDeletionInProgress, dt.pendingServiceOps[uid].State,
+		"once locations clear, CheckPendingServiceDeletions must promote the op to StateDeletionInProgress")
+	_, stillPending := dt.pendingServiceDeletions[uid]
+	assert.False(t, stillPending, "the pendingServiceDeletions entry must be consumed once the deletion dispatches")
 }

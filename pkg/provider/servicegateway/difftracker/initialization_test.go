@@ -360,8 +360,9 @@ func newServiceOwnedEndpointSlice(name, namespace, svcUID string, addrType disco
 	}
 }
 
-// newEgressPod builds an egress-labeled pod for the processK8sEgresses seeder.
-func newEgressPod(name, namespace, egressVal, nodeName, podIP string, phase v1.PodPhase) *v1.Pod {
+// newEgressPod builds an egress-labeled pod for the processK8sEgresses seeder. hostIP is the
+// node's IP that the runtime egress path uses as the location key (pod.Status.HostIP).
+func newEgressPod(name, namespace, egressVal, nodeName, podIP, hostIP string, phase v1.PodPhase) *v1.Pod {
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -369,7 +370,7 @@ func newEgressPod(name, namespace, egressVal, nodeName, podIP string, phase v1.P
 			Labels:    map[string]string{consts.PodLabelServiceEgressGateway: egressVal},
 		},
 		Spec:   v1.PodSpec{NodeName: nodeName},
-		Status: v1.PodStatus{Phase: phase, PodIP: podIP},
+		Status: v1.PodStatus{Phase: phase, PodIP: podIP, HostIP: hostIP},
 	}
 }
 
@@ -397,7 +398,7 @@ func TestProcessK8sEndpoints_SkipsNotReadyEndpoints(t *testing.T) {
 	)
 
 	k8s := newK8sStateForSeeders(svcUID)
-	nodeNameToIPMap := map[string]string{nodeName: nodeIP}
+	nodeNameToIPMap := map[string][]string{nodeName: {nodeIP}}
 
 	eps := newServiceOwnedEndpointSlice("eps-1", "default", svcUID, discoveryv1.AddressTypeIPv4, []discoveryv1.Endpoint{
 		{
@@ -442,16 +443,15 @@ func TestInitOutboundRefCount_NotNegativeOnServiceUIDEgressLabelCollision(t *tes
 		},
 		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
 	}
-	pod := newEgressPod("pod-collide", "default", collideID, nodeName, podIP, v1.PodRunning)
+	pod := newEgressPod("pod-collide", "default", collideID, nodeName, podIP, nodeIP, v1.PodRunning)
 	kube := fake.NewSimpleClientset(svc, pod)
 
 	k8s := newK8sStateForSeeders()
-	nodeNameToIPMap := map[string]string{nodeName: nodeIP}
 
 	// Build the cold-start K8s state: inbound LB service + colliding egress pod.
 	_, _, err := processK8sServices(context.Background(), kube, &k8s)
 	assert.NoError(t, err)
-	_, err = processK8sEgresses(context.Background(), kube, &k8s, nodeNameToIPMap)
+	_, err = processK8sEgresses(context.Background(), kube, &k8s)
 	assert.NoError(t, err)
 
 	// New() seeds outboundIdentityPodRefCount from the egress pods now present in k8s state.
@@ -513,7 +513,7 @@ func TestRecoverStuckFinalizers_KeepsFinalizerWhenAzureResourceExists(t *testing
 	services := &v1.ServiceList{Items: []v1.Service{*svc}}
 
 	// A real Azure LB exists for the UID even though it is absent from NRPResources.
-	recoverStuckFinalizers(context.Background(), dt, nil, services, nil, nil, utilsets.NewString(uid), utilsets.NewString(), nil)
+	recoverStuckFinalizers(context.Background(), dt, services, nil, nil, utilsets.NewString(uid), utilsets.NewString(), nil)
 
 	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-crash", metav1.GetOptions{})
 	assert.NoError(t, err)
@@ -541,7 +541,7 @@ func TestRecoverStuckFinalizers_KeepsFinalizerWhenOnlyPIPExists(t *testing.T) {
 	services := &v1.ServiceList{Items: []v1.Service{*svc}}
 
 	azurePIPs := map[string]string{uid + "-pip": "10.0.0.9"}
-	recoverStuckFinalizers(context.Background(), dt, nil, services, nil, nil, utilsets.NewString(), utilsets.NewString(), azurePIPs)
+	recoverStuckFinalizers(context.Background(), dt, services, nil, nil, utilsets.NewString(), utilsets.NewString(), azurePIPs)
 
 	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-pip", metav1.GetOptions{})
 	assert.NoError(t, err)
@@ -568,7 +568,7 @@ func TestRecoverStuckFinalizers_RemovesFinalizerWhenNoAzureResource(t *testing.T
 	dt.kubeClient = kube
 	services := &v1.ServiceList{Items: []v1.Service{*svc}}
 
-	recoverStuckFinalizers(context.Background(), dt, nil, services, nil, nil, utilsets.NewString(), utilsets.NewString(), nil)
+	recoverStuckFinalizers(context.Background(), dt, services, nil, nil, utilsets.NewString(), utilsets.NewString(), nil)
 
 	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-clean", metav1.GetOptions{})
 	assert.NoError(t, err)

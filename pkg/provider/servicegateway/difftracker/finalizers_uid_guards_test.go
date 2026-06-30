@@ -131,3 +131,47 @@ func TestGuardFinalizers_PositiveStripRemovesFinalizer(t *testing.T) {
 	_, stillPending := dt.pendingPodDeletions["default/foo"]
 	assert.False(t, stillPending, "processed entry must be removed from pendingPodDeletions")
 }
+
+// TestGuardRemovePodFinalizerByPod_DoesNotStripReplacementPod verifies that removePodFinalizer
+// captures the intended pod UID and refuses to strip the finalizer when the Get-fresh returns a
+// same-name replacement pod with a different UID (UIDs are unique in time and space, so a
+// deleted+recreated name is a new pod). The positive control confirms a matching UID still strips.
+func TestGuardRemovePodFinalizerByPod_DoesNotStripReplacementPod(t *testing.T) {
+	ctx := context.Background()
+	live := &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace:  "default",
+		Name:       "foo",
+		UID:        types.UID("uid-NEW"),
+		Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
+	}}
+	stale := &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default",
+		Name:      "foo",
+		UID:       types.UID("uid-OLD"),
+	}}
+
+	kube := fake.NewSimpleClientset(live)
+	dt := newTestDiffTracker()
+	dt.kubeClient = kube
+
+	err := dt.RemovePodFinalizerByPod(ctx, stale)
+	assert.NoError(t, err)
+
+	got, err := kube.CoreV1().Pods("default").Get(ctx, "foo", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Contains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
+		"a stale-UID removal must not strip the replacement pod's finalizer")
+
+	// Positive control: when the UID matches the live pod, the finalizer is removed.
+	matching := &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default",
+		Name:      "foo",
+		UID:       types.UID("uid-NEW"),
+	}}
+	err = dt.RemovePodFinalizerByPod(ctx, matching)
+	assert.NoError(t, err)
+	got, err = kube.CoreV1().Pods("default").Get(ctx, "foo", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.NotContains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
+		"a matching-UID removal must strip the finalizer")
+}

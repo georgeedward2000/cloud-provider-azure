@@ -179,6 +179,24 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 	// Service operation exists - check state
 	switch opState.State {
 	case StateNotStarted, StateCreationInProgress:
+		// A terminal UPDATE failure parks a live service in StateNotStarted while its LB stays in NRP
+		// and keeps serving. Its backend pool must keep tracking endpoint changes, so when the LB
+		// already exists in NRP apply the update immediately rather than buffering it (which would let
+		// the live pool go stale until a spec change un-parks the op). A not-yet-created service, or a
+		// recreate-after-deletion whose LB was already torn down, has no LB in NRP and buffers below.
+		if opState.State == StateNotStarted && dt.NRPResources.LoadBalancers != nil && dt.NRPResources.LoadBalancers.Has(serviceUID) {
+			dt.logger.V(5).Info("Applied endpoints to live LB parked after terminal update", "service", serviceUID, "oldCount", len(oldPodIPToNodeIP), "newCount", len(newPodIPToNodeIP))
+			errs := dt.updateK8sEndpointsLocked(UpdateK8sEndpointsInputType{
+				InboundIdentity: serviceUID,
+				OldAddresses:    oldPodIPToNodeIP,
+				NewAddresses:    newPodIPToNodeIP,
+			})
+			if len(errs) > 0 {
+				dt.logger.V(4).Info("Could not update endpoints", "err", errs, "service", serviceUID)
+			}
+			dt.triggerLocationsUpdater()
+			return
+		}
 		// Service is being created or waiting to be created - buffer the endpoints.
 		// Store both old and new so the intervening removals are replayed on promotion
 		// (otherwise an add-then-remove during creation would leak the removed IP).
@@ -207,6 +225,21 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 		dt.triggerLocationsUpdater()
 
 	case StateDeletionPending:
+		if opState.RecreateAfterDeletion {
+			// A recreate is queued (the Service toggled ClusterIP->LoadBalancer while the delete
+			// was in flight). DeleteService already wiped the endpoint state, so buffer these
+			// endpoints (both old and new, like the creation-in-progress path) and let
+			// promotePendingEndpointsLocked replay them when the service is re-created. Without
+			// this the recreated LB comes up with an empty backend pool until the next
+			// EndpointSlice event.
+			dt.logger.V(5).Info("Buffered endpoints for service pending recreate-after-deletion", "service", serviceUID, "count", len(newPodIPToNodeIP))
+			dt.pendingEndpoints[serviceUID] = append(dt.pendingEndpoints[serviceUID], PendingEndpointUpdate{
+				OldPodIPToNodeIP: oldPodIPToNodeIP,
+				PodIPToNodeIP:    newPodIPToNodeIP,
+				Timestamp:        time.Now().Format(time.RFC3339),
+			})
+			return
+		}
 		// Service is pending deletion - process removals only. NewAddresses is dropped so
 		// a service being torn down cannot re-insert pod refs that delete-success never scrubs.
 		dt.logger.V(5).Info("Processed endpoint removals for service pending deletion", "service", serviceUID, "oldCount", len(oldPodIPToNodeIP), "ignoredNewCount", len(newPodIPToNodeIP))
@@ -221,6 +254,17 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 		dt.triggerLocationsUpdater()
 
 	case StateDeletionInProgress:
+		if opState.RecreateAfterDeletion {
+			// As above, but the delete is already dispatched. Still buffer for the queued recreate
+			// (replayed by promotePendingEndpointsLocked on the post-deletion create).
+			dt.logger.V(5).Info("Buffered endpoints while service deletion is in progress (recreate queued)", "service", serviceUID, "count", len(newPodIPToNodeIP))
+			dt.pendingEndpoints[serviceUID] = append(dt.pendingEndpoints[serviceUID], PendingEndpointUpdate{
+				OldPodIPToNodeIP: oldPodIPToNodeIP,
+				PodIPToNodeIP:    newPodIPToNodeIP,
+				Timestamp:        time.Now().Format(time.RFC3339),
+			})
+			return
+		}
 		// Service deletion already in progress - ignore endpoint updates
 		dt.logger.V(5).Info("Ignored endpoint update while service deletion is in progress", "service", serviceUID)
 
@@ -605,7 +649,6 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		(opState.State == StateDeletionInProgress && opState.InFlightConfig != nil) {
 		dt.logger.V(4).Info("Routed completed in-flight service operation to deletion", "service", serviceUID, "success", success)
 		opState.InFlightConfig = nil
-		// pendingServiceDeletions[serviceUID] is the source of truth and was set by DeleteService.
 		hasLocations := dt.serviceHasLocationsInNRP(serviceUID)
 		if !hasLocations {
 			// Ready for immediate deletion.
@@ -615,7 +658,25 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		} else {
 			// Locations still present; LocationsUpdater will clear them and
 			// CheckPendingServiceDeletions will transition opState.State.
+			//
+			// The pendingServiceDeletions entry is NOT guaranteed to still exist here: when the
+			// Delete arrived, DeleteService gated on serviceHasLocationsInNRP — if that was
+			// momentarily false (no locations yet) it took the fast path, jumped this op straight
+			// to StateDeletionInProgress, and DELETED the pendingServiceDeletions entry. An
+			// in-flight endpoint sync (a port-change UpdateEndpoints applies immediately for an
+			// in-flight update) can then re-publish the service's pod address to NRP just after
+			// that gate, so hasLocations is true again now. Without re-adding the entry,
+			// CheckPendingServiceDeletions would have nothing to advance once the locations drain
+			// and the op would strand in StateDeletionPending forever (Azure LB/PIP/SGW + finalizer
+			// leaked, Service stuck Terminating). Re-add it idempotently.
 			opState.State = StateDeletionPending
+			if _, ok := dt.pendingServiceDeletions[serviceUID]; !ok {
+				dt.pendingServiceDeletions[serviceUID] = &PendingServiceDeletion{
+					ServiceUID: serviceUID,
+					IsInbound:  opState.Config.IsInbound,
+					Timestamp:  time.Now().Format(time.RFC3339),
+				}
+			}
 			dt.triggerLocationsUpdater()
 		}
 		return
@@ -1488,4 +1549,15 @@ func (dt *DiffTracker) IsServiceTracked(serviceUID string) bool {
 		return true
 	}
 	return false
+}
+
+// IsServiceRecreating reports whether the service has a queued recreate-after-deletion: a
+// LoadBalancer->ClusterIP->LoadBalancer toggle caught while the delete was in flight. The provider
+// uses this to re-seed endpoints (DeleteService wiped them) so the recreated LoadBalancer does not
+// come up with an empty backend pool.
+func (dt *DiffTracker) IsServiceRecreating(serviceUID string) bool {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	op, ok := dt.pendingServiceOps[serviceUID]
+	return ok && op.RecreateAfterDeletion
 }
