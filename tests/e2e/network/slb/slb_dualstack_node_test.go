@@ -19,6 +19,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -41,6 +42,15 @@ import (
 //
 // The whole suite skips cleanly on a cluster whose nodes are not dual-stack (no node exposes both
 // an IPv4 and an IPv6 InternalIP), so it is safe to run everywhere.
+// ipEqual reports whether two textual IP addresses denote the same address.
+// The Service Gateway API may return an IPv6 address in a different letter case
+// or representation than the Kubernetes node InternalIP, so address and location
+// keys are compared by parsed value rather than by raw string.
+func ipEqual(a, b string) bool {
+	parsed := net.ParseIP(a)
+	return parsed != nil && parsed.Equal(net.ParseIP(b))
+}
+
 var _ = Describe("SLB - Dual-stack nodes with single-stack services", Label(slbTestLabel), func() {
 	basename := "slb-dualstack-node-test"
 
@@ -136,7 +146,7 @@ var _ = Describe("SLB - Dual-stack nodes with single-stack services", Label(slbT
 		Expect(err).NotTo(HaveOccurred())
 		for _, loc := range resp.Value {
 			for _, addr := range loc.Addresses {
-				if addr.Address == podIP {
+				if ipEqual(addr.Address, podIP) {
 					return loc.AddressLocation
 				}
 			}
@@ -216,11 +226,11 @@ var _ = Describe("SLB - Dual-stack nodes with single-stack services", Label(slbT
 		By("Asserting each pod IP is registered under its family-matched node underlay location")
 		Eventually(func() error {
 			gotV4 := sgLocationForAddress(v4PodIP)
-			if gotV4 != nodeV4 {
+			if !ipEqual(gotV4, nodeV4) {
 				return fmt.Errorf("IPv4 pod %s registered under location %q, want node IPv4 underlay %q", v4PodIP, gotV4, nodeV4)
 			}
 			gotV6 := sgLocationForAddress(v6PodIP)
-			if gotV6 != nodeV6 {
+			if !ipEqual(gotV6, nodeV6) {
 				return fmt.Errorf("IPv6 pod %s registered under location %q, want node IPv6 underlay %q", v6PodIP, gotV6, nodeV6)
 			}
 			return nil

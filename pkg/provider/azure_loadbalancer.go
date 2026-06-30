@@ -1111,16 +1111,21 @@ func (az *Cloud) getServiceLoadBalancer(
 			defaultLB.Properties = &armnetwork.LoadBalancerPropertiesFormat{
 				Scope: to.Ptr(armnetwork.LoadBalancerScopePublic),
 			}
-			// For Service Gateway, we need to set a backend pool for the load balancer.
-			// Use per-service backend pool (Service UID). Dual-stack is not supported here.
-			backendPoolName, err := az.getBackendPoolNameForSLBService(service)
-			if err != nil {
-				return nil, existingLBs, nil, nil, false, false, fmt.Errorf("getServiceLoadBalancer: failed to get per-service backend pool name: %w", err)
-			}
-			defaultLB.Properties.BackendAddressPools = []*armnetwork.BackendAddressPool{
-				{
-					Name: &backendPoolName,
-				},
+			// The per-service backend pool (Service UID) is only required when ensuring the
+			// load balancer. On the deletion and existence-check path (wantLb=false) it must
+			// be skipped: getBackendPoolNameForSLBService rejects dual-stack services, and
+			// returning that error here would prevent EnsureLoadBalancerDeleted from cleaning
+			// up a rejected dual-stack service and removing its finalizers.
+			if wantLb {
+				backendPoolName, err := az.getBackendPoolNameForSLBService(service)
+				if err != nil {
+					return nil, existingLBs, nil, nil, false, false, fmt.Errorf("getServiceLoadBalancer: failed to get per-service backend pool name: %w", err)
+				}
+				defaultLB.Properties.BackendAddressPools = []*armnetwork.BackendAddressPool{
+					{
+						Name: &backendPoolName,
+					},
+				}
 			}
 			// Service SKU is required for Service Gateway
 			defaultLB.SKU = &armnetwork.LoadBalancerSKU{
