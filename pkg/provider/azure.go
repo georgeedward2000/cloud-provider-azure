@@ -276,6 +276,14 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 		az.ServiceGatewayEnabled = false
 	}
 
+	// PodIP backend pools are only supported together with ServiceGateway, which is what programs
+	// pod IPs into the load balancer. If ServiceGateway is not active (wrong SKU or disabled) there
+	// is no mechanism to populate a PodIP backend pool, so reject the configuration explicitly
+	// instead of starting with a load balancer path that would silently misroute traffic.
+	if az.IsLBBackendPoolTypePodIP() && !az.ServiceGatewayEnabled {
+		return fmt.Errorf("InitializeCloudFromConfig: PodIP backend pool type requires ServiceGateway (loadBalancerBackendPoolConfigurationType=podIP needs ServiceGatewayEnabled=true and loadBalancerSku=service)")
+	}
+
 	// ServiceGateway (ContainerLB) and Multi-SLB are mutually exclusive.
 	// ContainerLB uses PodIP-based backend pools via ServiceGateway, while
 	// Multi-SLB requires NodeIP/NIC-based backend pools.

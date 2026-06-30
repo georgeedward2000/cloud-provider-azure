@@ -14,11 +14,14 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient/mock_subnetclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/privatelinkservice"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -66,7 +69,7 @@ func TestPodIPWithoutServiceGateway_RejectsDualStack(t *testing.T) {
 
 	svc := getTestServiceDualStack("podip-dualstack", v1.ProtocolTCP, nil, 80)
 	_, _, err := az.getExpectedLBRules(&svc, "frontend-v4", "backend-v4", "lb", consts.IPVersionIPv4)
-	assert.Error(t, err, "dual-stack PodIP services must be rejected")
+	assert.Error(t, err, "PodIP backend pool without ServiceGateway must be rejected")
 }
 
 func TestPodIPWithoutServiceGateway_RejectsNamedTargetPort(t *testing.T) {
@@ -80,10 +83,10 @@ func TestPodIPWithoutServiceGateway_RejectsNamedTargetPort(t *testing.T) {
 
 	svc := getTestServiceWithNamedTargetPorts("podip-named-target-port", v1.ProtocolTCP, nil, false, 8080, "http")
 	_, _, err := az.getExpectedLBRules(&svc, "frontend-v4", "backend-v4", "lb", consts.IPVersionIPv4)
-	assert.Error(t, err, "named targetPort with PodIP backend must be rejected")
+	assert.Error(t, err, "PodIP backend pool without ServiceGateway must be rejected")
 }
 
-func TestPodIPWithoutServiceGateway_ProgramsBackendTargetPortAndProtocol(t *testing.T) {
+func TestPodIPWithoutServiceGateway_RejectsIntTargetPort(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -93,31 +96,8 @@ func TestPodIPWithoutServiceGateway_ProgramsBackendTargetPortAndProtocol(t *test
 	az.ServiceGatewayEnabled = false
 
 	svc := getTestServiceWithIntTargetPorts("podip-udp-target-port", v1.ProtocolUDP, nil, true, 8080, 1234)
-	probes, rules, err := az.getExpectedLBRules(&svc, "frontend-ipv6", "backend-ipv6", "lb", consts.IPVersionIPv6)
-	if !assert.NoError(t, err) {
-		t.FailNow()
-	}
-	if !assert.Len(t, rules, 1) {
-		t.FailNow()
-	}
-	if !assert.NotNil(t, rules[0].Properties) {
-		t.FailNow()
-	}
-
-	props := rules[0].Properties
-	if !assert.NotNil(t, props.BackendPort) ||
-		!assert.NotNil(t, props.Protocol) ||
-		!assert.NotNil(t, props.FrontendIPConfiguration) ||
-		!assert.NotNil(t, props.FrontendIPConfiguration.ID) ||
-		!assert.NotNil(t, props.EnableFloatingIP) {
-		t.FailNow()
-	}
-
-	assert.Equal(t, int32(1234), *props.BackendPort, "backend port must be programmed from targetPort")
-	assert.Equal(t, armnetwork.TransportProtocolUDP, *props.Protocol, "UDP service must program UDP LB rule")
-	assert.Equal(t, "frontend-ipv6", *props.FrontendIPConfiguration.ID, "rule must be bound to requested IP-family frontend")
-	assert.False(t, *props.EnableFloatingIP, "PodIP backend should not enable floating IP")
-	assert.Empty(t, probes, "PodIP backend path should not create health probes")
+	_, _, err := az.getExpectedLBRules(&svc, "frontend-ipv6", "backend-ipv6", "lb", consts.IPVersionIPv6)
+	assert.Error(t, err, "PodIP backend pool without ServiceGateway must be rejected")
 }
 
 func TestServiceGatewayInternalAnnotation_IsRejected(t *testing.T) {
@@ -237,4 +217,148 @@ func TestCLBWiring_CorrectedFixtureEndpointSliceInformerPath(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+}
+
+func TestPodIPWithoutServiceGateway_EnsureLoadBalancerRejects(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	az := GetTestCloud(ctrl)
+	az.LoadBalancerBackendPoolConfigurationType = consts.LoadBalancerBackendPoolConfigurationTypePodIP
+	az.LoadBalancerSKU = "standardV2"
+	az.ServiceGatewayEnabled = false
+
+	mockLBBackendPool := az.LoadBalancerBackendPool.(*MockBackendPool)
+	mockLBBackendPool.EXPECT().ReconcileBackendPools(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, _ string, _ *v1.Service, lb *armnetwork.LoadBalancer) (bool, bool, *armnetwork.LoadBalancer, error) {
+		return false, false, lb, nil
+	}).AnyTimes()
+	mockLBBackendPool.EXPECT().EnsureHostsInPool(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockLBBackendPool.EXPECT().GetBackendPrivateIPs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	clusterResources, expectedInterfaces, expectedVirtualMachines := getClusterResources(az, 8, 4)
+	setMockEnv(az, expectedInterfaces, expectedVirtualMachines, 5)
+
+	svc := getTestServiceWithIntTargetPorts("service1", v1.ProtocolTCP, nil, false, 8080, 1234)
+	expectedLBs := make([]*armnetwork.LoadBalancer, 0)
+	setMockLBs(az, &expectedLBs, "service", 1, 1, false)
+
+	mockPLSRepo := privatelinkservice.NewMockRepository(ctrl)
+	mockPLSRepo.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armnetwork.PrivateLinkService{ID: ptr.To(consts.PrivateLinkServiceNotExistID)}, nil).AnyTimes()
+	az.plsRepo = mockPLSRepo
+
+	// PodIP backend pools are only supported with ServiceGateway; without it EnsureLoadBalancer must
+	// reject the service rather than program a load balancer that misroutes traffic to an empty pool.
+	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, clusterResources.nodes)
+	assert.Error(t, err, "PodIP backend pool without ServiceGateway must be rejected")
+	assert.Nil(t, status)
+	assert.True(t, az.IsLBBackendPoolTypePodIP())
+	assert.False(t, az.ServiceGatewayEnabled)
+}
+
+func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
+	t.Run("dual-stack service emits no warning", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		svc := getTestServiceDualStack("sgw-dualstack", v1.ProtocolTCP, nil, 80)
+		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+
+		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, status)
+		assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+
+		// The SGW path accepts the dual-stack service (tracked) and emits no warning event.
+		assertNoEvent(t, rec)
+	})
+
+	t.Run("named targetPort service emits no warning", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		svc := getTestServiceWithNamedTargetPorts("sgw-named-port", v1.ProtocolTCP, nil, false, 8080, "http")
+		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+
+		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, status)
+		assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+
+		// The SGW path accepts the named-targetPort service (tracked) and emits no warning event.
+		assertNoEvent(t, rec)
+	})
+
+	t.Run("internal service emits UnsupportedInternalLoadBalancer warning", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		svc := getInternalTestService("sgw-internal-warning", 80)
+		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+
+		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		assert.Error(t, err)
+		assert.Nil(t, status)
+
+		select {
+		case ev := <-rec.Events:
+			assert.Contains(t, ev, "UnsupportedInternalLoadBalancer")
+		case <-time.After(time.Second):
+			t.Fatal("expected UnsupportedInternalLoadBalancer warning event")
+		}
+	})
+}
+
+func TestExtractInboundConfigFromService_DropsAffinityAndIdleTimeout(t *testing.T) {
+	svc := getTestService("extract-inbound", v1.ProtocolTCP, map[string]string{consts.ServiceAnnotationLoadBalancerIdleTimeout: "30"}, false, 80)
+	svc.Spec.SessionAffinity = v1.ServiceAffinityClientIP
+
+	config := difftracker.ExtractInboundConfigFromService(&svc)
+	if !assert.NotNil(t, config) {
+		t.FailNow()
+	}
+
+	// The extractor does not currently map SessionAffinity or the idle-timeout annotation, so both stay nil.
+	assert.Nil(t, config.SessionPersistence)
+	assert.Nil(t, config.IdleTimeoutMinutes)
+}
+
+func TestServiceGateway_EnsureAndDelete(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	svc := getTestService("sgw-ensure-delete", v1.ProtocolTCP, nil, false, 80)
+	az, _ := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+
+	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+	assert.NotNil(t, status)
+	assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+
+	err = az.EnsureLoadBalancerDeleted(context.Background(), testClusterName, &svc)
+	assert.NoError(t, err)
+}
+
+func newSGWCloudWithServiceAndRecorder(t *testing.T, ctrl *gomock.Controller, svc v1.Service) (*Cloud, *record.FakeRecorder) {
+	t.Helper()
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	kubeClient := fake.NewSimpleClientset(&svc)
+	az.KubeClient = kubeClient
+	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+	rec := record.NewFakeRecorder(10)
+	az.eventRecorder = rec
+
+	return az, rec
+}
+
+func assertNoEvent(t *testing.T, rec *record.FakeRecorder) {
+	t.Helper()
+
+	select {
+	case ev := <-rec.Events:
+		t.Fatalf("expected no warning event, got: %s", ev)
+	case <-time.After(100 * time.Millisecond):
+	}
 }

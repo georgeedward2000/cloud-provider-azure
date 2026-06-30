@@ -1,6 +1,7 @@
 package difftracker
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
@@ -680,4 +681,34 @@ func TestBuildInboundServiceResources_SameBackendPortDifferentProtocolAllowed(t 
 	_, lb, _, err := buildInboundServiceResources("svc", cfg, testConfig())
 	assert.NoError(t, err, "same backend port over different protocols must be allowed")
 	assert.Len(t, lb.Properties.LoadBalancingRules, 2)
+}
+
+func TestIsValidEgressIdentity(t *testing.T) {
+	valid := []string{
+		"egress-gateway-a",
+		"tenant-a-egress",
+		"my_egress.gw-1",
+		"a",
+		"e0",
+		strings.Repeat("a", 80), // max length
+	}
+	for _, n := range valid {
+		assert.True(t, IsValidEgressIdentity(n), "expected %q to be a valid egress identity", n)
+	}
+
+	invalid := []string{
+		"",                      // empty
+		"../hijacked-nat",       // path traversal
+		"egress/gateway",        // slash
+		"-leading-hyphen",       // must start with an alphanumeric
+		".leading-dot",          // must start with an alphanumeric
+		"trailing-dot.",         // must end with an alphanumeric or underscore
+		"trailing-hyphen-",      // must end with an alphanumeric or underscore
+		"has space",             // whitespace
+		"UPPER",                 // callers lowercase first; raw uppercase is rejected
+		strings.Repeat("a", 81), // too long
+	}
+	for _, n := range invalid {
+		assert.False(t, IsValidEgressIdentity(n), "expected %q to be an invalid egress identity", n)
+	}
 }

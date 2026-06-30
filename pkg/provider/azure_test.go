@@ -2504,6 +2504,25 @@ func TestInitializeCloudFromConfig(t *testing.T) {
 		assert.Equal(t, az.Config.LoadBalancerBackendPoolConfigurationType, consts.LoadBalancerBackendPoolConfigurationTypeNodeIPConfiguration)
 	})
 
+	t.Run("PodIP backend pool type requires ServiceGateway", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		az := GetTestCloud(ctrl)
+		zoneMock := az.zoneRepo.(*zone.MockRepository)
+		zoneMock.EXPECT().ListZones(gomock.Any()).Return(map[string][]string{"eastus": {"1", "2", "3"}}, nil).AnyTimes()
+
+		// PodIP backend pool with a non-Service SKU disables ServiceGateway, which leaves no mechanism
+		// to populate the pool; InitializeCloudFromConfig must reject this rather than start a broken
+		// load balancer path.
+		az.LoadBalancerBackendPoolConfigurationType = consts.LoadBalancerBackendPoolConfigurationTypePodIP
+		az.LoadBalancerSKU = "standardV2"
+
+		azureconfig := config.Config{}
+		err := az.InitializeCloudFromConfig(context.Background(), &azureconfig, false, true)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "PodIP backend pool type requires ServiceGateway")
+	})
+
 	t.Run("should setup network client factory with network subscription ID - same network sub in same tenant", func(t *testing.T) {
 
 		ctrl := gomock.NewController(t)

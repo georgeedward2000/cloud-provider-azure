@@ -23,14 +23,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	servicehelper "k8s.io/cloud-provider/service/helpers"
+	"k8s.io/utils/ptr"
 
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/loadbalancerclient/mock_loadbalancerclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipaddressclient/mock_publicipaddressclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient/mock_servicegatewayclient"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -362,4 +369,168 @@ func TestServiceUpdaterProcessBatchSkipsParkedService(t *testing.T) {
 	assert.Equal(t, StateNotStarted, dt.pendingServiceOps["svc"].State,
 		"parked service must not be transitioned/dispatched")
 	assert.Len(t, dt.serviceUpdaterTrigger, 0, "parked service must not enqueue further work")
+}
+
+// TestCreateInboundService_StatusUpdateFailureRetriesInsteadOfFalseSuccess drives createInboundService
+// with all Azure steps succeeding but the Service-status patch (Step 5) returning a transient non-409
+// error. Because the load balancer would otherwise appear permanently pending, the op must report
+// failure so the existing retry path re-runs (the Azure resources are idempotent), rather than
+// reporting success and moving to StateCreated with an empty Ingress.
+func TestCreateInboundService_StatusUpdateFailureRetriesInsteadOfFalseSuccess(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Pre-load the K8s Service WITH the SGW + LB finalizers so addServiceGatewayFinalizer
+	// short-circuits on the Get (no Patch needed) — this isolates the Patch reactor below to
+	// the Step 5 status patch only.
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc-status", Namespace: "default", UID: "uid-status",
+			Finalizers: []string{ServiceGatewayServiceCleanupFinalizer, servicehelper.LoadBalancerCleanupFinalizer},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+	kube := fake.NewSimpleClientset(svc)
+	// Force every Service patch to fail with a generic (non-409, non-NotFound) transient error.
+	// retry.RetryOnConflict only retries on Conflict, so this propagates as a hard error.
+	kube.PrependReactor("patch", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("transient apiserver patch error")
+	})
+
+	f := mock_azclient.NewMockClientFactory(ctrl)
+	mockPIP := mock_publicipaddressclient.NewMockInterface(ctrl)
+	mockLB := mock_loadbalancerclient.NewMockInterface(ctrl)
+	mockSGW := mock_servicegatewayclient.NewMockInterface(ctrl)
+	f.EXPECT().GetPublicIPAddressClient().Return(mockPIP).AnyTimes()
+	f.EXPECT().GetLoadBalancerClient().Return(mockLB).AnyTimes()
+	f.EXPECT().GetServiceGatewayClient().Return(mockSGW).AnyTimes()
+
+	// PIP returns a populated response so pipIPAddress is non-empty and Step 5 actually runs.
+	mockPIP.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "uid-status-pip", gomock.Any()).Return(
+		&armnetwork.PublicIPAddress{
+			Name: ptr.To("uid-status-pip"),
+			Properties: &armnetwork.PublicIPAddressPropertiesFormat{
+				IPAddress: ptr.To("10.1.2.3"),
+			},
+		}, nil)
+	mockLB.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "uid-status", gomock.Any()).Return(nil, nil)
+	mockSGW.EXPECT().UpdateServices(gomock.Any(), "rg", "sgw", gomock.Any()).Return(nil)
+
+	dt := newTestDiffTracker()
+	dt.config = testConfig()
+	dt.kubeClient = kube
+	dt.networkClientFactory = f
+	uid := "uid-status"
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:      StateCreationInProgress,
+		InFlightConfig: func() *ServiceConfig {
+			c := NewInboundServiceConfig(uid, makeInboundConfig(80))
+			return &c
+		}(),
+	}
+
+	var gotSuccess *bool
+	var gotErr error
+	su := newTestServiceUpdater(dt)
+	su.onComplete = func(serviceUID string, ok bool, err error) {
+		b := ok
+		gotSuccess = &b
+		gotErr = err
+		// Route through the engine completion to drive the StateCreated transition.
+		dt.OnServiceCreationComplete(serviceUID, ok, err)
+	}
+
+	su.createInboundService(uid, makeInboundConfig(80), "corr-status")
+
+	if assert.NotNil(t, gotSuccess, "onComplete must be called") {
+		assert.False(t, *gotSuccess, "a status-patch failure must fail the op, not report success")
+	}
+	if assert.Error(t, gotErr, "the status-patch failure must be propagated") {
+		assert.Contains(t, gotErr.Error(), "failed to update service status with external IP")
+	}
+
+	op := dt.pendingServiceOps[uid]
+	if assert.NotNil(t, op, "op must remain tracked") {
+		assert.Equal(t, StateNotStarted, op.State, "a status-patch failure must reset the op for retry, not promote it to StateCreated")
+		assert.Equal(t, 1, op.RetryCount, "a status-patch failure must schedule a retry")
+	}
+
+	// The status patch failed, so Ingress stays empty for this attempt; the scheduled retry repopulates it.
+	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-status", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Empty(t, got.Status.LoadBalancer.Ingress)
+}
+
+// TestCreateInboundService_PopulatesIngressOnSuccess confirms the success path writes the allocated
+// public IP into Service.Status.LoadBalancer.Ingress and promotes the op to StateCreated, so a later
+// retry caused by a transient status failure eventually surfaces the external IP.
+func TestCreateInboundService_PopulatesIngressOnSuccess(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc-status-ok", Namespace: "default", UID: "uid-status-ok",
+			Finalizers: []string{ServiceGatewayServiceCleanupFinalizer, servicehelper.LoadBalancerCleanupFinalizer},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+	kube := fake.NewSimpleClientset(svc)
+
+	f := mock_azclient.NewMockClientFactory(ctrl)
+	mockPIP := mock_publicipaddressclient.NewMockInterface(ctrl)
+	mockLB := mock_loadbalancerclient.NewMockInterface(ctrl)
+	mockSGW := mock_servicegatewayclient.NewMockInterface(ctrl)
+	f.EXPECT().GetPublicIPAddressClient().Return(mockPIP).AnyTimes()
+	f.EXPECT().GetLoadBalancerClient().Return(mockLB).AnyTimes()
+	f.EXPECT().GetServiceGatewayClient().Return(mockSGW).AnyTimes()
+
+	mockPIP.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "uid-status-ok-pip", gomock.Any()).Return(
+		&armnetwork.PublicIPAddress{
+			Name:       ptr.To("uid-status-ok-pip"),
+			Properties: &armnetwork.PublicIPAddressPropertiesFormat{IPAddress: ptr.To("10.1.2.3")},
+		}, nil)
+	mockLB.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "uid-status-ok", gomock.Any()).Return(nil, nil)
+	mockSGW.EXPECT().UpdateServices(gomock.Any(), "rg", "sgw", gomock.Any()).Return(nil)
+
+	dt := newTestDiffTracker()
+	dt.config = testConfig()
+	dt.kubeClient = kube
+	dt.networkClientFactory = f
+	uid := "uid-status-ok"
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:      StateCreationInProgress,
+		InFlightConfig: func() *ServiceConfig {
+			c := NewInboundServiceConfig(uid, makeInboundConfig(80))
+			return &c
+		}(),
+	}
+
+	var gotSuccess *bool
+	su := newTestServiceUpdater(dt)
+	su.onComplete = func(serviceUID string, ok bool, err error) {
+		b := ok
+		gotSuccess = &b
+		dt.OnServiceCreationComplete(serviceUID, ok, err)
+	}
+
+	su.createInboundService(uid, makeInboundConfig(80), "corr-status-ok")
+
+	if assert.NotNil(t, gotSuccess, "onComplete must be called") {
+		assert.True(t, *gotSuccess, "a create with a successful status patch must report success")
+	}
+	op := dt.pendingServiceOps[uid]
+	if assert.NotNil(t, op, "op must remain tracked") {
+		assert.Equal(t, StateCreated, op.State, "a successful create must promote the op to StateCreated")
+	}
+
+	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-status-ok", metav1.GetOptions{})
+	assert.NoError(t, err)
+	if assert.Len(t, got.Status.LoadBalancer.Ingress, 1, "the allocated IP must be written to the Service status") {
+		assert.Equal(t, "10.1.2.3", got.Status.LoadBalancer.Ingress[0].IP)
+	}
 }

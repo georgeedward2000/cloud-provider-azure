@@ -217,3 +217,51 @@ func TestUpdatePendingOperationOldestAgeMetric_IncludesUpdateInProgress(t *testi
 	assert.NoError(t, err)
 	assert.Greater(t, v, 3000.0, "the update_in_progress oldest-age series must be emitted")
 }
+
+// TestOnServiceCreationComplete_PreEmptDoesNotRecordOperationMetric verifies the pre-empt branch:
+// when a delete arrived while a create/update was in flight, OnServiceCreationComplete routes the
+// completed in-flight operation to the deletion flow and does not increment the service-operation
+// counter for the pre-empted create/update (the subsequent delete records its own metric).
+func TestOnServiceCreationComplete_PreEmptDoesNotRecordOperationMetric(t *testing.T) {
+	RegisterMetrics()
+	serviceOperationTotal.Reset()
+
+	dt := newTestDiffTracker()
+	uid := "svc-preempt-metric"
+	// Pre-empt fixture: a concurrent DeleteService changed the state while a create was in flight
+	// (InFlightConfig != nil). StateDeletionPending is one of the pre-empt triggers.
+	cfg := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	inflight := cfg
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:     uid,
+		Config:         cfg,
+		InFlightConfig: &inflight,
+		State:          StateDeletionPending,
+	}
+	dt.pendingServiceDeletions[uid] = &PendingServiceDeletion{ServiceUID: uid, IsInbound: true}
+
+	// The in-flight create completes successfully. The pre-empt branch fires.
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	// The pre-empt branch took the path (InFlightConfig is cleared and state moved off pending).
+	op := dt.pendingServiceOps[uid]
+	if assert.NotNil(t, op, "op must remain tracked through the pre-empt") {
+		assert.Nil(t, op.InFlightConfig, "pre-empt must clear InFlightConfig")
+	}
+
+	// The "create" metric for this service-type+success must NOT have been incremented.
+	got, err := testutil.GetCounterMetricValue(
+		serviceOperationTotal.WithLabelValues("create", "inbound", "success", "", "false"),
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, 0.0, got,
+		"the pre-empt path does not record the create operation, so the counter stays 0")
+
+	// The error series is also untouched: no metric is recorded on this path at all.
+	gotErr, err := testutil.GetCounterMetricValue(
+		serviceOperationTotal.WithLabelValues("create", "inbound", "error", "", "false"),
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, 0.0, gotErr,
+		"no metric is recorded on the pre-empt path (the error series also stays 0)")
+}

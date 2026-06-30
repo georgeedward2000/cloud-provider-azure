@@ -184,6 +184,18 @@ func TestPodInformerAddPod(t *testing.T) {
 			expectedCalls:  1,
 			expectedEgress: "egress-gateway-upper",
 		},
+		{
+			name:          "Pod with path-traversal egress label should be skipped",
+			pod:           newTestPod("default", "evil-pod", "../hijacked-nat", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			expectAddPod:  false,
+			expectedCalls: 0,
+		},
+		{
+			name:          "Pod with slash in egress label should be skipped",
+			pod:           newTestPod("default", "slash-pod", "egress/gw", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			expectAddPod:  false,
+			expectedCalls: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -260,6 +272,43 @@ func TestPodInformerAddPod_FinalizerAddFailureRegistersAndAlerts(t *testing.T) {
 			"a warning Event must be emitted when an egress pod is registered without its cleanup finalizer")
 	default:
 		t.Fatal("expected a ServiceGatewayFinalizerAddFailed warning Event on finalizer add failure")
+	}
+}
+
+// TestPodInformerAddPod_RejectsInvalidEgressLabel verifies that an egress pod whose label is not a
+// valid Azure resource name (e.g. a path-traversal value) is NOT registered with the engine and a
+// warning Event is emitted, so the label can never be interpolated raw into a NAT Gateway ARM ID.
+func TestPodInformerAddPod_RejectsInvalidEgressLabel(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "evil-egress",
+			Namespace: "default",
+			Labels:    map[string]string{consts.PodLabelServiceEgressGateway: "../hijacked-nat"},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning, HostIP: "10.0.0.1", PodIP: "10.244.0.1"},
+	}
+	kube := fake.NewSimpleClientset(pod)
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = newProviderDiffTracker(t, az, kube)
+	rec := record.NewFakeRecorder(10)
+	az.eventRecorder = rec
+
+	az.podInformerAddPod(pod)
+
+	assert.False(t, az.diffTracker.IsServiceTracked("../hijacked-nat"),
+		"a pod with an invalid egress label must not be registered with the engine")
+
+	select {
+	case ev := <-rec.Events:
+		assert.Contains(t, ev, "ServiceGatewayInvalidEgressLabel",
+			"a warning Event must be emitted for an invalid egress gateway label")
+	default:
+		t.Fatal("expected a ServiceGatewayInvalidEgressLabel warning Event")
 	}
 }
 
@@ -704,6 +753,9 @@ func (tc *testCloudWithMockDiffTracker) podInformerAddPod(pod *v1.Pod) {
 	}
 
 	egressName := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
+	if !difftracker.IsValidEgressIdentity(egressName) {
+		return
+	}
 	podKey := pod.Namespace + "/" + pod.Name
 
 	// Call mock instead of real diffTracker

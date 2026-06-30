@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
+	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
 var (
@@ -1814,4 +1815,66 @@ func TestGetSyncLocationsAddressesRemovesGoneNode(t *testing.T) {
 	dt.UpdateLocationsAddresses(result)
 	_, ok = dt.NRPResources.Locations["node1"]
 	assert.False(t, ok, "gone node's location must be removed locally")
+}
+
+// TestLastPodRemoval_EmitsNodeDeletionPayload verifies that when the last pod backing a service on a
+// node is removed (updateK8sEndpointsLocked drops the node from K8sResources.Nodes while NRP still
+// holds the address), getSyncLocationsAddresses emits a Location with AddressUpdateAction=PartialUpdate
+// and an empty, non-nil Addresses map. The ServiceGateway treats an empty Addresses array as "delete
+// the whole location/node", which is the intended payload for a fully drained node.
+func TestLastPodRemoval_EmitsNodeDeletionPayload(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-last-pod"
+	const node = "10.0.0.1"
+	const podIP = "10.244.0.5"
+
+	// Service is created and known to NRP. NRP already reflects the single pod on this node.
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:      StateCreated,
+	}
+	dt.NRPResources.LoadBalancers.Insert(uid)
+	dt.NRPResources.Locations[node] = NRPLocation{
+		Addresses: map[string]NRPAddress{
+			podIP: {Services: utilsets.NewString(uid)},
+		},
+	}
+
+	// Step 1: simulate the EndpointSlice that originally added the pod, so K8s state has the
+	// node entry. We drive it through the production entry point so the node is created by a real
+	// informer flow rather than synthetic state stitching.
+	errs := dt.UpdateK8sEndpoints(UpdateK8sEndpointsInputType{
+		InboundIdentity: uid,
+		OldAddresses:    nil,
+		NewAddresses:    map[string]string{podIP: node},
+	})
+	assert.Empty(t, errs, "endpoint-add fixture must apply cleanly")
+	// Sanity: the node entry was created (otherwise the path below is moot).
+	_, hasNode := dt.K8sResources.Nodes[node]
+	assert.True(t, hasNode, "fixture precondition: node must be present after endpoint add")
+
+	// Step 2: the sole pod for this service is removed. With no other identities on the pod
+	// and no other pods on the node, updateK8sEndpointsLocked deletes the node from K8s state.
+	errs = dt.UpdateK8sEndpoints(UpdateK8sEndpointsInputType{
+		InboundIdentity: uid,
+		OldAddresses:    map[string]string{podIP: node},
+		NewAddresses:    nil,
+	})
+	assert.Empty(t, errs)
+	_, hasNodeAfter := dt.K8sResources.Nodes[node]
+	assert.False(t, hasNodeAfter, "last-pod removal must drop the node entry from K8sResources.Nodes")
+
+	// Step 3: observe the sync payload the LocationsUpdater would send.
+	result := dt.GetSyncLocationsAddresses()
+	loc, ok := result.Locations[node]
+	if !assert.True(t, ok, "a location entry must be emitted for the now-gone node") {
+		return
+	}
+	assert.Equal(t, PartialUpdate, loc.AddressUpdateAction,
+		"the gone node is emitted with AddressUpdateAction=PartialUpdate")
+	assert.NotNil(t, loc.Addresses, "Addresses map must be non-nil (else the JSON would omit the field)")
+	assert.Empty(t, loc.Addresses,
+		"a fully drained node is emitted with an empty Addresses map, which the ServiceGateway treats "+
+			"as deleting the whole location/node")
 }

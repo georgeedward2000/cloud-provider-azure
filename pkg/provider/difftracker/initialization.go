@@ -97,7 +97,7 @@ func InitializeFromCluster(
 	// Recover resources stuck with finalizers from a previous crash
 	// This must happen BEFORE informers start to avoid race conditions
 	// Reuse lists from buildK8sState (avoids duplicate API calls)
-	recoverStuckFinalizers(ctx, diffTracker, nodeNameToIPMap, serviceList, egressPodList, endpointSliceList)
+	recoverStuckFinalizers(ctx, diffTracker, nodeNameToIPMap, serviceList, egressPodList, endpointSliceList, currentLoadBalancersInNRP, currentNATGatewaysInNRP, pipNameToIP)
 
 	// Counter already initialized from K8s state during buildK8sState
 	// After initialization sync completes, NRP will match K8s, so counter reflects final state
@@ -287,6 +287,9 @@ func recoverStuckFinalizers(
 	services *v1.ServiceList,
 	egressPods *v1.PodList,
 	endpointSlices *discoveryv1.EndpointSliceList,
+	currentLBsInAzure *utilsets.IgnoreCaseSet,
+	currentNATsInAzure *utilsets.IgnoreCaseSet,
+	azurePIPNameToIP map[string]string,
 ) {
 	logger := log.FromContextOrBackground(ctx)
 
@@ -299,17 +302,20 @@ func recoverStuckFinalizers(
 
 	// Recover stuck services (LoadBalancer services with our finalizer + DeletionTimestamp)
 	//
-	// SAFETY ANALYSIS: Why is it safe to remove the finalizer if no Azure resource exists?
-	// - processK8sServices() explicitly SKIPS services with DeletionTimestamp (line ~456)
-	// - Therefore, services with DeletionTimestamp are NOT added to K8s.Services
-	// - GetSyncOperations() computes Additions = K8s.Services - NRP (services in K8s but not NRP)
-	// - Since this service is NOT in K8s.Services, it will NEVER be in Additions
-	// - Therefore, Azure resources will NEVER be created for this service during initialization
-	// - If no Azure resource exists and none will be created, the finalizer is just blocking deletion
+	// SAFETY ANALYSIS: When is it safe to remove the finalizer directly?
+	// - processK8sServices() SKIPS services with a DeletionTimestamp, so they are NOT in K8s.Services
+	//   and GetSyncOperations() (Additions = K8s.Services - NRP) will never re-create their resources.
+	// - So once we confirm no Azure resource currently EXISTS for the service, the finalizer is just
+	//   blocking deletion and can be removed.
+	// - "Exists" must be judged against actual Azure state, not just ServiceGateway registration: a
+	//   crash after the PIP/LB were created but before SGW registration leaves a real resource that is
+	//   absent from NRPResources. We therefore also consult the Azure LB/NAT/PIP enumeration below so
+	//   the finalizer (the only anchor to those resources) is not stripped before their cleanup runs.
 	//
 	// Two cases for stuck services:
-	// 1. Azure resource EXISTS in NRP → diff mechanism handles it (marks for Removal → deletes → removes finalizer)
-	// 2. Azure resource DOES NOT exist in NRP → we directly remove finalizer (nothing to clean up)
+	// 1. A real Azure resource EXISTS (registered in NRP or found by the Azure enumeration) → leave the
+	//    finalizer in place; the diff/orphan cleanup deletes the resource and then removes the finalizer.
+	// 2. No Azure resource exists → directly remove the finalizer (nothing to clean up).
 	servicesDirectCleaned := 0
 	if services == nil {
 		logger.V(4).Info("Skipped service finalizer recovery because service list was nil")
@@ -332,8 +338,16 @@ func recoverStuckFinalizers(
 
 			uid := strings.ToLower(string(svc.UID))
 
-			// Check if this service has a corresponding Azure resource in NRP
-			hasAzureResource := dt.NRPResources.LoadBalancers.Has(uid) || dt.NRPResources.NATGateways.Has(uid)
+			// Check whether a real Azure resource exists for this service. NRPResources only reflects
+			// services that completed ServiceGateway registration (Step 4 of creation), so a crash
+			// after the PIP/LB were created but before registration leaves the resource present in
+			// Azure yet absent from NRPResources. Also consult the actual Azure LB/NAT/PIP enumeration
+			// so we do not strip the finalizer before the resource's cleanup is scheduled.
+			_, pipExistsInAzure := azurePIPNameToIP[uid+"-pip"]
+			hasAzureResource := dt.NRPResources.LoadBalancers.Has(uid) || dt.NRPResources.NATGateways.Has(uid) ||
+				(currentLBsInAzure != nil && currentLBsInAzure.Has(uid)) ||
+				(currentNATsInAzure != nil && currentNATsInAzure.Has(uid)) ||
+				pipExistsInAzure
 
 			if hasAzureResource {
 				// Azure resource exists - diff mechanism will handle deletion
@@ -576,7 +590,7 @@ func processK8sEgresses(
 		}
 
 		egressVal := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
-		if egressVal == "" || pod.Status.PodIP == "" || pod.Spec.NodeName == "" {
+		if egressVal == "" || pod.Status.PodIP == "" || pod.Spec.NodeName == "" || !IsValidEgressIdentity(egressVal) {
 			logger.V(5).Info("Skipped invalid egress pod", "namespace", pod.Namespace, "pod", pod.Name, "label", egressVal, "podIP", pod.Status.PodIP, "node", pod.Spec.NodeName)
 			continue
 		}

@@ -303,3 +303,65 @@ func TestGuardStateTransitions_AddPodDuringDeletionInProgress_Buffers(t *testing
 	op := dt.pendingServiceOps[uid]
 	assert.Equal(t, StateDeletionInProgress, op.State, "service must stay in DeletionInProgress until delete finishes")
 }
+
+// TestUpdateService_RecreateAfterDeletionReplays verifies the LoadBalancer -> ClusterIP -> LoadBalancer
+// toggle contract: an UpdateService arriving while a delete is in flight must not race the delete;
+// instead it records RecreateAfterDeletion and buffers the new Config, and the deletion-success branch
+// then replays it as a fresh create (StateNotStarted, retry/inflight/last-applied cleared,
+// RecreateAfterDeletion cleared, trigger fired).
+func TestUpdateService_RecreateAfterDeletionReplays(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-recreate"
+
+	// Service is mid-delete. NRP still has the LB so UpdateService takes the
+	// existing-tracking path rather than delegating to AddService.
+	dt.NRPResources.LoadBalancers.Insert(uid)
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:        uid,
+		Config:            NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:             StateDeletionInProgress,
+		LastAppliedConfig: func() *ServiceConfig { c := NewInboundServiceConfig(uid, makeInboundConfig(80)); return &c }(),
+		// InFlightConfig is nil — the delete worker doesn't set it on the engine state,
+		// so a genuine delete-success completion will NOT fire the pre-empt branch.
+	}
+	dt.pendingServiceDeletions[uid] = &PendingServiceDeletion{ServiceUID: uid, IsInbound: true}
+	// Drain any pre-existing trigger so we can assert the replay fires a fresh one.
+	select {
+	case <-dt.serviceUpdaterTrigger:
+	default:
+	}
+
+	// UpdateService with a CHANGED spec while deletion is in progress.
+	dt.UpdateService(NewInboundServiceConfig(uid, makeInboundConfig(8080)))
+
+	op := dt.pendingServiceOps[uid]
+	assert.True(t, op.RecreateAfterDeletion,
+		"UpdateService during StateDeletionInProgress MUST set RecreateAfterDeletion")
+	assert.Equal(t, int32(8080), op.Config.InboundConfig.FrontendPorts[0].Port,
+		"UpdateService during deletion MUST buffer the new desired Config for the replay")
+	// State must stay in deletion — the re-create cannot race the in-flight delete.
+	assert.Equal(t, StateDeletionInProgress, op.State,
+		"UpdateService during deletion must NOT change state (deletion still wins until success)")
+
+	// Delete success arrives. The replay branch must reset the op to a fresh create and trigger
+	// the dispatcher.
+	dt.OnServiceCreationComplete(uid, true, nil)
+	op = dt.pendingServiceOps[uid]
+	if !assert.NotNil(t, op, "replay must keep the op tracked (not delete it like a normal delete-success)") {
+		return
+	}
+	assert.Equal(t, StateNotStarted, op.State,
+		"delete-success with RecreateAfterDeletion MUST replay as StateNotStarted")
+	assert.False(t, op.RecreateAfterDeletion, "the flag MUST be cleared after the replay")
+	assert.Nil(t, op.InFlightConfig, "InFlightConfig MUST be cleared on replay")
+	assert.Nil(t, op.LastAppliedConfig, "LastAppliedConfig MUST be cleared on replay (fresh create)")
+	assert.Equal(t, 0, op.RetryCount, "RetryCount MUST be reset for the fresh create")
+	_, stillQueued := dt.pendingServiceDeletions[uid]
+	assert.False(t, stillQueued, "PendingServiceDeletion MUST be cleared on replay")
+
+	select {
+	case <-dt.serviceUpdaterTrigger:
+	default:
+		t.Fatal("replay path MUST nudge the ServiceUpdater so the fresh create dispatches")
+	}
+}

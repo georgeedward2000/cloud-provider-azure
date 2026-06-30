@@ -1331,3 +1331,23 @@ func TestGetBackendPrivateIPsPodIP(t *testing.T) {
 		})
 	}
 }
+
+func TestPodIPBackendPool_EnsureHostsInPoolIsNoOp(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	az := GetTestCloud(ctrl)
+	bpi := newBackendPoolTypePodIP(az)
+	svc := getTestServiceWithIntTargetPorts("podip-noop", v1.ProtocolTCP, nil, false, 8080, 1234)
+	backendPool := &armnetwork.BackendAddressPool{Properties: &armnetwork.BackendAddressPoolPropertiesFormat{}}
+
+	err := bpi.EnsureHostsInPool(context.Background(), &svc, []*v1.Node{{}}, "pool-id", "vmss", testClusterName, "lb", backendPool)
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+
+	// PodIP backend pools are populated by ServiceGateway (via NRP), not by this legacy hook, and the
+	// non-ServiceGateway PodIP path is rejected upstream, so EnsureHostsInPool intentionally programs
+	// no addresses here.
+	assert.Empty(t, backendPool.Properties.LoadBalancerBackendAddresses)
+}

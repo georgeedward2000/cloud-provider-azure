@@ -3148,6 +3148,15 @@ func (az *Cloud) getExpectedLBRules(
 	var expectedRules []*armnetwork.LoadBalancingRule
 	var expectedProbes []*armnetwork.Probe
 
+	// PodIP backend pools are only supported via ServiceGateway, which programs the load balancing
+	// rules and backend addresses itself and never reaches this legacy reconcile path. Reaching here
+	// with a PodIP backend pool means ServiceGateway is not active, an unsupported configuration, so
+	// reject it rather than emit rules that target the wrong backend port with floating IP enabled
+	// against a backend pool that is never populated.
+	if az.IsLBBackendPoolTypePodIP() {
+		return nil, nil, fmt.Errorf("PodIP backend pool type is not supported without ServiceGateway for service %q", service.Name)
+	}
+
 	// support podPresence health check when External Traffic Policy is local
 	// take precedence over user defined probe configuration
 	// healthcheck proxy server serves http requests

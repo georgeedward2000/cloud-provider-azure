@@ -219,6 +219,16 @@ func (az *Cloud) podInformerAddPod(pod *v1.Pod) {
 	}
 
 	egressName := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
+	if !difftracker.IsValidEgressIdentity(egressName) {
+		// The egress label is set by the workload owner and becomes the NAT Gateway name and ARM
+		// resource ID, so an invalid value would produce malformed ARM requests (endless create
+		// retries). Reject it and surface the misconfiguration rather than registering the pod.
+		klog.Warningf("podInformerAddPod: pod %s/%s has an invalid egress gateway label %q; skipping egress registration",
+			pod.Namespace, pod.Name, egressName)
+		az.Event(pod, v1.EventTypeWarning, "ServiceGatewayInvalidEgressLabel",
+			fmt.Sprintf("Invalid egress gateway label %q: must be a valid Azure resource name (alphanumerics, '-', '_', '.'; start alphanumeric; 1-80 chars)", egressName))
+		return
+	}
 	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 
 	klog.V(2).Infof("podInformerAddPod: Pod %s added with egress %s (HostIP=%s, PodIP=%s)",

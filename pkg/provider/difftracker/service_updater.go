@@ -145,12 +145,28 @@ const parkReArmCooldown = 5 * time.Minute
 func (s *ServiceUpdater) retryGate(serviceUID string, opState *ServiceOperationState) bool {
 	// Terminal ceiling: stop re-dispatching after exhausting the retry budget.
 	if opState.RetryCount >= maxServiceRetries {
+		// A parked delete has no external driver to re-arm it: the upstream service controller removes
+		// its own load-balancer finalizer on the first (async) delete and then stops calling
+		// EnsureLoadBalancerDeleted, so unlike create/update (which its periodic resync re-drives via
+		// UpdateService) a parked delete would otherwise strand the Service in Terminating until the
+		// CCM restarts. Self-arm it: park for a cooldown, schedule a self-driven revisit, then re-arm
+		// once the cooldown elapses.
+		isDelete := opState.State == StateDeletionInProgress
 		if !opState.RetriesExhausted {
 			opState.RetriesExhausted = true
-			// Record when the op may be re-armed so a resync can self-heal it after the outage.
+			// Record when the op may be re-armed so a resync (or, for a delete, the self-driven
+			// revisit below) can recover it after the outage.
 			opState.NextRetryAt = time.Now().Add(parkReArmCooldown)
 			s.logger.Info("Giving up service operation after exhausting retries",
 				"serviceUID", serviceUID, "state", opState.State, "retries", opState.RetryCount)
+			if isDelete {
+				time.AfterFunc(parkReArmCooldown, s.diffTracker.triggerServiceUpdater)
+			}
+		} else if isDelete && !opState.NextRetryAt.IsZero() && time.Now().After(opState.NextRetryAt) {
+			// The cooldown since the delete parked has elapsed: re-arm it once so the deletion (and
+			// SGW finalizer removal) dispatches again this pass.
+			resetRetryStateLocked(opState)
+			return false
 		}
 		s.mu.Lock()
 		delete(s.activeOps, serviceUID)
@@ -449,19 +465,26 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 	}
 	s.logger.V(5).Info("Registered inbound service with ServiceGateway", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	// Step 5: Update K8s Service status with the external IP
-	// This is critical for ServiceGateway mode since EnsureLoadBalancer returns empty status immediately.
-	// Without this, the Service.Status.LoadBalancer.Ingress would remain empty.
-	if pipIPAddress != "" {
-		if err := s.diffTracker.updateServiceLoadBalancerStatus(ctx, serviceUID, pipIPAddress); err != nil {
-			s.logger.V(4).Info("Could not update service status with external IP", "serviceUID", serviceUID, "publicIPAddress", pipIPAddress, "err", err)
-			// Non-fatal: Azure resources are created successfully, status update can be retried
-		} else {
-			s.logger.V(5).Info("Updated service status with external IP", "serviceUID", serviceUID, "publicIPAddress", pipIPAddress)
-		}
-	} else {
-		s.logger.V(4).Info("Could not update service status because Public IP address was unavailable", "serviceUID", serviceUID)
+	// Step 5: Update K8s Service status with the external IP.
+	// This is critical for ServiceGateway mode since EnsureLoadBalancer returns empty status
+	// immediately; without it the Service.Status.LoadBalancer.Ingress stays empty and the load
+	// balancer appears permanently pending despite the Azure resources existing.
+	if pipIPAddress == "" {
+		// The Public IP create response carried no allocated address. Fail the op so it is retried;
+		// the Azure resources are idempotent and a later attempt returns the allocated address.
+		s.logger.V(4).Info("Public IP address unavailable, will retry to populate service status", "serviceUID", serviceUID, "correlationID", correlationID)
+		s.onComplete(serviceUID, false, fmt.Errorf("public IP address unavailable for service %s", serviceUID))
+		return
 	}
+	if err := s.diffTracker.updateServiceLoadBalancerStatus(ctx, serviceUID, pipIPAddress); err != nil {
+		// The Azure resources are created and idempotent, but the Service status was not written.
+		// Fail the op so the existing retry path re-runs and re-attempts the status update instead of
+		// reporting a false success that would leave the service stranded without an ingress IP.
+		s.logger.V(4).Info("Could not update service status with external IP, will retry", "serviceUID", serviceUID, "correlationID", correlationID, "publicIPAddress", pipIPAddress, "err", err)
+		s.onComplete(serviceUID, false, fmt.Errorf("failed to update service status with external IP: %w", err))
+		return
+	}
+	s.logger.V(5).Info("Updated service status with external IP", "serviceUID", serviceUID, "publicIPAddress", pipIPAddress)
 
 	// Update NRPResources to reflect the sync
 	s.diffTracker.UpdateNRPLoadBalancers(SyncServicesReturnType{

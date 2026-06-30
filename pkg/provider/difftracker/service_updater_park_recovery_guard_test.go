@@ -25,10 +25,20 @@ limitations under the License.
 package difftracker
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+	servicehelper "k8s.io/cloud-provider/service/helpers"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/loadbalancerclient/mock_loadbalancerclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipaddressclient/mock_publicipaddressclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient/mock_servicegatewayclient"
 )
 
 // gatedByRetry reports whether the dispatcher would skip the operation this pass. It mirrors the
@@ -214,4 +224,178 @@ func TestGuardRetriesExhaustedPark_ParkedDeleteRecoversOnRedelete(t *testing.T) 
 	assert.False(t, op.RetriesExhausted, "a repeated delete must clear a parked deletion")
 	assert.Equal(t, 0, op.RetryCount, "a repeated delete must reset the parked delete retry budget")
 	assert.False(t, gatedByRetry(su, dt, uid), "the recovered delete must be dispatchable")
+}
+
+// TestParkedDelete_SelfReArmsAfterCooldown verifies that a delete parked after exhausting its retry
+// budget re-arms itself once the cooldown has elapsed, without depending on a second DeleteService
+// call. The upstream controller removes its own load-balancer finalizer on the first (async) delete
+// and never re-calls EnsureLoadBalancerDeleted, so retryGate must drive the recovery itself.
+func TestParkedDelete_SelfReArmsAfterCooldown(t *testing.T) {
+	dt := newTestDiffTracker()
+	su := newTestServiceUpdater(dt)
+	uid := "svc-parked-delete-cooldown"
+
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:       uid,
+		Config:           NewInboundServiceConfig(uid, nil),
+		State:            StateDeletionInProgress,
+		RetryCount:       maxServiceRetries,
+		RetriesExhausted: true,
+		NextRetryAt:      time.Now().Add(-time.Minute), // cooldown elapsed
+	}
+
+	assert.False(t, gatedByRetry(su, dt, uid),
+		"a parked delete past its cooldown must be re-armed and dispatchable without a second DeleteService")
+	op := dt.pendingServiceOps[uid]
+	assert.False(t, op.RetriesExhausted, "the parked delete must be re-armed (park cleared)")
+	assert.Equal(t, 0, op.RetryCount, "the parked delete must get a fresh retry budget")
+}
+
+// TestParkedCreate_NotSelfReArmedByRetryGate verifies that the self-rearm is delete-only: a parked
+// create past its cooldown stays gated in retryGate, because create/update recover through the
+// upstream controller's periodic resync via UpdateService (covered by
+// TestGuardRetriesExhaustedPark_CreateRecoversAfterCooldown), which a delete has no equivalent of.
+func TestParkedCreate_NotSelfReArmedByRetryGate(t *testing.T) {
+	dt := newTestDiffTracker()
+	su := newTestServiceUpdater(dt)
+	uid := "svc-parked-create-cooldown"
+
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:       uid,
+		Config:           NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:            StateNotStarted,
+		RetryCount:       maxServiceRetries,
+		RetriesExhausted: true,
+		NextRetryAt:      time.Now().Add(-time.Minute), // cooldown elapsed
+	}
+
+	assert.True(t, gatedByRetry(su, dt, uid),
+		"retryGate must not self-rearm a parked create; it recovers via UpdateService on the next resync")
+	op := dt.pendingServiceOps[uid]
+	assert.True(t, op.RetriesExhausted, "the parked create must stay parked in retryGate")
+}
+
+// TestParkedDelete_SkippedDuringCooldown verifies that a delete which has exhausted its retry budget
+// (RetriesExhausted=true) and whose park cooldown has not yet elapsed is skipped by the dispatcher:
+// processBatch dispatches no worker, the SGW cleanup finalizer is left in place, and activeOps is
+// released so retryGate can re-evaluate on a later pass. Once the cooldown elapses the delete re-arms
+// itself (see TestParkedDelete_SelfReArmsAfterCooldown), so the deletion resumes without depending on
+// a second EnsureLoadBalancerDeleted call from the upstream controller.
+func TestParkedDelete_SkippedDuringCooldown(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// If any Azure client method is invoked at all, the test fails: that would mean processBatch
+	// dispatched the delete, the opposite of the skip-during-cooldown behavior asserted here.
+	f := mock_azclient.NewMockClientFactory(ctrl)
+	sgw := mock_servicegatewayclient.NewMockInterface(ctrl)
+	lb := mock_loadbalancerclient.NewMockInterface(ctrl)
+	pip := mock_publicipaddressclient.NewMockInterface(ctrl)
+	f.EXPECT().GetServiceGatewayClient().Return(sgw).AnyTimes()
+	f.EXPECT().GetLoadBalancerClient().Return(lb).AnyTimes()
+	f.EXPECT().GetPublicIPAddressClient().Return(pip).AnyTimes()
+	sgw.EXPECT().UpdateServices(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	lb.EXPECT().Delete(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	pip.EXPECT().Delete(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	// Pre-load a K8s Service carrying the SGW finalizer so we can prove the finalizer is NOT
+	// stripped while the op is parked.
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc", Namespace: "default", UID: "uid-parked-del",
+			Finalizers: []string{ServiceGatewayServiceCleanupFinalizer, servicehelper.LoadBalancerCleanupFinalizer},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+	kube := fake.NewSimpleClientset(svc)
+
+	dt := newTestDiffTracker()
+	dt.config = testConfig()
+	dt.kubeClient = kube
+	dt.networkClientFactory = f
+	dt.NRPResources.LoadBalancers.Insert("uid-parked-del")
+
+	uid := "uid-parked-del"
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:       uid,
+		Config:           NewInboundServiceConfig(uid, nil),
+		State:            StateDeletionInProgress,
+		RetryCount:       maxServiceRetries,
+		RetriesExhausted: true,
+		// Park cooldown still in effect: the op is skipped this pass. It re-arms itself once the
+		// cooldown elapses (see TestParkedDelete_SelfReArmsAfterCooldown).
+		NextRetryAt: time.Now().Add(time.Hour),
+	}
+	dt.pendingServiceDeletions[uid] = &PendingServiceDeletion{ServiceUID: uid, IsInbound: true}
+
+	su := newTestServiceUpdater(dt)
+
+	// processBatch must SKIP the parked op: no dispatch (proven by the Times(0) expectations on
+	// the SGW/LB/PIP clients above) and activeOps released so retryGate can re-evaluate later.
+	su.processBatch()
+
+	op := dt.pendingServiceOps[uid]
+	assert.Equal(t, StateDeletionInProgress, op.State,
+		"parked delete op must stay in StateDeletionInProgress (not advanced, not cleared)")
+	assert.True(t, op.RetriesExhausted, "parked delete op must remain parked")
+
+	su.mu.Lock()
+	_, active := su.activeOps[uid]
+	su.mu.Unlock()
+	assert.False(t, active, "retryGate must release activeOps for the parked op")
+
+	// The K8s Service finalizer must STILL be present (we never dispatched the worker, so
+	// removeServiceGatewayFinalizer was never invoked).
+	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Contains(t, got.ObjectMeta.Finalizers, ServiceGatewayServiceCleanupFinalizer,
+		"parked delete: SGW cleanup finalizer must NOT have been removed (no worker dispatched)")
+}
+
+// TestUpdateService_CreationFailedTerminalRecoversOnSpecChange verifies that an op parked with
+// CreationFailedTerminal (a non-retryable, spec-driven failure) recovers when an UpdateService
+// arrives with a changed spec: the terminal flag clears, the retry budget resets, the state returns
+// to StateNotStarted, and the dispatcher is nudged. An unchanged-spec resync leaves the park intact.
+func TestUpdateService_CreationFailedTerminalRecoversOnSpecChange(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-terminal-recover"
+	oldCfg := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:             uid,
+		Config:                 oldCfg,
+		State:                  StateNotStarted,
+		CreationFailedTerminal: true,
+		// Also pile on a real retry-budget exhaustion to prove the recovery clears BOTH
+		// terminal AND backoff state, not just one.
+		RetryCount:       maxServiceRetries,
+		RetriesExhausted: true,
+		NextRetryAt:      time.Now().Add(time.Hour),
+	}
+	// Drain any pre-existing trigger so we can assert the recovery fires a fresh one.
+	select {
+	case <-dt.serviceUpdaterTrigger:
+	default:
+	}
+
+	dt.UpdateService(NewInboundServiceConfig(uid, makeInboundConfig(8080)))
+
+	op := dt.pendingServiceOps[uid]
+	assert.False(t, op.CreationFailedTerminal,
+		"a spec-changing UpdateService MUST clear CreationFailedTerminal")
+	assert.False(t, op.RetriesExhausted, "park (RetriesExhausted) MUST also be cleared on recovery")
+	assert.Equal(t, 0, op.RetryCount, "RetryCount MUST be reset to 0 on recovery")
+	assert.True(t, op.NextRetryAt.IsZero(), "NextRetryAt MUST be cleared so the dispatcher does not skip the recovered op")
+	assert.Equal(t, StateNotStarted, op.State,
+		"the recovered op MUST be StateNotStarted so the dispatcher picks it up next pass")
+	// Config was overwritten with the new spec.
+	assert.Equal(t, int32(8080), op.Config.InboundConfig.FrontendPorts[0].Port,
+		"the new (changed) spec must be stored on the op")
+
+	// The dispatcher must be nudged: without this nudge a parked op has no worker to pick it
+	// up and would wait for an unrelated future trigger.
+	select {
+	case <-dt.serviceUpdaterTrigger:
+	default:
+		t.Fatal("recovery must enqueue a fresh ServiceUpdater trigger")
+	}
 }

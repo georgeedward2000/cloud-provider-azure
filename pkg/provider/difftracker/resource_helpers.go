@@ -18,6 +18,7 @@ package difftracker
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
@@ -29,6 +30,19 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
+
+// egressIdentityRegex matches a valid (lowercased) Azure NAT Gateway resource name: it starts with
+// an alphanumeric, contains only alphanumerics, hyphens, underscores and periods, ends with an
+// alphanumeric or underscore, and is 1-80 characters long.
+var egressIdentityRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]{0,78}[a-z0-9_])?$`)
+
+// IsValidEgressIdentity reports whether name is a safe egress identity. The identity is derived from
+// a user-controllable pod label and is used verbatim as the NAT Gateway name and interpolated into
+// its ARM resource ID, so it must be validated to avoid malformed ARM requests (for example a
+// path-traversal value like "../foo") and the resulting endless create retries.
+func IsValidEgressIdentity(name string) bool {
+	return egressIdentityRegex.MatchString(name)
+}
 
 // buildInboundServiceResources constructs the PIP, LoadBalancer, and ServicesDTO for an inbound service
 // Returns the resources ready to be created via createOrUpdatePIP/createOrUpdateLB/updateNRPSGWServices

@@ -2,8 +2,11 @@ package difftracker
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
@@ -485,4 +488,191 @@ func TestInitOutboundRefCount_NotNegativeOnServiceUIDEgressLabelCollision(t *tes
 		"with exactly one live egress pod the ref-count must be 1 (last pod)")
 	assert.False(t, podIPTracked(&dt.K8sResources, podIP),
 		"DeletePod must remove the egress pod")
+}
+
+// TestRecoverStuckFinalizers_KeepsFinalizerWhenAzureResourceExists verifies that a service whose
+// PIP/LB was created in Azure but never registered with ServiceGateway (a crash between LB-create and
+// SGW-register) keeps its cleanup finalizer during recovery. NRPResources does not list it, but the
+// Azure LB enumeration does, so the finalizer is preserved as the anchor and the orphan cleanup
+// deletes the resource and removes the finalizer in the correct order.
+func TestRecoverStuckFinalizers_KeepsFinalizerWhenAzureResourceExists(t *testing.T) {
+	uid := "uid-crashwindow"
+	delTime := metav1.Now()
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc-crash", Namespace: "default", UID: types.UID(uid),
+			DeletionTimestamp: &delTime,
+			Finalizers:        []string{ServiceGatewayServiceCleanupFinalizer},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+	kube := fake.NewSimpleClientset(svc)
+	dt := newTestDiffTracker()
+	dt.kubeClient = kube
+	// NRPResources does NOT have the UID (registration never completed) - the crash window.
+	services := &v1.ServiceList{Items: []v1.Service{*svc}}
+
+	// A real Azure LB exists for the UID even though it is absent from NRPResources.
+	recoverStuckFinalizers(context.Background(), dt, nil, services, nil, nil, utilsets.NewString(uid), utilsets.NewString(), nil)
+
+	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-crash", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.True(t, hasServiceGatewayFinalizer(got),
+		"finalizer must be kept while a real Azure resource exists so cleanup can remove it after deleting the resource")
+}
+
+// TestRecoverStuckFinalizers_KeepsFinalizerWhenOnlyPIPExists covers the PIP-only crash window: the
+// Public IP was created but the LB was not, so the UID is absent from both NRPResources and the LB
+// enumeration, yet the {uid}-pip Public IP exists in Azure. The finalizer must still be preserved.
+func TestRecoverStuckFinalizers_KeepsFinalizerWhenOnlyPIPExists(t *testing.T) {
+	uid := "uid-pip-only"
+	delTime := metav1.Now()
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc-pip", Namespace: "default", UID: types.UID(uid),
+			DeletionTimestamp: &delTime,
+			Finalizers:        []string{ServiceGatewayServiceCleanupFinalizer},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+	kube := fake.NewSimpleClientset(svc)
+	dt := newTestDiffTracker()
+	dt.kubeClient = kube
+	services := &v1.ServiceList{Items: []v1.Service{*svc}}
+
+	azurePIPs := map[string]string{uid + "-pip": "10.0.0.9"}
+	recoverStuckFinalizers(context.Background(), dt, nil, services, nil, nil, utilsets.NewString(), utilsets.NewString(), azurePIPs)
+
+	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-pip", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.True(t, hasServiceGatewayFinalizer(got),
+		"finalizer must be kept while a real Azure Public IP exists for the service")
+}
+
+// TestRecoverStuckFinalizers_RemovesFinalizerWhenNoAzureResource verifies the complementary case: a
+// stuck finalizer with no Azure resource anywhere (not in ServiceGateway, not in the Azure LB/NAT/PIP
+// enumeration) is removed directly, since there is nothing to clean up.
+func TestRecoverStuckFinalizers_RemovesFinalizerWhenNoAzureResource(t *testing.T) {
+	uid := "uid-noresource"
+	delTime := metav1.Now()
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc-clean", Namespace: "default", UID: types.UID(uid),
+			DeletionTimestamp: &delTime,
+			Finalizers:        []string{ServiceGatewayServiceCleanupFinalizer},
+		},
+		Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+	kube := fake.NewSimpleClientset(svc)
+	dt := newTestDiffTracker()
+	dt.kubeClient = kube
+	services := &v1.ServiceList{Items: []v1.Service{*svc}}
+
+	recoverStuckFinalizers(context.Background(), dt, nil, services, nil, nil, utilsets.NewString(), utilsets.NewString(), nil)
+
+	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-clean", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.False(t, hasServiceGatewayFinalizer(got),
+		"finalizer with no Azure resource must be removed since there is nothing to clean up")
+}
+
+// TestCheckInitializationComplete_ParkedOpBlocksCompletion verifies that
+// checkInitializationCompleteLocked counts a transient-failure-parked op (RetriesExhausted=true,
+// CreationFailedTerminal=false) as still pending: while such an op remains in pendingServiceOps the
+// init-completion channel does not close, so WaitForInitialSync returns its context deadline rather
+// than completing.
+func TestCheckInitializationComplete_ParkedOpBlocksCompletion(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-init-parked"
+
+	// Set up the initialization state the engine uses during cold start.
+	atomic.StoreInt32(&dt.isInitializing, 1)
+	dt.initCompletionChecker = make(chan struct{})
+
+	// Parked-but-not-terminal: retryGate skips it, but checkInitializationCompleteLocked still
+	// counts it as pending.
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:             uid,
+		Config:                 NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:                  StateCreationInProgress,
+		RetryCount:             maxServiceRetries,
+		RetriesExhausted:       true,
+		CreationFailedTerminal: false,
+		NextRetryAt:            time.Now().Add(time.Hour),
+	}
+
+	// Force-evaluate completion: with the parked op counted as pending, the channel must NOT close.
+	dt.checkInitializationComplete()
+	select {
+	case <-dt.initCompletionChecker:
+		t.Fatal("init must not complete while a parked op remains in pendingServiceOps")
+	default:
+	}
+
+	// WaitForInitialSync therefore drains its context: it returns a context-deadline error rather
+	// than a successful completion.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := dt.WaitForInitialSync(ctx)
+	assert.Error(t, err, "WaitForInitialSync must return a context error while a parked op blocks completion")
+	assert.True(t, errors.Is(err, context.DeadlineExceeded),
+		"the error must be the context deadline (not a successful nil return)")
+}
+
+// TestEgressRefCount_Robust verifies the outbound (NAT Gateway) ref-count lifecycle:
+//
+//   - Two AddPod calls for the same egress identity and pod (an informer Add followed by an Update
+//     that re-delivers the same egress label) are idempotent: the ref-count stays at 1.
+//   - Removing the last pod marks the service for deletion exactly once (StateDeletionPending) and
+//     drops the ref-count entry to 0.
+//   - A subsequent stale DeletePod is a no-op and the ref-count never goes negative.
+func TestEgressRefCount_Robust(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "egress-refcount"
+	const node = "10.0.0.1"
+	const podIP = "10.244.0.9"
+
+	// Outbound service already exists in NRP (the AddPod no-tracking-yet path).
+	dt.NRPResources.NATGateways.Insert(uid)
+
+	// First AddPod registers the pod and bumps the counter to 1.
+	dt.AddPod(uid, "ns/pod-a", node, podIP)
+	v, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(uid))
+	if assert.True(t, ok, "first AddPod must register the egress identity in the ref-counter") {
+		assert.Equal(t, 1, v.(int), "first AddPod must set the ref-count to 1")
+	}
+
+	// Second AddPod for the SAME identity + SAME pod must be idempotent: counter stays at 1.
+	dt.AddPod(uid, "ns/pod-a", node, podIP)
+	v, _ = dt.outboundIdentityPodRefCount.Load(strings.ToLower(uid))
+	assert.Equal(t, 1, v.(int),
+		"duplicate AddPod for the same egress identity + pod must be idempotent (ref-count stays at 1)")
+
+	// Removing the last pod must report IsLastPod=true and drop the counter entry to 0
+	// (the sync.Map key is removed on counter==1 by decrementOutboundRefCount).
+	res := dt.DeletePod(uid, node, podIP, "ns", "pod-a", "")
+	assert.True(t, res.IsLastPod, "removing the only pod must report IsLastPod=true exactly once")
+	_, stillExists := dt.outboundIdentityPodRefCount.Load(strings.ToLower(uid))
+	assert.False(t, stillExists,
+		"last-pod removal must delete the ref-count key (counter went 1 → 0)")
+
+	// The teardown path must run EXACTLY ONCE — the service is marked for deletion.
+	op := dt.pendingServiceOps[uid]
+	if assert.NotNil(t, op, "last-pod removal must synthesize a deletion-tracking entry") {
+		assert.Equal(t, StateDeletionPending, op.State,
+			"last-pod removal must mark the service StateDeletionPending exactly once")
+	}
+	_, queued := dt.pendingServiceDeletions[uid]
+	assert.True(t, queued, "last-pod removal must enqueue PendingServiceDeletion exactly once")
+
+	// A stale duplicate DeletePod must be a no-op (the pod is no longer in live state) and
+	// must not drive the counter negative. We can also call AddPod again as the same pod
+	// (synthesizing a same-name replacement) and re-delete it without a negative counter.
+	dup := dt.DeletePod(uid, node, podIP, "ns", "pod-a", "")
+	assert.False(t, dup.IsLastPod, "stale duplicate DeletePod must be a no-op (IsLastPod=false)")
+	if v, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(uid)); ok {
+		if cnt, _ := v.(int); cnt < 0 {
+			t.Fatalf("egress ref-count went negative after duplicate delete: %d", cnt)
+		}
+	}
 }

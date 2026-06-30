@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Caller-level (RULE 1) guards for egress pod-finalizer strand conditions. These complement the
-// engine-isolation guards in pkg/provider/difftracker/finalizers_strand_guards_test.go by driving
-// the REAL informer caller podInformerRemovePod, where the !result.Enqueued fallback removes the
-// finalizer for pods the engine does not enqueue for drain-gated removal.
+// Guards for egress pod-finalizer strand conditions driven through the real informer caller
+// podInformerRemovePod, where the !result.Enqueued fallback removes the finalizer for pods the
+// engine does not enqueue for drain-gated removal.
 
 package provider
 
