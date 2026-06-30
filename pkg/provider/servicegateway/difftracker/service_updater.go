@@ -393,6 +393,9 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 		s.logger.V(4).Info("Service gone (NotFound) before create; aborting to avoid orphaned resources", "serviceUID", serviceUID, "correlationID", correlationID)
 		s.diffTracker.mu.Lock()
 		delete(s.diffTracker.pendingServiceOps, serviceUID)
+		// Drop buffers for the gone Service too; otherwise they leak until restart.
+		delete(s.diffTracker.pendingEndpoints, serviceUID)
+		delete(s.diffTracker.pendingPods, serviceUID)
 		s.diffTracker.checkInitializationCompleteLocked()
 		s.diffTracker.mu.Unlock()
 		return

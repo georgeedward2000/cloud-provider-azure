@@ -1078,3 +1078,42 @@ func TestCheckPendingPodDeletions_Concurrent(t *testing.T) {
 	// Should not panic and tracking should be cleaned up
 	assert.Empty(t, dt.pendingPodDeletions)
 }
+
+// TestAddPodPreservesFinalizerOnEgressIdentityChange verifies that re-registering a live pod under a
+// new egress identity drops the pending finalizer-removal record left by the previous identity, so
+// CheckPendingPodDeletions does not strip the still-needed cleanup finalizer once the old identity
+// drains from NRP.
+func TestAddPodPreservesFinalizerOnEgressIdentityChange(t *testing.T) {
+	const (
+		oldEgress = "egress-a"
+		newEgress = "egress-b"
+		location  = "10.0.0.1"
+		address   = "10.244.0.7"
+	)
+	pod := newFinalizerPod("foo", "uid-live", true)
+	kube := fake.NewSimpleClientset(pod)
+
+	dt := newTestDiffTracker()
+	dt.kubeClient = kube
+
+	dt.pendingPodDeletions["default/foo"] = &PendingPodDeletion{
+		Namespace:  "default",
+		Name:       "foo",
+		UID:        "uid-live",
+		ServiceUID: oldEgress,
+		Address:    address,
+		Location:   location,
+	}
+	dt.NRPResources.NATGateways.Insert(newEgress)
+
+	dt.AddPod(newEgress, "default/foo", location, address)
+	if _, pending := dt.pendingPodDeletions["default/foo"]; pending {
+		t.Fatalf("re-registering a live pod must drop its stale pending finalizer-removal record")
+	}
+
+	dt.CheckPendingPodDeletions(context.Background())
+	got, err := kube.CoreV1().Pods("default").Get(context.Background(), "foo", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Contains(t, got.ObjectMeta.Finalizers, ServiceGatewayPodCleanupFinalizer,
+		"a live pod under a new egress identity must retain its cleanup finalizer")
+}

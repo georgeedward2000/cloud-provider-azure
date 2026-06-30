@@ -857,6 +857,9 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 
 		} else {
 			dt.logger.V(4).Info("Could not create service", "err", err, "service", serviceUID)
+			// Clear on failure (as the update path does): a stale snapshot makes a later
+			// delete-completion misfire the pre-empt block and dispatch a redundant delete.
+			opState.InFlightConfig = nil
 
 			if isTerminalError(err) {
 				// Deterministic, spec-driven failure (e.g. unsupported protocol, port out
@@ -935,6 +938,11 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 	}
 
 	dt.logger.V(5).Info("Added pod request", "service", serviceUID, "pod", podKey, "location", location, "address", address)
+
+	// A pod reaching AddPod is live; drop any stale pending finalizer-removal record (e.g. from a
+	// prior egress identity after a label or IP change) so CheckPendingPodDeletions cannot strip
+	// its cleanup finalizer while it still backs a current egress service. DeletePod re-enqueues it.
+	delete(dt.pendingPodDeletions, podKey)
 
 	// Check if service operation is tracked
 	opState, exists := dt.pendingServiceOps[serviceUID]

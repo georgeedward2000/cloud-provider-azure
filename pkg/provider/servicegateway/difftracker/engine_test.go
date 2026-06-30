@@ -974,3 +974,24 @@ func drainTrigger(ch chan bool) {
 		<-ch
 	}
 }
+
+// TestOnServiceCreationCompleteClearsInFlightConfigOnFailure verifies that a failed create clears the
+// in-flight config snapshot, matching the update path, so a later delete-completion is not misread as
+// an in-flight create.
+func TestOnServiceCreationCompleteClearsInFlightConfigOnFailure(t *testing.T) {
+	dt := newTestDiffTracker()
+	const uid = "svc-inflight"
+
+	cfg := NewInboundServiceConfig(uid, makeInboundConfig(8080))
+	op := &ServiceOperationState{
+		ServiceUID:     uid,
+		Config:         cfg,
+		InFlightConfig: &cfg,
+		State:          StateCreationInProgress,
+	}
+	dt.pendingServiceOps[uid] = op
+
+	dt.OnServiceCreationComplete(uid, false, errors.New("transient failure"))
+
+	assert.Nil(t, op.InFlightConfig, "a failed create must clear the in-flight config snapshot")
+}

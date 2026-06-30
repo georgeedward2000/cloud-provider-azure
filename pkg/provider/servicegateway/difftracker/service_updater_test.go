@@ -534,3 +534,35 @@ func TestCreateInboundService_PopulatesIngressOnSuccess(t *testing.T) {
 		assert.Equal(t, "10.1.2.3", got.Status.LoadBalancer.Ingress[0].IP)
 	}
 }
+
+// TestCreateInboundServiceClearsBuffersWhenServiceGone verifies that aborting createInboundService
+// because the Service no longer exists also drops the endpoints and pods buffered for its in-flight
+// creation, so they do not leak until the next restart.
+func TestCreateInboundServiceClearsBuffersWhenServiceGone(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const uid = "11111111-1111-1111-1111-111111111111"
+	dt := newTestDiffTracker()
+	dt.kubeClient = fake.NewSimpleClientset() // empty: getServiceByUID returns a typed NotFound
+	dt.networkClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+
+	dt.pendingServiceOps[uid] = &ServiceOperationState{ServiceUID: uid, State: StateCreationInProgress}
+	dt.pendingEndpoints[uid] = []PendingEndpointUpdate{{PodIPToNodeIP: map[string]string{"10.244.0.1": "10.0.0.1"}}}
+	dt.pendingPods[uid] = []PendingPodUpdate{{PodKey: "ns/p", Location: "10.0.0.1", Address: "10.244.0.1"}}
+
+	su := NewServiceUpdater(context.Background(), dt, func(string, bool, error) {}, dt.GetServiceUpdaterTrigger())
+	su.createInboundService(uid, &InboundConfig{}, "corr")
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	if _, ok := dt.pendingServiceOps[uid]; ok {
+		t.Fatalf("aborted create must drop the service operation")
+	}
+	if _, ok := dt.pendingEndpoints[uid]; ok {
+		t.Fatalf("aborted create must drop buffered endpoints")
+	}
+	if _, ok := dt.pendingPods[uid]; ok {
+		t.Fatalf("aborted create must drop buffered pods")
+	}
+}
