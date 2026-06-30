@@ -8,11 +8,11 @@ This document describes the architecture and control flow when the Cloud Provide
 
 | Component | File | Description |
 |-----------|------|-------------|
-| **DiffTracker** | `pkg/provider/difftracker/difftracker.go` | Core state manager holding K8s and NRP state representations |
-| **Engine** | `pkg/provider/difftracker/engine.go` | API layer with state machine for service lifecycle (`AddService`, `UpdateEndpoints`, `DeleteService`, `AddPod`, `DeletePod`) |
-| **ServiceUpdater** | `pkg/provider/difftracker/service_updater.go` | Background goroutine that creates/deletes Azure resources (PIP, LB, NAT Gateway) |
-| **LocationsUpdater** | `pkg/provider/difftracker/locations_updater.go` | Background goroutine that syncs pod IP locations to NRP via `UpdateAddressLocations` |
-| **Repository** | `pkg/provider/difftracker/repository.go` | Azure SDK operations for ServiceGateway API (`UpdateServices`, `UpdateAddressLocations`) |
+| **DiffTracker** | `pkg/provider/servicegateway/difftracker/difftracker.go` | Core state manager holding K8s and NRP state representations |
+| **Engine** | `pkg/provider/servicegateway/difftracker/engine.go` | API layer with state machine for service lifecycle (`AddService`, `UpdateEndpoints`, `DeleteService`, `AddPod`, `DeletePod`) |
+| **ServiceUpdater** | `pkg/provider/servicegateway/difftracker/service_updater.go` | Background goroutine that creates/deletes Azure resources (PIP, LB, NAT Gateway) |
+| **LocationsUpdater** | `pkg/provider/servicegateway/difftracker/locations_updater.go` | Background goroutine that syncs pod IP locations to NRP via `UpdateAddressLocations` |
+| **Repository** | `pkg/provider/servicegateway/difftracker/repository.go` | Azure SDK operations for ServiceGateway API (`UpdateServices`, `UpdateAddressLocations`) |
 
 ### State Machine
 

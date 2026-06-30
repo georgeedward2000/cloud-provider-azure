@@ -20,7 +20,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient/mock_subnetclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/privatelinkservice"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )

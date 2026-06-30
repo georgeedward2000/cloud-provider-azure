@@ -43,7 +43,7 @@ import (
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	vmutil "sigs.k8s.io/cloud-provider-azure/pkg/util/vm"
 )
 

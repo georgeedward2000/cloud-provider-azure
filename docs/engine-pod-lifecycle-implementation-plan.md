@@ -282,7 +282,7 @@ T13: COMPLETE - NAT Gateway deleted
 
 ## Key Components
 
-### 1. Engine (`pkg/provider/difftracker/engine.go`)
+### 1. Engine (`pkg/provider/servicegateway/difftracker/engine.go`)
 
 **Purpose**: Central coordinator managing service lifecycle and buffering
 
@@ -305,7 +305,7 @@ StateNotStarted → StateCreationInProgress → StateCreated
                       StateDeletionInProgress → DELETED (removed from map)
 ```
 
-### 2. XUpdater (`pkg/provider/difftracker/x_updater.go`)
+### 2. XUpdater (`pkg/provider/servicegateway/difftracker/x_updater.go`)
 
 **Purpose**: Parallel resource creator/deleter
 
@@ -339,7 +339,7 @@ StateNotStarted → StateCreationInProgress → StateCreated
 - After pod deletion
 - After any UpdateK8sEndpoints/UpdateK8sPod call
 
-### 4. DeletionChecker (`pkg/provider/difftracker/engine.go`)
+### 4. DeletionChecker (`pkg/provider/servicegateway/difftracker/engine.go`)
 
 **Purpose**: Ensures locations cleared before service deletion
 
@@ -353,7 +353,7 @@ StateNotStarted → StateCreationInProgress → StateCreated
 3. If cleared, trigger XUpdater to delete service
 4. If not cleared, do nothing (will be checked again after next location sync)
 
-### 5. DiffTracker Extensions (`pkg/provider/difftracker/types.go`)
+### 5. DiffTracker Extensions (`pkg/provider/servicegateway/difftracker/types.go`)
 
 **New State Tracking**:
 ```go
@@ -455,7 +455,7 @@ func (az *Cloud) podInformerRemovePod(pod *v1.Pod) {
 
 ## Data Structures
 
-### New Types in `pkg/provider/difftracker/types.go`
+### New Types in `pkg/provider/servicegateway/difftracker/types.go`
 
 ```go
 // BufferedPodUpdate represents a pod waiting for its service to be created
@@ -489,7 +489,7 @@ The Engine already tracks service states in `pendingServiceOps`:
 
 ### Step 1: Extend DiffTracker Types
 
-**File**: `pkg/provider/difftracker/types.go`
+**File**: `pkg/provider/servicegateway/difftracker/types.go`
 
 Add new type definition:
 
@@ -529,7 +529,7 @@ type DiffTracker struct {
 
 ### Step 2: Initialize bufferedPods Map
 
-**File**: `pkg/provider/difftracker/difftracker.go`
+**File**: `pkg/provider/servicegateway/difftracker/difftracker.go`
 
 In `InitializeDiffTracker()`, add initialization (after `bufferedEndpoints`):
 
@@ -561,7 +561,7 @@ func InitializeDiffTracker() *DiffTracker {
 
 ### Step 3: Implement Engine.AddService()
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Add the `AddService()` method:
 
@@ -619,7 +619,7 @@ func (dt *DiffTracker) AddService(serviceUID string, isInbound bool) {
 
 ### Step 4: Implement Engine.UpdateEndpoints()
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Add the `UpdateEndpoints()` method (after `AddService()` method):
 
@@ -706,7 +706,7 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, podIPToNodeIP map[stri
 
 ### Step 5: Implement Engine.DeleteService()
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Add the `DeleteService()` method (after `UpdateEndpoints()` method):
 
@@ -797,7 +797,7 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool) {
 
 ### Step 6: Implement promoteBufferedEndpointsLocked()
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Add helper method:
 
@@ -843,7 +843,7 @@ func (dt *DiffTracker) promoteBufferedEndpointsLocked(serviceUID string) {
 
 ### Step 7: Implement Engine.AddPod()
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Add the `AddPod()` method (after `promoteBufferedEndpointsLocked()` method):
 
@@ -951,7 +951,7 @@ func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
 
 ### Step 8: Implement Engine.DeletePod()
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Add the `DeletePod()` method (after `AddPod()` method):
 
@@ -1038,7 +1038,7 @@ func (dt *DiffTracker) DeletePod(serviceUID, location, address string) {
 
 ### Step 9: Implement promoteBufferedPodsLocked()
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Add helper method (after `DeletePod()` method):
 
@@ -1092,7 +1092,7 @@ func (dt *DiffTracker) promoteBufferedPodsLocked(serviceUID string) {
 
 ### Step 10: Update OnServiceCreationComplete()
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Modify `OnServiceCreationComplete()` to call both `promoteBufferedEndpointsLocked()` and `promoteBufferedPodsLocked()`:
 
@@ -1149,7 +1149,7 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 
 ### Step 11: Update XUpdater's createInboundService() and createOutboundService()
 
-**File**: `pkg/provider/difftracker/x_updater.go`
+**File**: `pkg/provider/servicegateway/difftracker/x_updater.go`
 
 Modify both `createInboundService()` and `createOutboundService()` to call `OnServiceCreationComplete()`:
 
@@ -1405,11 +1405,11 @@ func (az *Cloud) podInformerRemovePod(pod *v1.Pod) {
 
 **Files to Modify**:
 
-1. **`pkg/provider/difftracker/types.go`**
+1. **`pkg/provider/servicegateway/difftracker/types.go`**
    - Remove `PodEgressQueue` field from `DiffTracker` struct
    - Remove `PodCrudEvent`, `AddPodEvent`, `DeletePodEvent` types (no longer needed)
 
-2. **`pkg/provider/difftracker/difftracker.go`**
+2. **`pkg/provider/servicegateway/difftracker/difftracker.go`**
    - Remove `PodEgressQueue` initialization from `InitializeDiffTracker()`
 
 3. **`pkg/provider/azure_servicegateway_difftracker_init.go`**
@@ -1558,7 +1558,7 @@ T15: Pod successfully registered in Service Gateway
 
 ### Phase 0: Prerequisites - Missing Type Definitions
 
-**File**: `pkg/provider/difftracker/types.go`
+**File**: `pkg/provider/servicegateway/difftracker/types.go`
 
 Before implementing the Engine, add these missing type definitions:
 
@@ -1592,7 +1592,7 @@ type UpdatePodInputType struct {
 }
 ```
 
-**File**: `pkg/provider/difftracker/engine.go`
+**File**: `pkg/provider/servicegateway/difftracker/engine.go`
 
 Add constants for retry logic:
 
@@ -1629,7 +1629,7 @@ func (az *Cloud) getNodeIPByName(nodeName string) string {
 }
 ```
 
-**File**: `pkg/provider/difftracker/x_updater.go`
+**File**: `pkg/provider/servicegateway/difftracker/x_updater.go`
 
 Add missing import:
 
@@ -1666,7 +1666,7 @@ func (az *Cloud) startDiffTrackerEngine(ctx context.Context) {
 }
 ```
 
-**File**: `pkg/provider/difftracker/types.go`
+**File**: `pkg/provider/servicegateway/difftracker/types.go`
 
 Add updater fields to DiffTracker:
 
@@ -1700,7 +1700,7 @@ type DiffTracker struct {
 
 **Files to Create/Modify**:
 
-1. `pkg/provider/difftracker/types.go`
+1. `pkg/provider/servicegateway/difftracker/types.go`
    - Add `ResourceState` enum (StateNotStarted, StateCreationInProgress, etc.) - ✅ DONE IN PHASE 0
    - Add `ServiceOperationState` struct
    - Add `BufferedEndpointUpdate` struct
@@ -1708,14 +1708,14 @@ type DiffTracker struct {
    - Add `PendingDeletion` struct
    - Add new fields to `DiffTracker` struct
 
-2. `pkg/provider/difftracker/difftracker.go`
+2. `pkg/provider/servicegateway/difftracker/difftracker.go`
    - Update `InitializeDiffTracker()` to initialize new maps and channels
 
 ### Phase 2: Engine Implementation
 
 **Files to Create**:
 
-3. `pkg/provider/difftracker/engine.go` (NEW FILE)
+3. `pkg/provider/servicegateway/difftracker/engine.go` (NEW FILE)
    ```go
    // Core methods:
    - AddService(serviceUID string, isInbound bool)
@@ -1821,7 +1821,7 @@ func (dt *DiffTracker) serviceHasLocationsInNRP(serviceUID string) bool {
 
 **Files to Create**:
 
-4. `pkg/provider/difftracker/x_updater.go` (NEW FILE)
+4. `pkg/provider/servicegateway/difftracker/x_updater.go` (NEW FILE)
 
 **Complete Implementation**:
 
@@ -2391,7 +2391,7 @@ func convertDTOToNRPLocation(dto map[string]interface{}) NRPLocation {
 
 **Note**: DeletionChecker is implemented as simple methods in `engine.go` (Phase 2), not as a separate file or goroutine.
 
-The following methods are added to the DiffTracker/Engine in `pkg/provider/difftracker/engine.go`:
+The following methods are added to the DiffTracker/Engine in `pkg/provider/servicegateway/difftracker/engine.go`:
 
 1. `checkPendingDeletions(ctx context.Context)` - Called by LocationsUpdater after syncing
 2. `serviceHasLocationsInNRP(serviceUID string) bool` - Helper to check if locations reference a service
@@ -2474,7 +2474,7 @@ The following methods are added to the DiffTracker/Engine in `pkg/provider/difft
 
 **Test Files to Create**:
 
-17. `pkg/provider/difftracker/engine_test.go`
+17. `pkg/provider/servicegateway/difftracker/engine_test.go`
     - TestEngineAddService
     - TestEngineDeleteService
     - TestEngineUpdateEndpoints_Buffering
@@ -2486,7 +2486,7 @@ The following methods are added to the DiffTracker/Engine in `pkg/provider/difft
     - TestPromoteBufferedEndpoints
     - TestPromoteBufferedPods
 
-18. `pkg/provider/difftracker/x_updater_test.go`
+18. `pkg/provider/servicegateway/difftracker/x_updater_test.go`
     - TestXUpdaterCreateInboundService
     - TestXUpdaterCreateOutboundService
     - TestXUpdaterDeleteInboundService
@@ -2494,7 +2494,7 @@ The following methods are added to the DiffTracker/Engine in `pkg/provider/difft
     - TestXUpdaterRetryLogic
     - TestXUpdaterParallelExecution
 
-19. `pkg/provider/difftracker/deletion_checker_test.go`
+19. `pkg/provider/servicegateway/difftracker/deletion_checker_test.go`
     - TestDeletionCheckerWaitsForLocations
     - TestDeletionCheckerTriggersXUpdater
     - TestDeletionCheckerMultipleDeletions
@@ -2645,14 +2645,14 @@ The following methods are added to the DiffTracker/Engine in `pkg/provider/difft
 ## File Creation Summary
 
 ### New Files to Create:
-1. `pkg/provider/difftracker/engine.go` (~750 lines - includes all Engine methods + DeletionChecker methods)
-2. `pkg/provider/difftracker/x_updater.go` (~800 lines)
-3. `pkg/provider/difftracker/engine_test.go` (~1400 lines - includes all Engine tests + DeletionChecker tests)
-4. `pkg/provider/difftracker/x_updater_test.go` (~800 lines)
+1. `pkg/provider/servicegateway/difftracker/engine.go` (~750 lines - includes all Engine methods + DeletionChecker methods)
+2. `pkg/provider/servicegateway/difftracker/x_updater.go` (~800 lines)
+3. `pkg/provider/servicegateway/difftracker/engine_test.go` (~1400 lines - includes all Engine tests + DeletionChecker tests)
+4. `pkg/provider/servicegateway/difftracker/x_updater_test.go` (~800 lines)
 
 ### Files to Modify:
-1. `pkg/provider/difftracker/types.go` (+~150 lines, remove PodEgressQueue field and deletionCheckerTrigger channel)
-2. `pkg/provider/difftracker/difftracker.go` (+~50 lines, remove PodEgressQueue init and deletionCheckerTrigger init)
+1. `pkg/provider/servicegateway/difftracker/types.go` (+~150 lines, remove PodEgressQueue field and deletionCheckerTrigger channel)
+2. `pkg/provider/servicegateway/difftracker/difftracker.go` (+~50 lines, remove PodEgressQueue init and deletionCheckerTrigger init)
 3. `pkg/provider/azure_loadbalancer.go` (+~30 lines)
 4. `pkg/provider/azure_servicegateway_pods.go` (+~30 lines, modify ~50 lines, remove queue logic)
 5. `pkg/provider/azure_servicegateway_location_service_updater.go` (+~150 lines - complete implementation)
@@ -2667,8 +2667,8 @@ The following methods are added to the DiffTracker/Engine in `pkg/provider/difft
 ## References
 
 - **Sequence Diagrams**: See "Complete Processing Flows" section above
-- **DiffTracker Design**: `pkg/provider/difftracker/types.go`
-- **Engine Design**: To be created in `pkg/provider/difftracker/engine.go`
-- **XUpdater Design**: To be created in `pkg/provider/difftracker/x_updater.go`
+- **DiffTracker Design**: `pkg/provider/servicegateway/difftracker/types.go`
+- **Engine Design**: To be created in `pkg/provider/servicegateway/difftracker/engine.go`
+- **XUpdater Design**: To be created in `pkg/provider/servicegateway/difftracker/x_updater.go`
 - **Integration Points**: `azure_loadbalancer.go`, `azure_servicegateway_pods.go`
 - **Azure SDK References**: `armnetwork/v6` for LoadBalancer, NatGateway, PublicIP

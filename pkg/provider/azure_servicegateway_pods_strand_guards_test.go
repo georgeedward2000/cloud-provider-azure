@@ -30,7 +30,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 
 	"github.com/stretchr/testify/assert"
 )

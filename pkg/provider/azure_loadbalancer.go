@@ -47,7 +47,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/loadbalancer"
 	"sigs.k8s.io/cloud-provider-azure/pkg/trace"
 	"sigs.k8s.io/cloud-provider-azure/pkg/trace/attributes"

@@ -18,7 +18,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 )
 
 // mockDiffTracker tracks calls to AddPod and DeletePod for testing

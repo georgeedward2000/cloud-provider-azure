@@ -15,7 +15,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 )
 
 // ResyncPeriod returns a function that generates a randomized resync duration

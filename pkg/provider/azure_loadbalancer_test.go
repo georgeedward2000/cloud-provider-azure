@@ -53,7 +53,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/difftracker"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/privatelinkservice"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/subnet"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/zone"
