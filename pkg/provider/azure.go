@@ -566,6 +566,11 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 				klog.Errorf("InitializeCloudFromConfig: failed to initialize difftracker: %s", err.Error())
 				return err
 			}
+			// Cover the ordering where SetInformers has already run: hand the existing lister to
+			// the freshly built difftracker. When SetInformers runs later it publishes the lister.
+			if az.serviceLister != nil {
+				az.diffTracker.SetServiceLister(az.serviceLister)
+			}
 
 			err = az.ensureDefaultOutboundServiceExists(ctx)
 			if err != nil {
@@ -809,6 +814,13 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 
 	az.serviceLister = informerFactory.Core().V1().Services().Lister()
 	az.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+
+	// Publish the Service lister to the difftracker so it can resolve a Service UID through a
+	// cached read. In the usual startup ordering the difftracker is built before SetInformers
+	// runs, so it starts with a nil lister; this hands it the lister once available.
+	if az.diffTracker != nil {
+		az.diffTracker.SetServiceLister(az.serviceLister)
+	}
 
 	az.setUpEndpointSlicesInformer(informerFactory)
 

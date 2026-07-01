@@ -22,6 +22,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 )
@@ -104,6 +105,16 @@ func New(logger logr.Logger, k8s K8sState, nrp NRPState, config Config, networkC
 	}
 
 	return diffTracker, nil
+}
+
+// SetServiceLister publishes the provider's shared-informer-backed Service lister to the engine.
+// It is called from SetInformers once the lister exists; getServiceByUID uses it for O(1) cached
+// reads instead of listing every Service. Safe to call from a different goroutine than the engine
+// workers because the write is serialized under mu.
+func (dt *DiffTracker) SetServiceLister(lister corelisters.ServiceLister) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.serviceLister = lister
 }
 
 // lockWithLatency acquires dt.mu and returns a release function that unlocks it and,

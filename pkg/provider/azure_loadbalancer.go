@@ -433,6 +433,8 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 		}
 
 		config := difftracker.NewInboundServiceConfig(serviceUID, inboundConfig)
+		config.Namespace = service.Namespace
+		config.Name = service.Name
 
 		// If the LB already exists in NRP (or engine has a tracking entry), route through
 		// UpdateService so spec edits like port changes are propagated to Azure. Otherwise

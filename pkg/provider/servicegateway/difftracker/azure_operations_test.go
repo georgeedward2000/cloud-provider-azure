@@ -22,8 +22,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	corelisters "k8s.io/client-go/listers/core/v1"
 )
 
 func TestConvertServiceDTOsToServiceRequests_OutboundRemovalHasNoNatGatewayID(t *testing.T) {
@@ -150,4 +153,139 @@ func TestConvertServiceDTOsToServiceRequests_VNetResourceGroup(t *testing.T) {
 	assert.Contains(t,
 		vnetID(Config{SubscriptionID: "sub", ResourceGroup: "cluster-rg", VNetName: "vnet"}),
 		"/resourceGroups/cluster-rg/", "an unset VNet resource group must fall back to the cluster resource group")
+}
+
+// serviceListerWith builds a Service lister seeded with the given services by adding them
+// directly to the informer indexer, so no informer needs to be started.
+func serviceListerWith(t *testing.T, svcs ...*v1.Service) corelisters.ServiceLister {
+	t.Helper()
+	factory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)
+	indexer := factory.Core().V1().Services().Informer().GetIndexer()
+	for _, s := range svcs {
+		if err := indexer.Add(s); err != nil {
+			t.Fatalf("seed service lister: %v", err)
+		}
+	}
+	return factory.Core().V1().Services().Lister()
+}
+
+// trackService records a namespace/name for a UID so getServiceByUID can resolve it through
+// the lister, mirroring what EnsureLoadBalancer populates on the ServiceConfig.
+func (dt *DiffTracker) trackService(uid, namespace, name string) {
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     ServiceConfig{UID: uid, IsInbound: true, Namespace: namespace, Name: name},
+	}
+}
+
+func TestGetServiceByUID_ResolvesThroughListerWithoutList(t *testing.T) {
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns", UID: "uid-1"}}
+	dt := newTestDiffTracker()
+	// Empty clientset: a List fallback would find nothing, so a successful resolve means the
+	// cached lister answered the read.
+	dt.kubeClient = fake.NewSimpleClientset()
+	dt.serviceLister = serviceListerWith(t, svc)
+	dt.trackService("uid-1", "ns", "svc")
+
+	got, err := dt.getServiceByUID(context.Background(), "uid-1")
+	assert.NoError(t, err)
+	if assert.NotNil(t, got) {
+		assert.Equal(t, "uid-1", string(got.UID))
+	}
+}
+
+func TestGetServiceByUID_UIDMismatchReturnsNotFound(t *testing.T) {
+	// The lister holds a different Service at the recorded namespace/name (a recreation that
+	// reused the name). A clientset copy carrying the expected UID exists at another
+	// namespace/name so a UID mismatch resolves to NotFound rather than falling through to the
+	// List scan and returning it.
+	current := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns", UID: "uid-current"}}
+	stale := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "ns", UID: "uid-expected"}}
+	dt := newTestDiffTracker()
+	dt.kubeClient = fake.NewSimpleClientset(stale)
+	dt.serviceLister = serviceListerWith(t, current)
+	dt.trackService("uid-expected", "ns", "svc")
+
+	got, err := dt.getServiceByUID(context.Background(), "uid-expected")
+	assert.Nil(t, got)
+	assert.True(t, apierrors.IsNotFound(err), "UID mismatch must surface as NotFound, got %v", err)
+}
+
+func TestGetServiceByUID_NilListerFallsBackToApiserverGet(t *testing.T) {
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns", UID: "uid-1"}}
+	dt := newTestDiffTracker()
+	dt.kubeClient = fake.NewSimpleClientset(svc)
+	dt.serviceLister = nil
+	dt.trackService("uid-1", "ns", "svc")
+
+	got, err := dt.getServiceByUID(context.Background(), "uid-1")
+	assert.NoError(t, err)
+	if assert.NotNil(t, got) {
+		assert.Equal(t, "uid-1", string(got.UID))
+	}
+}
+
+func TestGetServiceByUID_UnknownIdentityFallsBackToList(t *testing.T) {
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns", UID: "uid-1"}}
+	dt := newTestDiffTracker()
+	dt.kubeClient = fake.NewSimpleClientset(svc)
+	dt.serviceLister = serviceListerWith(t) // lister present but empty
+
+	got, err := dt.getServiceByUID(context.Background(), "uid-1")
+	assert.NoError(t, err)
+	if assert.NotNil(t, got) {
+		assert.Equal(t, "uid-1", string(got.UID))
+	}
+}
+
+func TestGetServiceByUID_ColdListerCacheFallsBackToApiserverGet(t *testing.T) {
+	// The Service exists on the apiserver but the lister cache has not observed it yet. The
+	// read must fall back rather than reporting a false NotFound.
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns", UID: "uid-1"}}
+	dt := newTestDiffTracker()
+	dt.kubeClient = fake.NewSimpleClientset(svc)
+	dt.serviceLister = serviceListerWith(t) // empty cache
+	dt.trackService("uid-1", "ns", "svc")
+
+	got, err := dt.getServiceByUID(context.Background(), "uid-1")
+	assert.NoError(t, err)
+	if assert.NotNil(t, got) {
+		assert.Equal(t, "uid-1", string(got.UID))
+	}
+}
+
+func TestUpdateServiceLoadBalancerStatus_DualStackSafeThroughLister(t *testing.T) {
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns", UID: "uid-1"},
+		Status: v1.ServiceStatus{
+			LoadBalancer: v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "2001:db8::1"},
+					{Hostname: "example.com"},
+				},
+			},
+		},
+	}
+	dt := newTestDiffTracker()
+	dt.kubeClient = fake.NewSimpleClientset(svc)
+	dt.serviceLister = serviceListerWith(t, svc)
+	dt.trackService("uid-1", "ns", "svc")
+
+	err := dt.updateServiceLoadBalancerStatus(context.Background(), "uid-1", "10.0.0.1")
+	assert.NoError(t, err)
+
+	got, err := dt.kubeClient.CoreV1().Services("ns").Get(context.Background(), "svc", metav1.GetOptions{})
+	assert.NoError(t, err)
+	var ips, hosts []string
+	for _, ing := range got.Status.LoadBalancer.Ingress {
+		if ing.IP != "" {
+			ips = append(ips, ing.IP)
+		}
+		if ing.Hostname != "" {
+			hosts = append(hosts, ing.Hostname)
+		}
+	}
+	assert.Contains(t, ips, "10.0.0.1")
+	assert.Contains(t, ips, "2001:db8::1")
+	assert.Contains(t, hosts, "example.com")
 }

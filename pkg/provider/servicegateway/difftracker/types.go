@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
@@ -222,6 +223,12 @@ type ServiceConfig struct {
 	IsInbound      bool
 	InboundConfig  *InboundConfig  // nil allowed for defaults
 	OutboundConfig *OutboundConfig // nil allowed for defaults
+
+	// Namespace and Name identify the originating Kubernetes Service. They let the engine
+	// resolve a UID to a cached serviceLister read instead of scanning every Service. They
+	// are empty for entries recovered from NRP without a Service object.
+	Namespace string
+	Name      string
 }
 
 // Validate checks if the ServiceConfig is valid
@@ -416,6 +423,11 @@ type DiffTracker struct {
 	config               Config
 	networkClientFactory azclient.ClientFactory
 	kubeClient           kubernetes.Interface
+
+	// serviceLister is the provider's shared-informer-backed Service lister, published via
+	// SetServiceLister once SetInformers has run. It is nil until then (and in tests), in which
+	// case getServiceByUID falls back to a direct apiserver read. Guarded by mu.
+	serviceLister corelisters.ServiceLister
 
 	// Engine state management
 	pendingServiceOps       map[string]*ServiceOperationState

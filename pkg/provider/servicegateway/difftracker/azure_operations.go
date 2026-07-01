@@ -44,6 +44,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/util/retry"
 	servicehelper "k8s.io/cloud-provider/service/helpers"
 	"k8s.io/utils/ptr"
@@ -255,23 +256,75 @@ func (dt *DiffTracker) updateNRPSGWAddressLocations(ctx context.Context, service
 	return nil
 }
 
-// getServiceByUID returns the Service whose UID matches the given uid
+// getServiceByUID returns the Service whose UID matches uid. It resolves the Service by its
+// recorded namespace/name through the cached serviceLister, an O(1) read backed by the shared
+// informer, keeping the UID as a consistency check so a recreated Service that reuses the same
+// namespace/name is never mistaken for the original. It falls back to a direct apiserver Get when
+// the lister is unset or its cache has not yet observed the object, and to a UID scan when the
+// namespace/name are unknown (e.g. entries recovered from NRP without a Service object).
 func (dt *DiffTracker) getServiceByUID(ctx context.Context, uid string) (*v1.Service, error) {
-	// This lists all Services and scans for a UID match, which is expensive. It is
-	// acceptable for now since it runs once per service operation (plus conflict retries),
-	// not in a hot path.
-	// TODO: carry the Service namespace/name into ServiceConfig (EnsureLoadBalancer already
-	// holds the *v1.Service) and resolve it through the provider's existing serviceLister
-	// (az.serviceLister, already backed by a SharedInformer), i.e. serviceLister.Services(ns).
-	// Get(name) with the UID kept only as a consistency check. That makes this an O(1),
-	// zero-apiserver, zero-extra-memory cached read instead of a NamespaceAll list.
+	namespace, name, lister := dt.serviceIdentityForUID(uid)
+
+	if namespace != "" && name != "" {
+		svc, err := dt.getServiceByNamespaceName(ctx, lister, namespace, name)
+		switch {
+		case err == nil:
+			if string(svc.UID) == uid {
+				return svc, nil
+			}
+			// A different Service now occupies this namespace/name; the original is gone.
+			return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "services"}, uid)
+		case apierrors.IsNotFound(err):
+			return nil, err
+		default:
+			// Transient error resolving by namespace/name; fall through to a UID scan.
+			dt.logger.V(4).Info("getServiceByUID: namespace/name lookup failed, falling back to list",
+				"uid", uid, "namespace", namespace, "name", name, "error", err)
+		}
+	}
+
+	return dt.getServiceByUIDViaList(ctx, uid)
+}
+
+// serviceIdentityForUID returns the namespace/name recorded for a service UID together with the
+// current serviceLister, read under mu.
+func (dt *DiffTracker) serviceIdentityForUID(uid string) (namespace, name string, lister corelisters.ServiceLister) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	if op, ok := dt.pendingServiceOps[uid]; ok {
+		namespace = op.Config.Namespace
+		name = op.Config.Name
+	}
+	return namespace, name, dt.serviceLister
+}
+
+// getServiceByNamespaceName reads a Service by namespace/name, preferring the cached lister and
+// falling back to a direct apiserver Get when the lister is unset or reports the object missing
+// (a cold cache before the informer has synced). Lister results are deep-copied because the
+// informer cache returns shared objects.
+func (dt *DiffTracker) getServiceByNamespaceName(ctx context.Context, lister corelisters.ServiceLister, namespace, name string) (*v1.Service, error) {
+	if lister != nil {
+		svc, err := lister.Services(namespace).Get(name)
+		if err == nil {
+			return svc.DeepCopy(), nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+	}
+	return dt.kubeClient.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
+// getServiceByUIDViaList scans all Services for a UID match. Used only when a Service's
+// namespace/name are not known to the engine.
+func (dt *DiffTracker) getServiceByUIDViaList(ctx context.Context, uid string) (*v1.Service, error) {
 	svcList, err := dt.kubeClient.CoreV1().Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("getServiceByUID: list failed: %w", err)
 	}
-	for _, svc := range svcList.Items {
-		if string(svc.UID) == uid {
-			return svc.DeepCopy(), nil
+	for i := range svcList.Items {
+		if string(svcList.Items[i].UID) == uid {
+			return svcList.Items[i].DeepCopy(), nil
 		}
 	}
 	// Genuinely not found (the list succeeded). Return a typed NotFound so callers can
