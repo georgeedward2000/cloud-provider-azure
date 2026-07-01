@@ -2,10 +2,17 @@ package difftracker
 
 import (
 	"encoding/json"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
+)
+
+var (
+	subscriptionID    = "test-subscription-id"
+	resourceGroupName = "test-resource-group-name"
 )
 
 // TestOperationStringAndJSON tests Operation String() and MarshalJSON()
@@ -1040,4 +1047,481 @@ func TestDeepEqualMoreCases(t *testing.T) {
 	loc = d.NRPResources.Locations["node1"]
 	loc.Addresses["10.0.0.1"] = NRPAddress{Services: sets.NewString("svc1", "egrX")}
 	assert.False(t, d.deepEqualLocked())
+}
+
+func TestDiffTracker_DeepEqual(t *testing.T) {
+	tests := []struct {
+		name     string
+		dt       *DiffTracker
+		expected bool
+	}{
+		{
+			name: "equal empty states",
+			dt: &DiffTracker{
+				K8sResources: K8sState{
+					Services: sets.NewString(),
+					Egresses: sets.NewString(),
+					Nodes:    map[string]Node{},
+				},
+				NRPResources: NRPState{
+					LoadBalancers: sets.NewString(),
+					NATGateways:   sets.NewString(),
+					Locations:     map[string]NRPLocation{},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "equal states with services",
+			dt: &DiffTracker{
+				K8sResources: K8sState{
+					Services: sets.NewString("service1", "service2"),
+					Egresses: sets.NewString(),
+					Nodes:    map[string]Node{},
+				},
+				NRPResources: NRPState{
+					LoadBalancers: sets.NewString("service1", "service2"),
+					NATGateways:   sets.NewString(),
+					Locations:     map[string]NRPLocation{},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "services not equal",
+			dt: &DiffTracker{
+				K8sResources: K8sState{
+					Services: sets.NewString("service1", "service2"),
+					Egresses: sets.NewString(),
+					Nodes:    map[string]Node{},
+				},
+				NRPResources: NRPState{
+					LoadBalancers: sets.NewString("service1"),
+					NATGateways:   sets.NewString(),
+					Locations:     map[string]NRPLocation{},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.dt.deepEqualLocked()
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+func TestOperation_String(t *testing.T) {
+	assert.Equal(t, "Add", Add.String())
+	assert.Equal(t, "Remove", Remove.String())
+	assert.Equal(t, "Update", Update.String())
+}
+func TestMapLocationDataToDTO(t *testing.T) {
+	tests := []struct {
+		name         string
+		locationData LocationData
+		expected     LocationsDataDTO
+	}{
+		{
+			name: "Empty location data",
+			locationData: LocationData{
+				Action:    PartialUpdate,
+				Locations: map[string]Location{},
+			},
+			expected: LocationsDataDTO{
+				Action:    PartialUpdate,
+				Locations: []LocationDTO{},
+			},
+		},
+		{
+			name: "Single location with no addresses",
+			locationData: LocationData{
+				Action: PartialUpdate,
+				Locations: map[string]Location{
+					"location1": {
+						AddressUpdateAction: FullUpdate,
+						Addresses:           map[string]Address{},
+					},
+				},
+			},
+			expected: LocationsDataDTO{
+				Action: PartialUpdate,
+				Locations: []LocationDTO{
+					{
+						Location:            "location1",
+						AddressUpdateAction: FullUpdate,
+						Addresses:           []AddressDTO{},
+					},
+				},
+			},
+		},
+		{
+			name: "Multiple locations",
+			locationData: LocationData{
+				Action: PartialUpdate,
+				Locations: map[string]Location{
+					"location0": {
+						AddressUpdateAction: PartialUpdate,
+						Addresses:           map[string]Address{},
+					},
+					"location1": {
+						AddressUpdateAction: PartialUpdate,
+						Addresses: map[string]Address{
+							"addr1": {
+								ServiceRef: sets.NewString("service1", "service2"),
+							},
+							"addr2": {
+								ServiceRef: sets.NewString("service3"),
+							},
+						},
+					},
+					"location2": {
+						AddressUpdateAction: FullUpdate,
+						Addresses: map[string]Address{
+							"addr3": {
+								ServiceRef: sets.NewString("service4"),
+							},
+						},
+					},
+				},
+			},
+			expected: LocationsDataDTO{
+				Action: PartialUpdate,
+				Locations: []LocationDTO{
+					{
+						Location:            "location0",
+						AddressUpdateAction: PartialUpdate,
+						Addresses:           []AddressDTO{},
+					},
+					{
+						Location:            "location1",
+						AddressUpdateAction: PartialUpdate,
+						Addresses: []AddressDTO{
+							{
+								Address:      "addr1",
+								ServiceNames: sets.NewString("service1", "service2"),
+							},
+							{
+								Address:      "addr2",
+								ServiceNames: sets.NewString("service3"),
+							},
+						},
+					},
+					{
+						Location:            "location2",
+						AddressUpdateAction: FullUpdate,
+						Addresses: []AddressDTO{
+							{
+								Address:      "addr3",
+								ServiceNames: sets.NewString("service4"),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := MapLocationDataToDTO(tt.locationData)
+
+			// Sort locations for deterministic comparison
+			sort.Slice(result.Locations, func(i, j int) bool {
+				return result.Locations[i].Location < result.Locations[j].Location
+			})
+
+			// Sort expected locations for deterministic comparison
+			sort.Slice(tt.expected.Locations, func(i, j int) bool {
+				return tt.expected.Locations[i].Location < tt.expected.Locations[j].Location
+			})
+
+			// For each location, sort addresses for deterministic comparison
+			for i := range result.Locations {
+				sort.Slice(result.Locations[i].Addresses, func(j, k int) bool {
+					return result.Locations[i].Addresses[j].Address < result.Locations[i].Addresses[k].Address
+				})
+			}
+
+			for i := range tt.expected.Locations {
+				sort.Slice(tt.expected.Locations[i].Addresses, func(j, k int) bool {
+					return tt.expected.Locations[i].Addresses[j].Address < tt.expected.Locations[i].Addresses[k].Address
+				})
+			}
+
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("mapLocationDataToDTO() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+func TestMapLoadBalancerUpdatesToServicesDataDTO_EmptyUpdates(t *testing.T) {
+	updates := SyncServicesReturnType{
+		Additions: sets.NewString(),
+		Removals:  sets.NewString(),
+	}
+
+	actual := MapLoadBalancerUpdatesToServicesDataDTO(updates, subscriptionID, resourceGroupName)
+
+	expected := ServicesDataDTO{
+		Action:   PartialUpdate,
+		Services: []ServiceDTO{},
+	}
+
+	assert.Equal(t, expected, actual)
+}
+func TestMapLoadBalancerUpdatesToServicesDataDTO_OnlyAdditions(t *testing.T) {
+	updates := SyncServicesReturnType{
+		Additions: sets.NewString("service-1", "service-2"),
+		Removals:  sets.NewString(),
+	}
+
+	actual := MapLoadBalancerUpdatesToServicesDataDTO(updates, subscriptionID, resourceGroupName)
+
+	expected := ServicesDataDTO{
+		Action: PartialUpdate,
+		Services: []ServiceDTO{
+			{
+				Service:     "service-1",
+				ServiceType: Inbound,
+				IsDelete:    false,
+				LoadBalancerBackendPools: []LoadBalancerBackendPoolDTO{
+					{
+						Id: "/subscriptions/test-subscription-id/resourceGroups/test-resource-group-name/providers/Microsoft.Network/loadBalancers/service-1/backendAddressPools/service-1",
+					},
+				},
+			},
+			{
+				Service:     "service-2",
+				ServiceType: Inbound,
+				IsDelete:    false,
+				LoadBalancerBackendPools: []LoadBalancerBackendPoolDTO{
+					{
+						Id: "/subscriptions/test-subscription-id/resourceGroups/test-resource-group-name/providers/Microsoft.Network/loadBalancers/service-2/backendAddressPools/service-2",
+					},
+				},
+			},
+		},
+	}
+
+	// Sort both slices for consistent comparison
+	sortServiceDTOs(expected.Services)
+	sortServiceDTOs(actual.Services)
+
+	assert.Equal(t, expected, actual)
+}
+func TestMapLoadBalancerUpdatesToServicesDataDTO_OnlyRemovals(t *testing.T) {
+	updates := SyncServicesReturnType{
+		Additions: sets.NewString(),
+		Removals:  sets.NewString("service-3", "service-4"),
+	}
+
+	actual := MapLoadBalancerUpdatesToServicesDataDTO(updates, subscriptionID, resourceGroupName)
+
+	expected := ServicesDataDTO{
+		Action: PartialUpdate,
+		Services: []ServiceDTO{
+			{
+				Service:     "service-3",
+				ServiceType: Inbound,
+				IsDelete:    true,
+			},
+			{
+				Service:     "service-4",
+				ServiceType: Inbound,
+				IsDelete:    true,
+			},
+		},
+	}
+
+	// Sort both slices for consistent comparison
+	sortServiceDTOs(expected.Services)
+	sortServiceDTOs(actual.Services)
+
+	assert.Equal(t, expected, actual)
+}
+func TestMapLoadBalancerUpdatesToServicesDataDTO_AdditionsAndRemovals(t *testing.T) {
+	updates := SyncServicesReturnType{
+		Additions: sets.NewString("service-add-1", "service-add-2"),
+		Removals:  sets.NewString("service-remove-1", "service-remove-2"),
+	}
+
+	actual := MapLoadBalancerUpdatesToServicesDataDTO(updates, subscriptionID, resourceGroupName)
+
+	expected := ServicesDataDTO{
+		Action: PartialUpdate,
+		Services: []ServiceDTO{
+			{
+				Service:     "service-add-1",
+				IsDelete:    false,
+				ServiceType: Inbound,
+				LoadBalancerBackendPools: []LoadBalancerBackendPoolDTO{
+					{
+						Id: "/subscriptions/test-subscription-id/resourceGroups/test-resource-group-name/providers/Microsoft.Network/loadBalancers/service-add-1/backendAddressPools/service-add-1",
+					},
+				},
+			},
+			{
+				Service:     "service-add-2",
+				ServiceType: Inbound,
+				IsDelete:    false,
+				LoadBalancerBackendPools: []LoadBalancerBackendPoolDTO{
+					{
+						Id: "/subscriptions/test-subscription-id/resourceGroups/test-resource-group-name/providers/Microsoft.Network/loadBalancers/service-add-2/backendAddressPools/service-add-2",
+					},
+				},
+			},
+			{
+				Service:     "service-remove-1",
+				ServiceType: Inbound,
+				IsDelete:    true,
+			},
+			{
+				Service:     "service-remove-2",
+				ServiceType: Inbound,
+				IsDelete:    true,
+			},
+		},
+	}
+
+	// Sort both slices for consistent comparison
+	sortServiceDTOs(expected.Services)
+	sortServiceDTOs(actual.Services)
+
+	assert.Equal(t, expected, actual)
+}
+
+// Helper function to sort ServiceDTO slices by Service name
+func sortServiceDTOs(services []ServiceDTO) {
+	sort.Slice(services, func(i, j int) bool {
+		return services[i].Service < services[j].Service
+	})
+}
+func TestMapNATGatewayUpdatesToServicesDataDTO_EmptyUpdates(t *testing.T) {
+	updates := SyncServicesReturnType{
+		Additions: sets.NewString(),
+		Removals:  sets.NewString(),
+	}
+
+	actual := MapNATGatewayUpdatesToServicesDataDTO(updates, subscriptionID, resourceGroupName)
+
+	expected := ServicesDataDTO{
+		Action:   PartialUpdate,
+		Services: []ServiceDTO{},
+	}
+
+	assert.Equal(t, expected, actual)
+}
+func TestMapNATGatewayUpdatesToServicesDataDTO_OnlyAdditions(t *testing.T) {
+	updates := SyncServicesReturnType{
+		Additions: sets.NewString("natgw-1", "natgw-2"),
+		Removals:  sets.NewString(),
+	}
+
+	actual := MapNATGatewayUpdatesToServicesDataDTO(updates, subscriptionID, resourceGroupName)
+
+	expected := ServicesDataDTO{
+		Action: PartialUpdate,
+		Services: []ServiceDTO{
+			{
+				Service:     "natgw-1",
+				ServiceType: Outbound,
+				IsDelete:    false,
+				PublicNatGateway: NatGatewayDTO{
+					Id: "/subscriptions/test-subscription-id/resourceGroups/test-resource-group-name/providers/Microsoft.Network/natGateways/natgw-1",
+				},
+			},
+			{
+				Service:     "natgw-2",
+				ServiceType: Outbound,
+				IsDelete:    false,
+				PublicNatGateway: NatGatewayDTO{
+					Id: "/subscriptions/test-subscription-id/resourceGroups/test-resource-group-name/providers/Microsoft.Network/natGateways/natgw-2",
+				},
+			},
+		},
+	}
+
+	// Sort both slices for consistent comparison
+	sortServiceDTOs(expected.Services)
+	sortServiceDTOs(actual.Services)
+
+	assert.Equal(t, expected, actual)
+}
+func TestMapNATGatewayUpdatesToServicesDataDTO_OnlyRemovals(t *testing.T) {
+	updates := SyncServicesReturnType{
+		Additions: sets.NewString(),
+		Removals:  sets.NewString("natgw-3", "natgw-4"),
+	}
+
+	actual := MapNATGatewayUpdatesToServicesDataDTO(updates, subscriptionID, resourceGroupName)
+
+	expected := ServicesDataDTO{
+		Action: PartialUpdate,
+		Services: []ServiceDTO{
+			{
+				Service:     "natgw-3",
+				ServiceType: Outbound,
+				IsDelete:    true,
+			},
+			{
+				Service:     "natgw-4",
+				ServiceType: Outbound,
+				IsDelete:    true,
+			},
+		},
+	}
+
+	// Sort both slices for consistent comparison
+	sortServiceDTOs(expected.Services)
+	sortServiceDTOs(actual.Services)
+
+	assert.Equal(t, expected, actual)
+}
+func TestMapNATGatewayUpdatesToServicesDataDTO_AdditionsAndRemovals(t *testing.T) {
+	updates := SyncServicesReturnType{
+		Additions: sets.NewString("natgw-add-1", "natgw-add-2"),
+		Removals:  sets.NewString("natgw-remove-1", "natgw-remove-2"),
+	}
+
+	actual := MapNATGatewayUpdatesToServicesDataDTO(updates, subscriptionID, resourceGroupName)
+
+	expected := ServicesDataDTO{
+		Action: PartialUpdate,
+		Services: []ServiceDTO{
+			{
+				Service:     "natgw-add-1",
+				ServiceType: Outbound,
+				IsDelete:    false,
+				PublicNatGateway: NatGatewayDTO{
+					Id: "/subscriptions/test-subscription-id/resourceGroups/test-resource-group-name/providers/Microsoft.Network/natGateways/natgw-add-1",
+				},
+			},
+			{
+				Service:     "natgw-add-2",
+				ServiceType: Outbound,
+				IsDelete:    false,
+				PublicNatGateway: NatGatewayDTO{
+					Id: "/subscriptions/test-subscription-id/resourceGroups/test-resource-group-name/providers/Microsoft.Network/natGateways/natgw-add-2",
+				},
+			},
+			{
+				Service:     "natgw-remove-1",
+				ServiceType: Outbound,
+				IsDelete:    true,
+			},
+			{
+				Service:     "natgw-remove-2",
+				ServiceType: Outbound,
+				IsDelete:    true,
+			},
+		},
+	}
+
+	// Sort both slices for consistent comparison
+	sortServiceDTOs(expected.Services)
+	sortServiceDTOs(actual.Services)
+
+	assert.Equal(t, expected, actual)
 }
