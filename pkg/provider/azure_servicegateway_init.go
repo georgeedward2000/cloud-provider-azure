@@ -15,10 +15,7 @@ import (
 // TODO(enechitoaia): remove after added aks-rp support
 func (az *Cloud) attachServiceGatewayToSubnet(ctx context.Context) error {
 	klog.Infof("Attaching Service Gateway %s to subnet in VNet %s", consts.DefaultServiceGatewayResourceName, az.VnetName)
-	subnetName := az.SubnetName
-	if subnetName == "" {
-		subnetName = "aks-subnet"
-	}
+	subnetName := az.serviceGatewaySubnetName()
 	// The subnet may live in a resource group separate from the cluster RG (BYO-VNet),
 	// so prefer the configured VnetResourceGroup and fall back to ResourceGroup.
 	vnetResourceGroup := az.VnetResourceGroup

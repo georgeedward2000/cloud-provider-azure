@@ -431,6 +431,15 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 			az.Event(service, v1.EventTypeWarning, "UnsupportedNamedTargetPort", err.Error())
 			return nil, err
 		}
+		// The PodIP backend only programs TCP and UDP load-balancing rules; any other protocol
+		// (e.g. SCTP) would otherwise terminal-park the create asynchronously with no visible cause.
+		for _, fp := range inboundConfig.FrontendPorts {
+			if !strings.EqualFold(fp.Protocol, "TCP") && !strings.EqualFold(fp.Protocol, "UDP") {
+				err = fmt.Errorf("protocol %q is not supported when ServiceGateway is enabled (service port %d); use TCP or UDP", fp.Protocol, fp.Port)
+				az.Event(service, v1.EventTypeWarning, "UnsupportedProtocol", err.Error())
+				return nil, err
+			}
+		}
 
 		config := difftracker.NewInboundServiceConfig(serviceUID, inboundConfig)
 		config.Namespace = service.Namespace

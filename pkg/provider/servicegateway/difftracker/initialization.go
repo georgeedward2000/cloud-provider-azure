@@ -3,6 +3,7 @@ package difftracker
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"regexp"
 	"strings"
@@ -587,6 +588,12 @@ func processK8sEndpoints(
 
 			ensureNodeExists(k8s, nodeIP)
 			for _, podIP := range endpoint.Addresses {
+				// Skip malformed addresses; a bad value would poison the AddressLocations payload and
+				// make NRP reject the whole batch (matches getPodIPToNodeIPMapFromEndpointSlice).
+				if _, err := netip.ParseAddr(podIP); err != nil {
+					logger.V(4).Info("Skipped endpoint with malformed address", "namespace", endpointSlice.Namespace, "endpointSlice", endpointSlice.Name, "address", podIP)
+					continue
+				}
 				addInboundIdentityToPod(k8s, nodeIP, podIP, serviceUID)
 			}
 		}
@@ -598,7 +605,8 @@ func processK8sEndpoints(
 
 // processK8sEgresses fetches egress pods and populates K8s nodes/pods with outbound identities
 // NOTE: Pods with DeletionTimestamp are EXCLUDED because they are being deleted and should not
-// contribute to the pod counter. Their cleanup is handled by recoverStuckFinalizers.
+// contribute to the pod counter. Their cleanup is handled by recoverStuckFinalizers. Pods not in
+// Running or Pending phase are also EXCLUDED, matching the runtime egress admission gate.
 // Returns the raw pod list for reuse by recoverStuckFinalizers to avoid duplicate API calls.
 func processK8sEgresses(
 	ctx context.Context,
@@ -621,9 +629,28 @@ func processK8sEgresses(
 			continue
 		}
 
+		// Import only Running/Pending pods, matching the runtime path (podInformerAddPod).
+		// Succeeded/Failed containers have terminated and Unknown is unobtainable, so none is a live
+		// egress backend; importing one would program a stale NRP address no later event clears.
+		if pod.Status.Phase != v1.PodRunning && pod.Status.Phase != v1.PodPending {
+			logger.V(5).Info("Skipped egress pod not in Running/Pending phase", "namespace", pod.Namespace, "pod", pod.Name, "phase", pod.Status.Phase)
+			continue
+		}
+
 		egressVal := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
 		if egressVal == "" || pod.Status.PodIP == "" || pod.Status.HostIP == "" || pod.Spec.NodeName == "" || !IsValidEgressIdentity(egressVal) {
 			logger.V(5).Info("Skipped invalid egress pod", "namespace", pod.Namespace, "pod", pod.Name, "label", egressVal, "podIP", pod.Status.PodIP, "hostIP", pod.Status.HostIP, "node", pod.Spec.NodeName)
+			continue
+		}
+
+		// Validate the IPs before they enter the address/location payload (matches podInformerAddPod);
+		// a malformed HostIP or PodIP would make NRP reject the whole batch and stall location sync.
+		if _, err := netip.ParseAddr(pod.Status.HostIP); err != nil {
+			logger.V(4).Info("Skipped egress pod with malformed HostIP", "namespace", pod.Namespace, "pod", pod.Name, "hostIP", pod.Status.HostIP)
+			continue
+		}
+		if _, err := netip.ParseAddr(pod.Status.PodIP); err != nil {
+			logger.V(4).Info("Skipped egress pod with malformed PodIP", "namespace", pod.Namespace, "pod", pod.Name, "podIP", pod.Status.PodIP)
 			continue
 		}
 

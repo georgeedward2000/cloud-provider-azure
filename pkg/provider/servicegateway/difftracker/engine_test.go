@@ -995,3 +995,79 @@ func TestOnServiceCreationCompleteClearsInFlightConfigOnFailure(t *testing.T) {
 
 	assert.Nil(t, op.InFlightConfig, "a failed create must clear the in-flight config snapshot")
 }
+
+// TestRecreateAfterDeletion_ClearsCreationFailedTerminal asserts that deleting and recreating a
+// service parked with a non-retryable creation error clears the terminal park, so the dispatcher
+// provisions the new LoadBalancer instead of skipping it.
+func TestRecreateAfterDeletion_ClearsCreationFailedTerminal(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-recreate-after-terminal-park"
+
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:             uid,
+		Config:                 NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:                  StateDeletionInProgress,
+		CreationFailedTerminal: true,
+		RecreateAfterDeletion:  true,
+	}
+
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	op, ok := dt.pendingServiceOps[uid]
+	if !assert.True(t, ok, "op must remain tracked to drive the recreate") {
+		return
+	}
+	assert.Equal(t, StateNotStarted, op.State, "recreate branch must reset State to NotStarted")
+	assert.False(t, op.RecreateAfterDeletion, "recreate flag must be cleared once consumed")
+	assert.False(t, op.CreationFailedTerminal,
+		"terminal park must be cleared on recreate, otherwise the dispatcher skips the op")
+
+	su := newTestServiceUpdater(dt)
+	su.processBatch()
+
+	assert.Equal(t, StateCreationInProgress, dt.pendingServiceOps[uid].State,
+		"dispatcher must transition the recreated op to CreationInProgress")
+}
+
+// TestDeleteService_RedundantDeleteDoesNotResurrectService asserts a second DeleteService on an
+// already-deleting service clears recreate intent buffered by an interleaved UpdateService, so the
+// deletion-success path does not resurrect a service meant to be deleted.
+func TestDeleteService_RedundantDeleteDoesNotResurrectService(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-redundant-delete"
+
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:            uid,
+		Config:                NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:                 StateDeletionInProgress,
+		RecreateAfterDeletion: true,
+	}
+
+	dt.DeleteService(uid, true, false)
+
+	op, ok := dt.pendingServiceOps[uid]
+	if !assert.True(t, ok, "op stays tracked while deletion is in flight") {
+		return
+	}
+	assert.False(t, op.RecreateAfterDeletion,
+		"a redundant delete of an already-deleting service must clear the recreate intent")
+
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	_, stillTracked := dt.pendingServiceOps[uid]
+	assert.False(t, stillTracked,
+		"deletion success must tear the service down after a user-issued delete, not recreate it")
+}
+
+// TestUpdateEndpoints_UntrackedServiceIsNotBuffered verifies endpoints for a Service that is neither
+// tracked nor in NRP are dropped, not buffered: the informer fires for every Service, so buffering
+// would grow pendingEndpoints unbounded. AddService re-seeds from the EndpointSlice cache.
+func TestUpdateEndpoints_UntrackedServiceIsNotBuffered(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-untracked-clusterip"
+
+	dt.UpdateEndpoints(uid, nil, map[string]string{"10.244.0.1": "10.0.0.1"})
+
+	assert.Empty(t, dt.pendingEndpoints, "endpoints for an untracked, non-NRP service must not be buffered")
+	assert.NotContains(t, dt.pendingEndpoints, uid)
+}

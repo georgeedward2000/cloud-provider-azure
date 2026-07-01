@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -371,7 +372,7 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 					currentIPs = append(currentIPs, az.nodePrivateIPsForNode(currentNodeName)...)
 				}
 
-				if az.backendPoolUpdater != nil {
+				if !az.ServiceGatewayEnabled && az.backendPoolUpdater != nil {
 					lbName, ipFamily := si.lbName, si.ipFamily
 					var bpNames []string
 					bpNameIPv4 := getLocalServiceBackendPoolName(key, false)
@@ -597,8 +598,13 @@ func (az *Cloud) getPodIPToNodeIPMapFromEndpointSlice(es *discovery_v1.EndpointS
 			continue
 		}
 
-		// Map each pod IP address to the node IP
+		// Map each pod IP to the node IP. Skip malformed addresses; a bad value would poison the
+		// AddressLocations payload and make NRP reject the whole batch, stalling location sync.
 		for _, podIP := range ep.Addresses {
+			if _, err := netip.ParseAddr(podIP); err != nil {
+				klog.Warningf("EndpointSlice %s/%s has a malformed endpoint address %q; skipping", es.Namespace, es.Name, podIP)
+				continue
+			}
 			podIPToNodeIPMap[podIP] = matchingNodeIP
 		}
 	}

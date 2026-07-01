@@ -90,8 +90,15 @@ func (dt *DiffTracker) updateK8sEndpointsLocked(input UpdateK8sEndpointsInputTyp
 			continue
 		}
 
+		// OldAddresses reports this pod as unchanged at this location, but trust that only when the
+		// engine actually tracks the pod+identity: an add skipped earlier (node IP not yet cached)
+		// leaves it absent despite an unchanged address. Fall through to re-insert (set add is idempotent).
 		if oldLocation, exists := input.OldAddresses[address]; exists && oldLocation == location {
-			continue
+			if node, ok := dt.K8sResources.Nodes[location]; ok {
+				if pod, ok := node.Pods[address]; ok && pod.InboundIdentities.Has(input.InboundIdentity) {
+					continue
+				}
+			}
 		}
 
 		nodeState, exists := dt.K8sResources.Nodes[location]

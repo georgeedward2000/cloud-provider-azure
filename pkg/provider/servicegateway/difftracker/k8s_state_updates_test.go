@@ -252,3 +252,25 @@ func TestUpdateK8sPodRemovePreservesInboundIdentities(t *testing.T) {
 // map (AddressUpdateAction PartialUpdate). The Service Gateway treats an empty
 // addresses array as null and deletes the location; applying the result also drops
 // the location locally.
+
+// TestUpdateEndpoints_AddIsIdempotentWhenPriorAddWasMissed asserts an update reporting an unchanged
+// pod location (old == new) still records the pod when the engine is not yet tracking it: an add
+// whose node IP was not yet cached produces no state, and skipping the later update would strand it.
+func TestUpdateEndpoints_AddIsIdempotentWhenPriorAddWasMissed(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-endpoint-readd"
+	dt.NRPResources.LoadBalancers.Insert(uid)
+
+	const podIP = "10.244.1.7"
+	const node = "10.0.0.20"
+
+	dt.UpdateEndpoints(uid, map[string]string{podIP: node}, map[string]string{podIP: node})
+
+	n, ok := dt.K8sResources.Nodes[node]
+	if assert.True(t, ok, "node must be registered by the self-healing add") {
+		pod, onNode := n.Pods[podIP]
+		if assert.True(t, onNode, "pod must be recorded even though the update reported old == new") {
+			assert.True(t, pod.InboundIdentities.Has(uid), "pod must carry the inbound identity")
+		}
+	}
+}

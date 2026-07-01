@@ -9,6 +9,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 )
 
 func TestExtractInboundConfigFromService_NilService(t *testing.T) {
@@ -711,4 +713,34 @@ func TestIsValidEgressIdentity(t *testing.T) {
 	for _, n := range invalid {
 		assert.False(t, IsValidEgressIdentity(n), "expected %q to be an invalid egress identity", n)
 	}
+}
+
+func TestExtractInboundConfigFromService_DropsAffinityAndIdleTimeout(t *testing.T) {
+	service := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-service",
+			Namespace:   "default",
+			Annotations: map[string]string{consts.ServiceAnnotationLoadBalancerIdleTimeout: "30"},
+		},
+		Spec: v1.ServiceSpec{
+			SessionAffinity: v1.ServiceAffinityClientIP,
+			Ports: []v1.ServicePort{
+				{
+					Name:       "http",
+					Protocol:   v1.ProtocolTCP,
+					Port:       80,
+					TargetPort: intstr.FromInt(8080),
+				},
+			},
+		},
+	}
+
+	config := ExtractInboundConfigFromService(service)
+	if !assert.NotNil(t, config) {
+		t.FailNow()
+	}
+
+	// The extractor maps neither SessionAffinity nor the idle-timeout annotation, so both stay nil.
+	assert.Nil(t, config.SessionPersistence)
+	assert.Nil(t, config.IdleTimeoutMinutes)
 }

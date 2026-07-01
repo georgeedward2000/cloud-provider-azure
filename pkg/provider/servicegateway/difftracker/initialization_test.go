@@ -694,3 +694,89 @@ func TestEgressRefCount_Robust(t *testing.T) {
 		}
 	}
 }
+
+// TestProcessK8sEgresses_SkipsTerminatedPhases verifies the cold-start seeder imports only egress
+// pods in Running/Pending phase (matching podInformerAddPod): a Succeeded/Failed pod keeps its
+// PodIP/HostIP until GC, so without the filter a restart programs a stale NRP address.
+func TestProcessK8sEgresses_SkipsTerminatedPhases(t *testing.T) {
+	const (
+		egressVal   = "corp-egress"
+		nodeName    = "node-1"
+		hostIP      = "10.0.0.30"
+		runningIP   = "10.244.5.1"
+		pendingIP   = "10.244.5.2"
+		succeededIP = "10.244.5.3"
+		failedIP    = "10.244.5.4"
+	)
+
+	k8s := newK8sStateForSeeders()
+	kube := fake.NewSimpleClientset(
+		newEgressPod("pod-running", "default", egressVal, nodeName, runningIP, hostIP, v1.PodRunning),
+		newEgressPod("pod-pending", "default", egressVal, nodeName, pendingIP, hostIP, v1.PodPending),
+		newEgressPod("pod-succeeded", "default", egressVal, nodeName, succeededIP, hostIP, v1.PodSucceeded),
+		newEgressPod("pod-failed", "default", egressVal, nodeName, failedIP, hostIP, v1.PodFailed),
+	)
+
+	_, err := processK8sEgresses(context.Background(), kube, &k8s)
+	assert.NoError(t, err)
+
+	assert.True(t, podIPTracked(&k8s, runningIP), "a Running egress pod must be imported")
+	assert.True(t, podIPTracked(&k8s, pendingIP), "a Pending egress pod must be imported")
+	assert.False(t, podIPTracked(&k8s, succeededIP), "a Succeeded egress pod must not be imported")
+	assert.False(t, podIPTracked(&k8s, failedIP), "a Failed egress pod must not be imported")
+}
+
+// TestProcessK8sEgresses_SkipsMalformedIPs verifies the cold-start seeder rejects egress pods with a
+// malformed HostIP/PodIP (matching podInformerAddPod), which would otherwise make NRP reject the batch.
+func TestProcessK8sEgresses_SkipsMalformedIPs(t *testing.T) {
+	const (
+		egressVal = "corp-egress"
+		nodeName  = "node-1"
+		goodHost  = "10.0.0.40"
+		goodPodIP = "10.244.6.1"
+	)
+
+	k8s := newK8sStateForSeeders()
+	kube := fake.NewSimpleClientset(
+		newEgressPod("pod-good", "default", egressVal, nodeName, goodPodIP, goodHost, v1.PodRunning),
+		newEgressPod("pod-bad-podip", "default", egressVal, nodeName, "not-an-ip", goodHost, v1.PodRunning),
+		newEgressPod("pod-bad-hostip", "default", egressVal, nodeName, "10.244.6.3", "bad-host", v1.PodRunning),
+	)
+
+	_, err := processK8sEgresses(context.Background(), kube, &k8s)
+	assert.NoError(t, err)
+
+	assert.True(t, podIPTracked(&k8s, goodPodIP), "an egress pod with valid IPs must be imported")
+	assert.False(t, podIPTracked(&k8s, "10.244.6.3"), "an egress pod with a malformed HostIP must be skipped")
+	assert.False(t, podIPTracked(&k8s, "not-an-ip"), "an egress pod with a malformed PodIP must be skipped")
+}
+
+// TestProcessK8sEndpoints_SkipsMalformedAddresses verifies the cold-start seeder rejects malformed
+// EndpointSlice addresses, which would otherwise poison the AddressLocations payload and block sync.
+func TestProcessK8sEndpoints_SkipsMalformedAddresses(t *testing.T) {
+	const (
+		svcUID = "svc-malformed-eps"
+		node   = "node-1"
+		nodeIP = "10.0.0.41"
+		goodIP = "10.244.7.1"
+		badIP  = "not-an-ip"
+	)
+
+	k8s := newK8sStateForSeeders(svcUID)
+	nodeNameToIPMap := map[string][]string{node: {nodeIP}}
+
+	eps := newServiceOwnedEndpointSlice("eps-1", "default", svcUID, discoveryv1.AddressTypeIPv4, []discoveryv1.Endpoint{
+		{
+			Addresses:  []string{goodIP, badIP},
+			NodeName:   ptr.To(node),
+			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+		},
+	})
+	kube := fake.NewSimpleClientset(eps)
+
+	_, err := processK8sEndpoints(context.Background(), kube, &k8s, nodeNameToIPMap)
+	assert.NoError(t, err)
+
+	assert.True(t, podIPTracked(&k8s, goodIP), "a valid endpoint address must be imported")
+	assert.False(t, podIPTracked(&k8s, badIP), "a malformed endpoint address must be skipped")
+}

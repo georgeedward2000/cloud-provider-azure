@@ -683,6 +683,25 @@ func TestGetPodIPToNodeIPMapFromEndpointSlice_ReadinessFiltering(t *testing.T) {
 			},
 			expectedResult: map[string]string{},
 		},
+		{
+			name: "Malformed addresses are skipped, valid ones on the same endpoint are kept",
+			endpointSlice: &discovery_v1.EndpointSlice{
+				ObjectMeta:  metav1.ObjectMeta{Name: "eps1", Namespace: "default"},
+				AddressType: discovery_v1.AddressTypeIPv4,
+				Endpoints: []discovery_v1.Endpoint{
+					{
+						Addresses:  []string{"10.0.0.1", "not-an-ip"},
+						NodeName:   ptr.To("node1"),
+						Conditions: discovery_v1.EndpointConditions{Ready: &trueVal},
+					},
+				},
+			},
+			ipv6: false,
+			nodePrivateIPs: map[string]*utilsets.IgnoreCaseSet{
+				"node1": utilsets.NewString("192.168.1.1"),
+			},
+			expectedResult: map[string]string{"10.0.0.1": "192.168.1.1"},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1126,4 +1145,50 @@ func TestCheckAndApplyLocalServiceBackendPoolUpdates(t *testing.T) {
 			wg.Wait()
 		})
 	}
+}
+
+func TestServiceGatewayEndpointSliceInformer_TracksService(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	svc := getTestService("clb-wiring-eps", v1.ProtocolTCP, nil, false, 80)
+	svc.Namespace = "test"
+	serviceUID := svc.UID
+
+	existingEPS := getTestEndpointSliceWithAddressesAndServiceOwnerReference("eps-sgw", "test", svc.Name, serviceUID, []string{"10.0.0.1"}, "node1")
+	updatedEPS := getTestEndpointSliceWithAddressesAndServiceOwnerReference("eps-sgw", "test", svc.Name, serviceUID, []string{"10.0.0.2"}, "node2")
+	updatedEPS.ResourceVersion = "2"
+	updatedEPS.AddressType = discovery_v1.AddressTypeIPv4
+
+	kubeClient := fake.NewSimpleClientset(&svc, existingEPS)
+	az.KubeClient = kubeClient
+	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+
+	az.nodePrivateIPs = map[string]*utilsets.IgnoreCaseSet{
+		"node1": utilsets.NewString("192.168.0.1"),
+		"node2": utilsets.NewString("192.168.0.2"),
+	}
+
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	az.serviceLister = informerFactory.Core().V1().Services().Lister()
+	az.setUpEndpointSlicesInformer(informerFactory)
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	informerFactory.Start(stopCh)
+	informerFactory.WaitForCacheSync(stopCh)
+
+	_, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+
+	_, err = kubeClient.DiscoveryV1().EndpointSlices("test").Update(context.Background(), updatedEPS, metav1.UpdateOptions{})
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
 }

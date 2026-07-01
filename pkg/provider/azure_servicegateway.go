@@ -33,8 +33,26 @@ func (az *Cloud) existsServiceGateway(ctx context.Context, serviceGatewayName st
 	return true, nil
 }
 
+// defaultServiceGatewaySubnetName is used when the cluster config specifies no subnet (the AKS node subnet).
+const defaultServiceGatewaySubnetName = "aks-subnet"
+
+// serviceGatewaySubnetName returns the subnet used by the route target and subnet attachment,
+// defaulting to the AKS node subnet when unset so both paths always resolve identically.
+func (az *Cloud) serviceGatewaySubnetName() string {
+	if az.SubnetName != "" {
+		return az.SubnetName
+	}
+	return defaultServiceGatewaySubnetName
+}
+
 // TODO(enechitoaia): remove after added aks-rp support
 func (az *Cloud) createServiceGateway(ctx context.Context, serviceGatewayName string) error {
+	// Resolve the VNet/subnet IDs as the subnet attachment does: getVnetResourceID honours
+	// VnetResourceGroup (BYO-VNet), and the subnet defaults to the AKS node subnet. Using
+	// az.ResourceGroup or a bare az.SubnetName here would target the wrong VNet.
+	vnetID := az.getVnetResourceID()
+	subnetID := fmt.Sprintf("%s/subnets/%s", vnetID, az.serviceGatewaySubnetName())
+
 	// Create the service gateway if it does not exist.
 	serviceGateway := armnetwork.ServiceGateway{
 		Location: to.Ptr(az.Location),
@@ -43,22 +61,11 @@ func (az *Cloud) createServiceGateway(ctx context.Context, serviceGatewayName st
 			Tier: to.Ptr(armnetwork.ServiceGatewaySKUTierRegional),
 		},
 		Properties: &armnetwork.ServiceGatewayPropertiesFormat{
-			VirtualNetwork: &armnetwork.VirtualNetwork{ID: to.Ptr(fmt.Sprintf(
-				"/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/virtualNetworks/%s",
-				az.SubscriptionID,
-				az.ResourceGroup,
-				az.VnetName,
-			))},
+			VirtualNetwork: &armnetwork.VirtualNetwork{ID: to.Ptr(vnetID)},
 			RouteTargetAddress: &armnetwork.RouteTargetAddressPropertiesFormat{
 				PrivateIPAllocationMethod: to.Ptr(armnetwork.IPAllocationMethodDynamic),
 				Subnet: &armnetwork.Subnet{
-					ID: to.Ptr(fmt.Sprintf(
-						"/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/virtualNetworks/%s/subnets/%s",
-						az.SubscriptionID,
-						az.ResourceGroup,
-						az.VnetName,
-						az.SubnetName,
-					)),
+					ID: to.Ptr(subnetID),
 				},
 			},
 		},

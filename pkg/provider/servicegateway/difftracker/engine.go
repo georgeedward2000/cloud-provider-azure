@@ -166,13 +166,10 @@ func (dt *DiffTracker) UpdateEndpoints(serviceUID string, oldPodIPToNodeIP, newP
 			return
 		}
 
-		// Service doesn't exist and not tracked - this shouldn't happen
-		dt.logger.V(4).Info("Buffered endpoints for untracked service", "service", serviceUID)
-		dt.pendingEndpoints[serviceUID] = append(dt.pendingEndpoints[serviceUID], PendingEndpointUpdate{
-			OldPodIPToNodeIP: oldPodIPToNodeIP,
-			PodIPToNodeIP:    newPodIPToNodeIP,
-			Timestamp:        time.Now().Format(time.RFC3339),
-		})
+		// Untracked and absent from NRP: in ServiceGateway mode the informer fires for every Service
+		// (ClusterIP, headless, or a not-yet-created LoadBalancer), so buffering would grow
+		// pendingEndpoints unbounded. Drop it; AddService re-seeds from the EndpointSlice cache.
+		dt.logger.V(5).Info("Dropped endpoints for untracked service", "service", serviceUID)
 		return
 	}
 
@@ -542,6 +539,10 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 			opState.State = StateDeletionPending
 
 		case StateDeletionPending, StateDeletionInProgress:
+			// A fresh delete supersedes any recreate intent buffered by an interleaved UpdateService
+			// (a LoadBalancer->ClusterIP flap); otherwise the deletion-success path would resurrect a
+			// service meant to be deleted, leaking its LB, public IP and ServiceGateway registration.
+			opState.RecreateAfterDeletion = false
 			if opState.RetriesExhausted {
 				// A repeated delete is fresh intent: re-arm a delete that exhausted its retry budget
 				// so it dispatches again instead of leaking the Azure load balancer and public IP and
@@ -756,6 +757,11 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 				dt.logger.V(5).Info("Recreated service after deletion", "service", serviceUID, "recreateAfterDeletion", opState.RecreateAfterDeletion, "bufferedPods", len(dt.pendingPods[serviceUID]))
 				opState.State = StateNotStarted
 				opState.RetryCount = 0
+				// A post-deletion recreate is a fresh start: also clear the terminal/exhausted-retry
+				// parks, else a service parked before the delete never dispatches (LB stranded until restart).
+				opState.CreationFailedTerminal = false
+				opState.RetriesExhausted = false
+				opState.NextRetryAt = time.Time{}
 				opState.InFlightConfig = nil
 				opState.LastAppliedConfig = nil
 				opState.RecreateAfterDeletion = false
