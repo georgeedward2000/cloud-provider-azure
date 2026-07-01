@@ -691,4 +691,94 @@ var _ = Describe("Container Load Balancer Update", Label(slbTestLabel), func() {
 		utils.Logf("\n✓ Concurrent update+endpoint-churn test passed: port=%d, %d backing pods, UID stable",
 			portAfter, initialPods+extraPods)
 	})
+
+	// A terminal-failing update (a named targetPort, which the PodIP backend cannot resolve) parks the
+	// engine op at StateNotStarted while the LB stays live in NRP. A subsequent endpoint change must NOT
+	// drain the live LB's remaining backends: only the removed pod is unregistered, the rest stay bound.
+	It("should not drain a live LB's backends when an update fails terminally", func() {
+		const (
+			numPods    = 3
+			port       = int32(80)
+			targetPort = 8080
+			provision  = 90 * time.Second
+			settle     = 45 * time.Second
+		)
+
+		serviceLabels := map[string]string{"app": serviceName}
+
+		By(fmt.Sprintf("Creating %d pods", numPods))
+		for i := 0; i < numPods; i++ {
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("%s-pod-%d", serviceName, i),
+					Namespace: ns.Name,
+					Labels:    serviceLabels,
+				},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{
+						Name:            "test-app",
+						Image:           utils.AgnhostImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Args:            []string{"netexec", fmt.Sprintf("--http-port=%d", targetPort)},
+					}},
+				},
+			}
+			_, err := cs.CoreV1().Pods(ns.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+		}
+		Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
+
+		By(fmt.Sprintf("Creating a LoadBalancer service on port=%d with a numeric targetPort", port))
+		service := &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns.Name},
+			Spec: v1.ServiceSpec{
+				Type:                  v1.ServiceTypeLoadBalancer,
+				ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+				Selector:              serviceLabels,
+				Ports: []v1.ServicePort{{
+					Port:       port,
+					TargetPort: intstr.FromInt(targetPort),
+					Protocol:   v1.ProtocolTCP,
+				}},
+			},
+		}
+		created, err := cs.CoreV1().Services(ns.Name).Create(context.TODO(), service, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		serviceUID := string(created.UID)
+
+		By("Waiting until all pods are registered as backends")
+		Eventually(func() (int, error) {
+			if verr := verifyAzureResources(serviceUID); verr != nil {
+				return 0, verr
+			}
+			return countRegisteredEndpoints(serviceUID)
+		}, provision, 5*time.Second).Should(Equal(numPods),
+			"all pods must be registered as backends before the terminal update")
+
+		By("Applying a terminal-failing update: switch targetPort to a named port")
+		retrieved, err := cs.CoreV1().Services(ns.Name).Get(context.TODO(), serviceName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		retrieved.Spec.Ports[0].TargetPort = intstr.FromString("http")
+		_, err = cs.CoreV1().Services(ns.Name).Update(context.TODO(), retrieved, metav1.UpdateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Deleting one pod to force a locations sync while the op is parked")
+		Expect(cs.CoreV1().Pods(ns.Name).Delete(context.TODO(),
+			fmt.Sprintf("%s-pod-0", serviceName), metav1.DeleteOptions{})).To(Succeed())
+
+		By("Waiting for the sync to settle")
+		time.Sleep(settle)
+
+		By("Verifying only the removed pod was unregistered (the live LB was not drained)")
+		// The remaining backends must stay registered; only the deleted pod is unregistered.
+		Eventually(func() (int, error) {
+			return countRegisteredEndpoints(serviceUID)
+		}, 60*time.Second, 5*time.Second).Should(Equal(numPods-1),
+			"a terminal update must not drain the live LB's remaining backends")
+		Expect(verifyAzureResources(serviceUID)).To(Succeed(),
+			"the LB must remain live in Azure under the same UID")
+
+		utils.Logf("\n✓ Terminal-update drain test passed: %d/%d backends retained after a parked update",
+			numPods-1, numPods)
+	})
 })

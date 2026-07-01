@@ -791,6 +791,10 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 				recordServiceOperation("delete", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
 				opState.RetryCount++
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
+				// Back off like the other retry paths: the re-drain re-dispatches deletion through
+				// CheckPendingServiceDeletions -> retryGate, which honours NextRetryAt. Without it a
+				// persistent overlay rejection tight-loops the drain/delete cycle and storms NRP.
+				opState.NextRetryAt = time.Now().Add(computeRetryBackoff(opState.RetryCount))
 				recordServiceOperationRetry("delete", opState.Config.IsInbound, opState.RetryCount)
 
 				opState.State = StateDeletionPending
@@ -1495,10 +1499,12 @@ func (dt *DiffTracker) checkInitializationCompleteLocked() {
 	// Check if all work is complete:
 	// 1. No pending service operations (only count services NOT in StateCreated)
 	// 2. No in-flight updater triggers (LocationsUpdater work)
-	// Services in StateCreated are done creating but remain tracked for runtime operations
+	// StateCreated ops remain tracked for runtime operations. Parked ops (CreationFailedTerminal or
+	// RetriesExhausted) self-heal in the background and must not hold initial sync open, or a single
+	// un-provisionable service would block cloud-provider init, which waits on a no-timeout context.
 	pendingOps := 0
 	for _, opState := range dt.pendingServiceOps {
-		if opState.State != StateCreated && !opState.CreationFailedTerminal {
+		if opState.State != StateCreated && !opState.CreationFailedTerminal && !opState.RetriesExhausted {
 			pendingOps++
 		}
 	}

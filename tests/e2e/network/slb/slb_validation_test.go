@@ -76,6 +76,22 @@ var _ = Describe("SLB - Service Validation", Label(slbTestLabel), func() {
 		}, 45*time.Second, 10*time.Second).Should(BeTrue(), why)
 	}
 
+	// expectServiceWarningEvent asserts a warning event with the given reason is recorded on the service.
+	expectServiceWarningEvent := func(serviceName, reason string) {
+		Eventually(func() bool {
+			events, err := cs.CoreV1().Events(ns.Name).List(context.TODO(), metav1.ListOptions{})
+			if err != nil {
+				return false
+			}
+			for _, e := range events.Items {
+				if e.InvolvedObject.Name == serviceName && e.Reason == reason {
+					return true
+				}
+			}
+			return false
+		}, 60*time.Second, 5*time.Second).Should(BeTrue(), "expected a "+reason+" warning event")
+	}
+
 	It("should terminally reject a service with a named targetPort", func() {
 		const serviceName = "named-port-service"
 		labels := map[string]string{"app": serviceName}
@@ -100,6 +116,9 @@ var _ = Describe("SLB - Service Validation", Label(slbTestLabel), func() {
 		By("Verifying the service is terminally rejected and never provisions Azure resources")
 		expectTerminallyRejected(serviceUID,
 			"a service with a named targetPort must be terminally rejected (no PIP/LB/SGW registration)")
+
+		By("Verifying a warning event explains named targetPorts are unsupported")
+		expectServiceWarningEvent(serviceName, "UnsupportedNamedTargetPort")
 
 		utils.Logf("✓ Named-targetPort service was terminally rejected with no Azure resources")
 	})
@@ -177,6 +196,9 @@ var _ = Describe("SLB - Service Validation", Label(slbTestLabel), func() {
 		By("Verifying the dual-stack service is terminally rejected and never provisions Azure resources")
 		expectTerminallyRejected(serviceUID,
 			"a dual-stack service must be terminally rejected (no PIP/LB/SGW registration)")
+
+		By("Verifying a warning event explains dual-stack is unsupported")
+		expectServiceWarningEvent(serviceName, "UnsupportedDualStack")
 
 		utils.Logf("✓ Dual-stack service was terminally rejected with no Azure resources")
 	})

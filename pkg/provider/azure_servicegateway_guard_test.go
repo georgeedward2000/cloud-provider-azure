@@ -256,7 +256,7 @@ func TestPodIPWithoutServiceGateway_EnsureLoadBalancerRejects(t *testing.T) {
 }
 
 func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
-	t.Run("dual-stack service emits no warning", func(t *testing.T) {
+	t.Run("dual-stack service is rejected with a warning event", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
@@ -264,15 +264,20 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
 
 		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
-		assert.NoError(t, err)
-		assert.NotNil(t, status)
-		assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+		assert.Error(t, err)
+		assert.Nil(t, status)
+		assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+			"a rejected dual-stack service must not be tracked")
 
-		// The SGW path accepts the dual-stack service (tracked) and emits no warning event.
-		assertNoEvent(t, rec)
+		select {
+		case ev := <-rec.Events:
+			assert.Contains(t, ev, "UnsupportedDualStack")
+		case <-time.After(time.Second):
+			t.Fatal("expected UnsupportedDualStack warning event")
+		}
 	})
 
-	t.Run("named targetPort service emits no warning", func(t *testing.T) {
+	t.Run("named targetPort service is rejected with a warning event", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
@@ -280,12 +285,17 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
 
 		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
-		assert.NoError(t, err)
-		assert.NotNil(t, status)
-		assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+		assert.Error(t, err)
+		assert.Nil(t, status)
+		assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+			"a rejected named-targetPort service must not be tracked")
 
-		// The SGW path accepts the named-targetPort service (tracked) and emits no warning event.
-		assertNoEvent(t, rec)
+		select {
+		case ev := <-rec.Events:
+			assert.Contains(t, ev, "UnsupportedNamedTargetPort")
+		case <-time.After(time.Second):
+			t.Fatal("expected UnsupportedNamedTargetPort warning event")
+		}
 	})
 
 	t.Run("internal service emits UnsupportedInternalLoadBalancer warning", func(t *testing.T) {
@@ -305,6 +315,20 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("expected UnsupportedInternalLoadBalancer warning event")
 		}
+	})
+
+	t.Run("supported single-stack numeric-port service is accepted without a warning", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		svc := getTestService("sgw-supported", v1.ProtocolTCP, nil, false, 80)
+		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+
+		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, status)
+		assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+		assertNoEvent(t, rec)
 	})
 }
 

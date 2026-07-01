@@ -312,6 +312,40 @@ func TestPodInformerAddPod_RejectsInvalidEgressLabel(t *testing.T) {
 	}
 }
 
+func TestPodInformerAddPod_RejectsMalformedPodIP(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "malformed-ip-egress",
+			Namespace: "default",
+			Labels:    map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning, HostIP: "10.0.0.1", PodIP: "not-an-ip"},
+	}
+	kube := fake.NewSimpleClientset(pod)
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = newProviderDiffTracker(t, az, kube)
+	rec := record.NewFakeRecorder(10)
+	az.eventRecorder = rec
+
+	az.podInformerAddPod(pod)
+
+	assert.False(t, az.diffTracker.IsServiceTracked("egress-svc"),
+		"a pod with a malformed PodIP must not be registered with the engine")
+
+	select {
+	case ev := <-rec.Events:
+		assert.Contains(t, ev, "ServiceGatewayInvalidPodIP",
+			"a warning Event must be emitted for a malformed pod IP")
+	default:
+		t.Fatal("expected a ServiceGatewayInvalidPodIP warning Event")
+	}
+}
+
 // TestPodInformerRemovePod tests the podInformerRemovePod function
 func TestPodInformerRemovePod(t *testing.T) {
 	tests := []struct {

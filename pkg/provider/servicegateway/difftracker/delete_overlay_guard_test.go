@@ -49,7 +49,7 @@ func TestIsServiceOverlayMappingsError(t *testing.T) {
 // inbound service deletion fails because NRP still has its overlay address mappings, the
 // engine re-gates the deletion behind a fresh locations drain (instead of storming the
 // unregister): it moves the op back to StateDeletionPending, re-adds it to
-// pendingServiceDeletions, and triggers the LocationsUpdater.
+// pendingServiceDeletions, triggers the LocationsUpdater, and sets a retry backoff.
 func TestOnServiceCreationComplete_OverlayMappingsErrorReDrainsLocations(t *testing.T) {
 	dt := newTestDiffTracker()
 	uid := "svc-overlay"
@@ -73,11 +73,13 @@ func TestOnServiceCreationComplete_OverlayMappingsErrorReDrainsLocations(t *test
 	_, pending := dt.pendingServiceDeletions[uid]
 	retry := op.RetryCount
 	state := op.State
+	nextRetryAt := op.NextRetryAt
 	dt.mu.Unlock()
 
 	assert.Equal(t, StateDeletionPending, state, "overlay-mappings delete failure must re-gate the deletion behind a locations drain")
 	assert.True(t, pending, "service must be re-added to pendingServiceDeletions for the drain gating")
 	assert.Equal(t, 1, retry, "retry count should advance")
+	assert.False(t, nextRetryAt.IsZero(), "overlay re-drain must set a backoff (NextRetryAt) so a persistent rejection cannot storm NRP")
 
 	// The LocationsUpdater must have been triggered to drain the orphaned NRP addresses.
 	select {

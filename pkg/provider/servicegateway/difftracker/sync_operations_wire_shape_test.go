@@ -108,3 +108,46 @@ func TestGuardSyncOps_NoSpuriousLocationEntries(t *testing.T) {
 	assert.Empty(t, result.Locations,
 		"K8s state matches NRP state — no spurious location entries should be emitted")
 }
+
+// A service parked at StateNotStarted after a terminal update, whose LB is still live in NRP, must keep
+// syncing its backends (its pod address retains a non-empty ServiceRef) rather than being drained; a
+// first-time create whose LB is not yet in NRP is excluded from the sync.
+func TestSyncOps_ParkedLiveLBRemainsReadyToSync(t *testing.T) {
+	dt := newTestDiffTracker()
+	const node = "10.0.0.1"
+
+	live, pending := "svc-parked-live", "svc-new-pending"
+	dt.NRPResources.LoadBalancers.Insert(live) // live has an LB in NRP; pending does not.
+
+	dt.pendingServiceOps[live] = &ServiceOperationState{
+		ServiceUID: live, Config: NewInboundServiceConfig(live, nil), State: StateNotStarted,
+	}
+	dt.pendingServiceOps[pending] = &ServiceOperationState{
+		ServiceUID: pending, Config: NewInboundServiceConfig(pending, nil), State: StateNotStarted,
+	}
+
+	livePod, pendingPod := newPod(), newPod()
+	livePod.InboundIdentities.Insert(live)
+	pendingPod.InboundIdentities.Insert(pending)
+	n := newNode()
+	n.Pods["10.244.0.10"] = livePod
+	n.Pods["10.244.0.11"] = pendingPod
+	dt.K8sResources.Nodes[node] = n
+
+	result := dt.GetSyncLocationsAddresses()
+	loc, ok := result.Locations[node]
+	if !assert.True(t, ok, "location must be present for the live LB's pod") {
+		return
+	}
+
+	liveAddr, ok := loc.Addresses["10.244.0.10"]
+	if assert.True(t, ok, "the live LB's pod address must be synced") {
+		assert.True(t, liveAddr.ServiceRef.Has(live),
+			"a parked service whose LB is live in NRP must keep its backend bound (no drain)")
+	}
+
+	if pendingAddr, ok := loc.Addresses["10.244.0.11"]; ok {
+		assert.False(t, pendingAddr.ServiceRef.Has(pending),
+			"a first-time create with no NRP LB must not be synced yet")
+	}
+}

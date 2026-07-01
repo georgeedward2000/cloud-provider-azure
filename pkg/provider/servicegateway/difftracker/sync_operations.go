@@ -193,23 +193,32 @@ func (dt *DiffTracker) createServiceRefFiltered(pod Pod) *utilsets.IgnoreCaseSet
 	return serviceRef
 }
 
-// isServiceReadyToSync checks if a service is ready for location sync
-// Returns true if service is StateCreated/StateUpdateInProgress or exists in NRP (but not tracked).
-// StateUpdateInProgress is considered ready because the LB and SGW Service entry are
-// already in place; only LB rules are being updated.
+// isServiceReadyToSync reports whether a service is ready for location sync. A service is ready when
+// its LB/NAT is live in NRP, even if its engine op is parked (e.g. StateNotStarted after a terminal
+// update) or still being created, so the live resource keeps tracking endpoint changes instead of
+// having its backend pool drained. A service with no NRP resource yet is not synced.
 // Must be called with dt.mu held
 func (dt *DiffTracker) isServiceReadyToSync(serviceUID string, isInbound bool) bool {
-	// Check if service is tracked in pendingServiceOps
+	existsInNRP := (isInbound && dt.NRPResources.LoadBalancers.Has(serviceUID)) ||
+		(!isInbound && dt.NRPResources.NATGateways.Has(serviceUID))
+
 	if opState, exists := dt.pendingServiceOps[serviceUID]; exists {
-		// Sync if service is StateCreated or in-flight LB update.
-		return opState.State == StateCreated || opState.State == StateUpdateInProgress
+		switch opState.State {
+		case StateCreated, StateUpdateInProgress:
+			return true
+		case StateNotStarted, StateCreationInProgress:
+			// A live LB parked after a terminal update, or one still being created, must keep
+			// syncing its backends rather than have them drained; a not-yet-provisioned service
+			// has no NRP resource and is not synced.
+			return existsInNRP
+		default:
+			// Deletion states: addresses should drain, not sync.
+			return false
+		}
 	}
 
-	// Service not tracked - check if it exists in NRP (created outside Engine)
-	if isInbound {
-		return dt.NRPResources.LoadBalancers.Has(serviceUID)
-	}
-	return dt.NRPResources.NATGateways.Has(serviceUID)
+	// Service not tracked - ready iff it exists in NRP (created outside the Engine).
+	return existsInNRP
 }
 
 // findLocationData returns a pointer to the Location stored under the given key

@@ -465,6 +465,43 @@ func getTestEndpointSliceWithAddressesAndServiceOwnerReference(
 	return endpointSlice
 }
 
+// TestGetPodIPToNodeIPMapFromEndpointSlice_NodeCacheRace runs the EndpointSlice reader concurrently
+// with the node informer's cache writer under the race detector to verify that nodePrivateIPs access
+// is synchronized by nodeCachesLock.
+func TestGetPodIPToNodeIPMapFromEndpointSlice_NodeCacheRace(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	az := GetTestCloud(ctrl)
+
+	const nodeName = "race-node"
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+		Status: v1.NodeStatus{Addresses: []v1.NodeAddress{
+			{Type: v1.NodeInternalIP, Address: "10.0.0.5"},
+		}},
+	}
+	es := getTestEndpointSlice("es-race", "default", "svc-race", nodeName)
+	es.AddressType = discovery_v1.AddressTypeIPv4
+
+	const iterations = 2000
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			az.updateNodeCaches(nil, node)
+			az.updateNodeCaches(node, nil)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = az.getPodIPToNodeIPMapFromEndpointSlice(es, false)
+		}
+	}()
+	wg.Wait()
+}
+
 func TestGetPodIPToNodeIPMapFromEndpointSlice_ReadinessFiltering(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

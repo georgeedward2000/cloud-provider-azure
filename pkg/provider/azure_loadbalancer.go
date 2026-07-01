@@ -416,6 +416,22 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 
 		// Extract port configuration from service
 		inboundConfig := az.extractInboundConfigFromService(service)
+
+		// Fail fast on specs the PodIP backend cannot support and surface the reason on the Service.
+		// Otherwise the difftracker terminal-parks the create asynchronously and the Service sits
+		// pending with no visible cause. ipFamilies has at most two entries (two == dual-stack), and a
+		// string targetPort names a container port that cannot be resolved to a PodIP backend port.
+		if len(inboundConfig.IPFamilies) > 1 {
+			err = fmt.Errorf("dual-stack Services are not supported when ServiceGateway is enabled (ipFamilies=%v); use a single-stack Service", service.Spec.IPFamilies)
+			az.Event(service, v1.EventTypeWarning, "UnsupportedDualStack", err.Error())
+			return nil, err
+		}
+		if len(inboundConfig.NamedTargetPorts) > 0 {
+			err = fmt.Errorf("named targetPort(s) %v are not supported when ServiceGateway is enabled; use a numeric targetPort", inboundConfig.NamedTargetPorts)
+			az.Event(service, v1.EventTypeWarning, "UnsupportedNamedTargetPort", err.Error())
+			return nil, err
+		}
+
 		config := difftracker.NewInboundServiceConfig(serviceUID, inboundConfig)
 
 		// If the LB already exists in NRP (or engine has a tracking entry), route through

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"math/big"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -215,6 +216,24 @@ func (az *Cloud) podInformerAddPod(pod *v1.Pod) {
 	if pod.Status.HostIP == "" || pod.Status.PodIP == "" {
 		klog.V(4).Infof("podInformerAddPod: Pod %s/%s has egress label but no HostIP or PodIP yet, skipping",
 			pod.Namespace, pod.Name)
+		return
+	}
+
+	// Validate the IPs are well-formed before they flow into the ServiceGateway address/location
+	// payload. A malformed value (kubelet bug or a crafted pod status) would otherwise produce a
+	// rejected ARM request and endless create retries.
+	if _, err := netip.ParseAddr(pod.Status.HostIP); err != nil {
+		klog.Warningf("podInformerAddPod: pod %s/%s has a malformed HostIP %q; skipping egress registration",
+			pod.Namespace, pod.Name, pod.Status.HostIP)
+		az.Event(pod, v1.EventTypeWarning, "ServiceGatewayInvalidPodIP",
+			fmt.Sprintf("Malformed HostIP %q on the pod status", pod.Status.HostIP))
+		return
+	}
+	if _, err := netip.ParseAddr(pod.Status.PodIP); err != nil {
+		klog.Warningf("podInformerAddPod: pod %s/%s has a malformed PodIP %q; skipping egress registration",
+			pod.Namespace, pod.Name, pod.Status.PodIP)
+		az.Event(pod, v1.EventTypeWarning, "ServiceGatewayInvalidPodIP",
+			fmt.Sprintf("Malformed PodIP %q on the pod status", pod.Status.PodIP))
 		return
 	}
 

@@ -407,7 +407,7 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) (readyRemov
 	}
 
 	// Phase 2: Remove finalizers without holding lock (API calls)
-	var processed []string
+	var processed []pendingPodToProcess
 
 	for _, p := range toProcess {
 		// Get the pod and remove finalizer
@@ -416,7 +416,7 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) (readyRemov
 			if apierrors.IsNotFound(err) {
 				// Pod genuinely gone - finalizer effectively removed; clean up tracking.
 				dt.logger.V(4).Info("Pod not found, cleaning up tracking", "pod", p.Key)
-				processed = append(processed, p.Key)
+				processed = append(processed, p)
 				continue
 			}
 			// Transient error (5xx/429/etcd timeout - not a typed NotFound): keep the entry so a
@@ -433,7 +433,7 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) (readyRemov
 		// recorded UID preserves the legacy ns/name behaviour (e.g. recovered entries).
 		if p.UID != "" && string(pod.UID) != p.UID {
 			dt.logger.V(4).Info("Pod UID changed (replacement pod); dropping stale finalizer entry without stripping", "pod", p.Key, "wantUID", p.UID, "gotUID", string(pod.UID))
-			processed = append(processed, p.Key)
+			processed = append(processed, p)
 			continue
 		}
 
@@ -443,14 +443,18 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) (readyRemov
 			continue
 		}
 
-		processed = append(processed, p.Key)
+		processed = append(processed, p)
 	}
 
-	// Phase 3: Clean up processed entries (with lock)
+	// Phase 3: Clean up processed entries (with lock). Compare-and-delete on the recorded UID so a
+	// replacement pod re-added to pendingPodDeletions during the unlocked phase 2 (delete -> recreate
+	// -> re-delete of the same namespace/name) is not clobbered and keeps its own NRP-drain tracking.
 	if len(processed) > 0 {
 		dt.mu.Lock()
-		for _, podKey := range processed {
-			delete(dt.pendingPodDeletions, podKey)
+		for _, p := range processed {
+			if cur, ok := dt.pendingPodDeletions[p.Key]; ok && cur.UID == p.UID {
+				delete(dt.pendingPodDeletions, p.Key)
+			}
 		}
 		remaining := len(dt.pendingPodDeletions)
 		dt.mu.Unlock()
@@ -526,7 +530,7 @@ func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID s
 	}
 
 	// Phase 2: Remove finalizers without holding lock (API calls with retry)
-	var processed []string
+	var processed []lastPodEntry
 	var failed []string
 
 	for _, p := range toProcess {
@@ -570,16 +574,19 @@ func (dt *DiffTracker) RemoveLastPodFinalizers(ctx context.Context, serviceUID s
 			dt.logger.V(4).Info("Could not remove finalizer from last pod after retries", "pod", p.Key, "err", retryErr, "lastErr", lastErr)
 			failed = append(failed, p.Key)
 		} else {
-			processed = append(processed, p.Key)
+			processed = append(processed, p)
 		}
 	}
 
-	// Phase 3: Clean up processed entries (with lock)
-	// Only remove successfully processed entries; failed ones will be retried on next cycle
+	// Phase 3: Clean up processed entries (with lock). Compare-and-delete on the recorded UID so a
+	// same-name replacement pod re-added during the unlocked phase 2 keeps its own drain tracking.
+	// Only remove successfully processed entries; failed ones will be retried on next cycle.
 	if len(processed) > 0 {
 		dt.mu.Lock()
-		for _, podKey := range processed {
-			delete(dt.pendingPodDeletions, podKey)
+		for _, p := range processed {
+			if cur, ok := dt.pendingPodDeletions[p.Key]; ok && cur.UID == p.UID {
+				delete(dt.pendingPodDeletions, p.Key)
+			}
 		}
 		remaining := len(dt.pendingPodDeletions)
 		dt.mu.Unlock()

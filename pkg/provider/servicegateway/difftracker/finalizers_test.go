@@ -536,6 +536,60 @@ func TestRemovePodFinalizer(t *testing.T) {
 // PENDING POD DELETION TESTS
 // ================================================================================================
 
+// TestCheckPendingPodDeletions_PreservesReplacementPodEntry verifies that finalizer cleanup does not
+// remove a same-name replacement pod's tracking entry that was re-added while the API calls ran
+// without the lock held.
+func TestCheckPendingPodDeletions_PreservesReplacementPodEntry(t *testing.T) {
+	ctx := context.Background()
+	const key = "default/test-pod"
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-pod",
+			Namespace:  "default",
+			UID:        "uid-a",
+			Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
+		},
+	}
+	kube := fake.NewSimpleClientset(pod)
+	dt := &DiffTracker{
+		kubeClient:          kube,
+		pendingPodDeletions: make(map[string]*PendingPodDeletion),
+		NRPResources:        NRPState{Locations: make(map[string]NRPLocation)},
+	}
+	// Original entry (uid-a); its address is not in NRP, so it is collected for finalizer removal.
+	dt.pendingPodDeletions[key] = &PendingPodDeletion{
+		Namespace: "default", Name: "test-pod", ServiceUID: "egress-1",
+		Address: "10.0.0.1", Location: "192.168.1.1", IsLastPod: false,
+		UID: "uid-a", Timestamp: time.Now().Format(time.RFC3339),
+	}
+
+	// During the unlocked phase-2 GET, a same-name replacement pod (uid-b) re-adds a fresh entry.
+	swapped := false
+	kube.PrependReactor("get", "pods", func(_ ktesting.Action) (bool, runtime.Object, error) {
+		if !swapped {
+			swapped = true
+			dt.mu.Lock()
+			dt.pendingPodDeletions[key] = &PendingPodDeletion{
+				Namespace: "default", Name: "test-pod", ServiceUID: "egress-1",
+				Address: "10.0.0.2", Location: "192.168.1.1", IsLastPod: false,
+				UID: "uid-b", Timestamp: time.Now().Format(time.RFC3339),
+			}
+			dt.mu.Unlock()
+		}
+		return false, nil, nil // let the default tracker return the uid-a pod
+	})
+
+	dt.CheckPendingPodDeletions(ctx)
+
+	dt.mu.Lock()
+	cur, ok := dt.pendingPodDeletions[key]
+	dt.mu.Unlock()
+	if assert.True(t, ok, "the replacement pod's tracking entry must not be clobbered") {
+		assert.Equal(t, "uid-b", cur.UID, "phase 3 must preserve the replacement entry (compare-and-delete on UID)")
+	}
+}
+
 func TestCheckPendingPodDeletions(t *testing.T) {
 	ctx := context.Background()
 

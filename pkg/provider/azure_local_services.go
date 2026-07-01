@@ -365,12 +365,10 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 					}
 				}
 				for _, previousNodeName := range previousNodeNames {
-					nodeIPsSet := az.nodePrivateIPs[strings.ToLower(previousNodeName)]
-					previousIPs = append(previousIPs, nodeIPsSet.UnsortedList()...)
+					previousIPs = append(previousIPs, az.nodePrivateIPsForNode(previousNodeName)...)
 				}
 				for _, currentNodeName := range currentNodeNames {
-					nodeIPsSet := az.nodePrivateIPs[strings.ToLower(currentNodeName)]
-					currentIPs = append(currentIPs, nodeIPsSet.UnsortedList()...)
+					currentIPs = append(currentIPs, az.nodePrivateIPsForNode(currentNodeName)...)
 				}
 
 				if az.backendPoolUpdater != nil {
@@ -580,15 +578,14 @@ func (az *Cloud) getPodIPToNodeIPMapFromEndpointSlice(es *discovery_v1.EndpointS
 		}
 
 		// Get node IPs
-		nodeName = strings.ToLower(nodeName)
-		nodeIPsSet := az.nodePrivateIPs[nodeName]
-		if nodeIPsSet == nil {
+		nodeIPs := az.nodePrivateIPsForNode(nodeName)
+		if len(nodeIPs) == 0 {
 			continue
 		}
 
 		// Find the first node IP matching the requested IP family
 		var matchingNodeIP string
-		for _, nodeIP := range nodeIPsSet.UnsortedList() {
+		for _, nodeIP := range nodeIPs {
 			if utilnet.IsIPv6String(nodeIP) == ipv6 {
 				matchingNodeIP = nodeIP
 				break
@@ -776,8 +773,7 @@ func (az *Cloud) checkAndApplyLocalServiceBackendPoolUpdates(lb armnetwork.LoadB
 
 	var expectedIPs []string
 	for _, nodeName := range endpointsNodeNames.UnsortedList() {
-		ips := az.nodePrivateIPs[strings.ToLower(nodeName)]
-		expectedIPs = append(expectedIPs, ips.UnsortedList()...)
+		expectedIPs = append(expectedIPs, az.nodePrivateIPsForNode(nodeName)...)
 	}
 	currentIPsInBackendPools := make(map[string][]string)
 	for _, bp := range lb.Properties.BackendAddressPools {

@@ -2,7 +2,6 @@ package difftracker
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -576,12 +575,12 @@ func TestRecoverStuckFinalizers_RemovesFinalizerWhenNoAzureResource(t *testing.T
 		"finalizer with no Azure resource must be removed since there is nothing to clean up")
 }
 
-// TestCheckInitializationComplete_ParkedOpBlocksCompletion verifies that
-// checkInitializationCompleteLocked counts a transient-failure-parked op (RetriesExhausted=true,
-// CreationFailedTerminal=false) as still pending: while such an op remains in pendingServiceOps the
-// init-completion channel does not close, so WaitForInitialSync returns its context deadline rather
-// than completing.
-func TestCheckInitializationComplete_ParkedOpBlocksCompletion(t *testing.T) {
+// TestCheckInitializationComplete_ParkedOpDoesNotBlockCompletion verifies that
+// checkInitializationCompleteLocked does NOT count a transient-failure-parked op (RetriesExhausted=true,
+// CreationFailedTerminal=false) as pending. Such an op self-heals in the background (retryGate cooldown
+// re-arm), so it must not hold initial sync open: the real caller waits on a no-timeout context, and a
+// single un-provisionable service would otherwise stall the whole cloud-provider init.
+func TestCheckInitializationComplete_ParkedOpDoesNotBlockCompletion(t *testing.T) {
 	dt := newTestDiffTracker()
 	uid := "svc-init-parked"
 
@@ -589,8 +588,7 @@ func TestCheckInitializationComplete_ParkedOpBlocksCompletion(t *testing.T) {
 	atomic.StoreInt32(&dt.isInitializing, 1)
 	dt.initCompletionChecker = make(chan struct{})
 
-	// Parked-but-not-terminal: retryGate skips it, but checkInitializationCompleteLocked still
-	// counts it as pending.
+	// Retry-exhausted parked op: retryGate skips it and it is not terminal, but it must not block init.
 	dt.pendingServiceOps[uid] = &ServiceOperationState{
 		ServiceUID:             uid,
 		Config:                 NewInboundServiceConfig(uid, makeInboundConfig(80)),
@@ -601,22 +599,42 @@ func TestCheckInitializationComplete_ParkedOpBlocksCompletion(t *testing.T) {
 		NextRetryAt:            time.Now().Add(time.Hour),
 	}
 
-	// Force-evaluate completion: with the parked op counted as pending, the channel must NOT close.
 	dt.checkInitializationComplete()
 	select {
 	case <-dt.initCompletionChecker:
-		t.Fatal("init must not complete while a parked op remains in pendingServiceOps")
 	default:
+		t.Fatal("init must complete when the only pending op is retry-exhausted parked")
+	}
+	assert.Equal(t, int32(0), atomic.LoadInt32(&dt.isInitializing), "isInitializing must be cleared on completion")
+
+	// WaitForInitialSync therefore returns successfully rather than draining its context.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	assert.NoError(t, dt.WaitForInitialSync(ctx), "WaitForInitialSync must complete despite the parked op")
+}
+
+// TestCheckInitializationComplete_InProgressOpBlocksCompletion verifies the other direction: an op that is
+// genuinely still in flight (not parked, not created) keeps initial sync open.
+func TestCheckInitializationComplete_InProgressOpBlocksCompletion(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-init-inflight"
+
+	atomic.StoreInt32(&dt.isInitializing, 1)
+	dt.initCompletionChecker = make(chan struct{})
+
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewInboundServiceConfig(uid, makeInboundConfig(80)),
+		State:      StateCreationInProgress,
 	}
 
-	// WaitForInitialSync therefore drains its context: it returns a context-deadline error rather
-	// than a successful completion.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	err := dt.WaitForInitialSync(ctx)
-	assert.Error(t, err, "WaitForInitialSync must return a context error while a parked op blocks completion")
-	assert.True(t, errors.Is(err, context.DeadlineExceeded),
-		"the error must be the context deadline (not a successful nil return)")
+	dt.checkInitializationComplete()
+	select {
+	case <-dt.initCompletionChecker:
+		t.Fatal("init must not complete while a genuinely in-flight op remains pending")
+	default:
+	}
+	assert.Equal(t, int32(1), atomic.LoadInt32(&dt.isInitializing), "isInitializing must stay set while work is pending")
 }
 
 // TestEgressRefCount_Robust verifies the outbound (NAT Gateway) ref-count lifecycle:
