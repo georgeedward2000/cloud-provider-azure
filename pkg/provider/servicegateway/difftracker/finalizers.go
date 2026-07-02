@@ -8,6 +8,7 @@ package difftracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -232,18 +233,26 @@ func (dt *DiffTracker) getPodByNamespaceName(ctx context.Context, namespace, nam
 // a missing pod is success) rather than trusting the informer-cache finalizer list, so it re-adds a
 // concurrently-stripped finalizer. It is UID-guarded so a same-name replacement pod is never given
 // the finalizer (removePodFinalizer would then refuse to strip it, stranding the replacement).
+// ErrPodGoneOrReplaced is returned by AddPodFinalizer when the target pod no longer exists or has
+// been replaced by a same-name pod with a different UID. The finalizer is intentionally not added
+// (removePodFinalizer is UID-guarded), so the caller must skip registering the stale event pod
+// rather than treat this as a successful add.
+var ErrPodGoneOrReplaced = errors.New("pod gone or replaced by a same-name UID; skip egress registration")
+
 func (dt *DiffTracker) AddPodFinalizer(ctx context.Context, pod *v1.Pod) error {
 	namespace := pod.Namespace
 	name := pod.Name
 	intendedUID := string(pod.UID)
 	var lastErr error
+	goneOrReplaced := false
 
 	retryErr := wait.ExponentialBackoff(finalizerRetryBackoff, func() (bool, error) {
 		// Get fresh pod to avoid conflicts with concurrent status updates
 		currentPod, err := dt.kubeClient.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				// Pod deleted, nothing to do
+				// Pod deleted: nothing to finalize, and the caller must not register it.
+				goneOrReplaced = true
 				return true, nil
 			}
 			lastErr = err
@@ -253,9 +262,11 @@ func (dt *DiffTracker) AddPodFinalizer(ctx context.Context, pod *v1.Pod) error {
 
 		// The named pod is now a different instance (the original target was deleted and a same-name
 		// pod recreated). Do NOT add this finalizer to the replacement: removePodFinalizer is
-		// UID-guarded and would refuse to strip it, stranding the replacement in Terminating.
+		// UID-guarded and would refuse to strip it, stranding the replacement in Terminating. Signal
+		// the caller so it skips registering the stale event pod's addresses.
 		if intendedUID != "" && string(currentPod.UID) != intendedUID {
 			dt.logger.V(4).Info("Pod UID changed (replacement pod); not adding finalizer", "namespace", namespace, "name", name, "wantUID", intendedUID, "gotUID", string(currentPod.UID))
+			goneOrReplaced = true
 			return true, nil
 		}
 
@@ -280,6 +291,9 @@ func (dt *DiffTracker) AddPodFinalizer(ctx context.Context, pod *v1.Pod) error {
 
 	if retryErr != nil {
 		return fmt.Errorf("failed to add pod finalizer after retries: %v (last error: %v)", retryErr, lastErr)
+	}
+	if goneOrReplaced {
+		return ErrPodGoneOrReplaced
 	}
 	return nil
 }

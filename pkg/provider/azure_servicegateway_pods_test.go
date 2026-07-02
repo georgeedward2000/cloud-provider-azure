@@ -377,6 +377,52 @@ func TestPodInformerAddPod_RejectsInvalidEgressLabel(t *testing.T) {
 	}
 }
 
+// TestPodInformerAddPod_SkipsStaleReplacedPod verifies that a stale Add event for a pod that has
+// since been replaced by a same-name pod with a different UID does NOT register the stale event
+// pod's address. AddPodFinalizer declines to add the finalizer to the replacement (it is UID-guarded)
+// and signals ErrPodGoneOrReplaced; the handler must abort rather than register an unprotected
+// mapping (no finalizer to drain it) for an IP that may already be reclaimed.
+func TestPodInformerAddPod_SkipsStaleReplacedPod(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const egress = "egress-svc"
+	// The live pod at default/egress-p is the replacement (new UID).
+	livePod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "egress-p",
+			Namespace: "default",
+			UID:       "uid-new",
+			Labels:    map[string]string{consts.PodLabelServiceEgressGateway: egress},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning, HostIP: "10.0.0.1", PodIP: "10.244.0.2"},
+	}
+	// The stale Add event carries the old pod (old UID, different IP).
+	stalePod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "egress-p",
+			Namespace: "default",
+			UID:       "uid-old",
+			Labels:    map[string]string{consts.PodLabelServiceEgressGateway: egress},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning, HostIP: "10.0.0.1", PodIP: "10.244.0.1"},
+	}
+	kube := fake.NewSimpleClientset(livePod)
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = newProviderDiffTracker(t, az, kube)
+
+	az.podInformerAddPod(stalePod)
+
+	assert.False(t, az.diffTracker.IsServiceTracked(egress),
+		"a stale event for a UID-replaced pod must not register the stale address")
+	if node, ok := az.diffTracker.K8sResources.Nodes["10.0.0.1"]; ok {
+		assert.NotContains(t, node.Pods, "10.244.0.1",
+			"the stale pod's IP must not be registered under the node location")
+	}
+}
+
 func TestPodInformerAddPod_RejectsMalformedPodIP(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

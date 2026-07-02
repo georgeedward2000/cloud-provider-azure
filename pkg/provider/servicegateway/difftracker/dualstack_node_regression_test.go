@@ -102,6 +102,38 @@ func TestColdStart_DualStackNode_InboundFamilyMatchedLocationKey(t *testing.T) {
 		"v4 and v6 pods on the same node must use distinct family-matched location keys")
 }
 
+// TestColdStart_NonCanonicalIPv6_CanonicalizesLocationKeys verifies that a non-canonical IPv6 node
+// InternalIP or endpoint address is canonicalized during cold-start seeding, so the location/address
+// keys match the runtime path and NRP state (both canonical). A raw key would diff as a spurious
+// add/delete against the canonical NRP location after a restart.
+func TestColdStart_NonCanonicalIPv6_CanonicalizesLocationKeys(t *testing.T) {
+	const (
+		nodeName    = "node-nc"
+		nodeV4      = "10.0.0.10"
+		nodeV6Raw   = "2001:DB8::0010" // uppercase + leading zeros
+		nodeV6Canon = "2001:db8::10"
+		svcV6UID    = "22222222-2222-2222-2222-222222222222"
+		podV6Raw    = "2001:DB8::0205"
+		podV6Canon  = "2001:db8::205"
+	)
+
+	esV6 := newServiceOwnedEndpointSlice("svc-v6-eps", "default", svcV6UID, discoveryv1.AddressTypeIPv6, []discoveryv1.Endpoint{
+		{Addresses: []string{podV6Raw}, NodeName: ptr.To(nodeName)},
+	})
+	kube := fake.NewSimpleClientset(dualStackNode(nodeName, nodeV4, nodeV6Raw), esV6)
+
+	nodeIPs, err := buildNodeNameToIPsMap(context.Background(), kube)
+	assert.NoError(t, err)
+	assert.Contains(t, nodeIPs[nodeName], nodeV6Canon, "node InternalIP must be canonicalized")
+
+	k8s := newK8sStateForSeeders(svcV6UID)
+	_, err = processK8sEndpoints(context.Background(), kube, &k8s, nodeIPs)
+	assert.NoError(t, err)
+
+	assert.Equal(t, nodeV6Canon, locationForAddr(&k8s, podV6Canon),
+		"IPv6 pod must be keyed under the canonical node InternalIP and canonical pod address")
+}
+
 // TestColdStart_DualStackNode_EgressUsesHostIP verifies an egress pod on a dual-stack node is
 // seeded under pod.Status.HostIP (the runtime AddPod/DeletePod key), regardless of which family
 // the node lists first.
@@ -127,6 +159,32 @@ func TestColdStart_DualStackNode_EgressUsesHostIP(t *testing.T) {
 	assert.NotContains(t, []string{locationForAddr(&k8s, podIP)}, nodeV4,
 		"egress pod must NOT be keyed under the node's first (mismatched-family) InternalIP")
 	assert.True(t, k8s.Egresses.Has(egress), "egress identity must be tracked")
+}
+
+// TestColdStart_EgressPodNoSameFamilyLocation_NotDesired verifies cold-start does not mark an egress
+// NAT Gateway desired for a pod whose PodIP has no same-family node location (an IPv6 PodIP on a node
+// exposing only an IPv4 InternalIP). Marking it desired would provision a NAT Gateway + PIP with no
+// backing pod address, diverging from the runtime path (podInformerAddPod), which only tracks the
+// egress once an address is actually registered.
+func TestColdStart_EgressPodNoSameFamilyLocation_NotDesired(t *testing.T) {
+	const (
+		nodeName = "node-v4only"
+		egress   = "egressnoloc"
+		podV6    = "fd00::501" // IPv6 egress PodIP
+		hostV4   = "10.0.0.40" // pod.Status.HostIP is IPv4 only -> no same-family (IPv6) location
+	)
+
+	pod := newEgressPod("orphan-egress-pod", "default", egress, nodeName, podV6, hostV4, v1.PodRunning)
+	kube := fake.NewSimpleClientset(pod)
+
+	k8s := newK8sStateForSeeders()
+	_, err := processK8sEgresses(context.Background(), kube, &k8s)
+	assert.NoError(t, err)
+
+	assert.False(t, k8s.Egresses.Has(egress),
+		"an egress pod with no same-family node location must not mark the NAT Gateway desired (no orphan NAT)")
+	assert.False(t, podIPTracked(&k8s, podV6),
+		"the unlocatable IPv6 PodIP must not be registered")
 }
 
 // TestColdStart_DualStackNode_RestartConvergence is the core regression guard: after a CCM

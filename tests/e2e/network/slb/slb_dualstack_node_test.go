@@ -240,6 +240,16 @@ var _ = Describe("SLB - Dual-stack nodes with single-stack services", Label(slbT
 		// The two families must occupy DISTINCT location keys even though both pods are on one node.
 		Expect(nodeV4).NotTo(Equal(nodeV6))
 		utils.Logf("\n✓ Dual-stack node: v4 pod under %s, v6 pod under %s (family-partitioned)", nodeV4, nodeV6)
+
+		By("Asserting the IPv6 location key is stable across reconciles (no representation churn)")
+		// A non-canonical IPv6 key on the K8s side would diff against the canonical NRP location and
+		// surface as the address/location flapping between reconciles; the key must stay constant.
+		stableV6Loc := sgLocationForAddress(v6PodIP)
+		Expect(stableV6Loc).NotTo(BeEmpty())
+		Consistently(func() string {
+			return sgLocationForAddress(v6PodIP)
+		}, 20*time.Second, 5*time.Second).Should(Equal(stableV6Loc),
+			"the IPv6 pod's registered node location must remain a single stable key across reconciles")
 	})
 })
 

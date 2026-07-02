@@ -716,6 +716,37 @@ func TestGetPodIPToNodeIPMapFromEndpointSlice_ReadinessFiltering(t *testing.T) {
 	}
 }
 
+// A non-canonical IPv6 endpoint address or node InternalIP must be canonicalized so the resulting
+// location keys match init (buildNodeNameToIPsMap/processK8sEndpoints) and NRP state; a raw key would
+// diff as a spurious add plus delete against the canonical NRP location on reconcile/restart.
+func TestGetPodIPToNodeIPMapFromEndpointSlice_CanonicalizesIPv6(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	trueVal := true
+	es := &discovery_v1.EndpointSlice{
+		ObjectMeta:  metav1.ObjectMeta{Name: "eps1", Namespace: "default"},
+		AddressType: discovery_v1.AddressTypeIPv6,
+		Endpoints: []discovery_v1.Endpoint{
+			{
+				Addresses:  []string{"2001:DB8::0001"}, // uppercase + leading zeros
+				NodeName:   ptr.To("node1"),
+				Conditions: discovery_v1.EndpointConditions{Ready: &trueVal},
+			},
+		},
+	}
+
+	cloud := GetTestCloud(ctrl)
+	cloud.nodePrivateIPs = map[string]*utilsets.IgnoreCaseSet{
+		"node1": utilsets.NewString("2001:DB8::00AB"), // non-canonical node InternalIP
+	}
+
+	result := cloud.getPodIPToNodeIPMapFromEndpointSlice(es, true)
+
+	assert.Equal(t, map[string]string{"2001:db8::1": "2001:db8::ab"}, result,
+		"pod IP key and node IP value must be canonicalized to match init and NRP state")
+}
+
 func TestEndpointSlicesInformer(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

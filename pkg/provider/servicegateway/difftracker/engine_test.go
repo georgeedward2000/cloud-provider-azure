@@ -1109,3 +1109,43 @@ func TestUpdateEndpoints_UntrackedServiceIsNotBuffered(t *testing.T) {
 	assert.Empty(t, dt.pendingEndpoints, "endpoints for an untracked, non-NRP service must not be buffered")
 	assert.NotContains(t, dt.pendingEndpoints, uid)
 }
+
+// A terminating egress pod is delivered to the informer several times (deletionTimestamp
+// set, then terminating status updates, duplicate deletes). Only the first event drains
+// addresses; later events drain nothing but must still report Enqueued so the cleanup
+// finalizer stays held until NRP drain completes. Otherwise the pod (and its egress IP)
+// is reclaimed while NRP still maps the address to the NAT Gateway.
+func TestEngineDeletePod_DuplicateEventKeepsDrainGate(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "egress-nat"
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid, Config: NewOutboundServiceConfig(uid, nil), State: StateCreated,
+	}
+	dt.NRPResources.NATGateways.Insert(uid)
+	dt.AddPod(uid, "ns/pod-a", "10.0.0.1", "10.244.0.5")
+
+	first := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "pod-a-uid")
+	assert.True(t, first.Enqueued, "first delete drains the address and must drain-gate the finalizer")
+
+	second := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "pod-a-uid")
+	assert.False(t, second.IsLastPod, "duplicate delete drains nothing new")
+	assert.True(t, second.Enqueued, "duplicate delete must keep the finalizer gated while the prior drain is pending")
+	assert.Contains(t, dt.pendingPodDeletions, "ns/pod-a", "pending drain record must survive the duplicate event")
+}
+
+// A duplicate delete carrying a different UID (same-name replacement pod) must not be
+// gated by the stale record left by the original pod, or the replacement's finalizer
+// would be held against a drain that isn't its own.
+func TestEngineDeletePod_ReplacementUIDNotGatedByStaleRecord(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "egress-nat"
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid, Config: NewOutboundServiceConfig(uid, nil), State: StateCreated,
+	}
+	dt.NRPResources.NATGateways.Insert(uid)
+	dt.AddPod(uid, "ns/pod-a", "10.0.0.1", "10.244.0.5")
+	dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "pod-a-uid")
+
+	replacement := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "pod-b-uid")
+	assert.False(t, replacement.Enqueued, "a different-UID delete must not inherit the prior pod's drain gate")
+}

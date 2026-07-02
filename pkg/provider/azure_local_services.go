@@ -584,11 +584,17 @@ func (az *Cloud) getPodIPToNodeIPMapFromEndpointSlice(es *discovery_v1.EndpointS
 			continue
 		}
 
-		// Find the first node IP matching the requested IP family
+		// Find the first node IP matching the requested IP family. Canonicalize it so the location
+		// key matches init (buildNodeNameToIPsMap) and NRP state; mixed IPv6 representations would
+		// otherwise diff as spurious add/delete pairs.
 		var matchingNodeIP string
 		for _, nodeIP := range nodeIPs {
 			if utilnet.IsIPv6String(nodeIP) == ipv6 {
-				matchingNodeIP = nodeIP
+				if addr, err := netip.ParseAddr(nodeIP); err == nil {
+					matchingNodeIP = addr.String()
+				} else {
+					matchingNodeIP = nodeIP
+				}
 				break
 			}
 		}
@@ -600,12 +606,14 @@ func (az *Cloud) getPodIPToNodeIPMapFromEndpointSlice(es *discovery_v1.EndpointS
 
 		// Map each pod IP to the node IP. Skip malformed addresses; a bad value would poison the
 		// AddressLocations payload and make NRP reject the whole batch, stalling location sync.
+		// Canonicalize the address so the key matches init and NRP state.
 		for _, podIP := range ep.Addresses {
-			if _, err := netip.ParseAddr(podIP); err != nil {
+			addr, err := netip.ParseAddr(podIP)
+			if err != nil {
 				klog.Warningf("EndpointSlice %s/%s has a malformed endpoint address %q; skipping", es.Namespace, es.Name, podIP)
 				continue
 			}
-			podIPToNodeIPMap[podIP] = matchingNodeIP
+			podIPToNodeIPMap[addr.String()] = matchingNodeIP
 		}
 	}
 

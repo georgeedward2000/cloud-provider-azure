@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -539,13 +540,36 @@ func TestRecoverStuckFinalizers_KeepsFinalizerWhenOnlyPIPExists(t *testing.T) {
 	dt.kubeClient = kube
 	services := &v1.ServiceList{Items: []v1.Service{*svc}}
 
-	azurePIPs := map[string]string{uid + "-pip": "10.0.0.9"}
-	recoverStuckFinalizers(context.Background(), dt, services, nil, nil, utilsets.NewString(), utilsets.NewString(), azurePIPs)
+	// The PIP exists in Azure but its static address has not been allocated yet (nil IPAddress) - the
+	// crash-after-PIP-create window. Existence must still be recognized (by name, via
+	// pipNamesInAzureFromList) so the Service finalizer is preserved for orphan cleanup.
+	azurePIPs := []*armnetwork.PublicIPAddress{{Name: ptr.To(uid + "-pip")}}
+	recoverStuckFinalizers(context.Background(), dt, services, nil, nil, utilsets.NewString(), utilsets.NewString(), pipNamesInAzureFromList(azurePIPs))
 
 	got, err := kube.CoreV1().Services("default").Get(context.Background(), "svc-pip", metav1.GetOptions{})
 	assert.NoError(t, err)
 	assert.True(t, hasServiceGatewayFinalizer(got),
 		"finalizer must be kept while a real Azure Public IP exists for the service")
+}
+
+// TestPIPNamesInAzureFromList_IncludesAddressLessPIP verifies the PIP existence oracle counts a PIP
+// whose static address has not been allocated yet (nil IPAddress, or nil Properties). pipNameToIP
+// omits these, so using it for existence would leak an address-less PIP and prematurely strip its
+// Service finalizer (the crash-after-PIP-create window).
+func TestPIPNamesInAzureFromList_IncludesAddressLessPIP(t *testing.T) {
+	pips := []*armnetwork.PublicIPAddress{
+		{Name: ptr.To("alloc-pip"), Properties: &armnetwork.PublicIPAddressPropertiesFormat{IPAddress: ptr.To("1.2.3.4")}},
+		{Name: ptr.To("pending-pip"), Properties: &armnetwork.PublicIPAddressPropertiesFormat{}}, // address not allocated yet
+		{Name: ptr.To("nilprops-pip")}, // no Properties at all
+		{Properties: &armnetwork.PublicIPAddressPropertiesFormat{}}, // no Name -> skipped
+	}
+
+	names := pipNamesInAzureFromList(pips)
+
+	assert.True(t, names.Has("alloc-pip"), "an allocated PIP must be counted as existing")
+	assert.True(t, names.Has("pending-pip"), "an address-less PIP must be counted as existing")
+	assert.True(t, names.Has("nilprops-pip"), "a PIP with nil Properties must be counted as existing")
+	assert.Equal(t, 3, names.Len(), "a nameless PIP must be skipped")
 }
 
 // TestRecoverStuckFinalizers_RemovesFinalizerWhenNoAzureResource verifies the complementary case: a

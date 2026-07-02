@@ -80,10 +80,16 @@ func InitializeFromCluster(
 
 	// Build NRP state from Azure (includes pipNameToIP for External IP recovery)
 	// We keep currentLoadBalancersInNRP and currentNATGatewaysInNRP to identify and clean up orphaned Azure resources
-	nrp, currentLoadBalancersInNRP, currentNATGatewaysInNRP, _, pipNameToIP, err := buildNRPState(ctx, config, networkClientFactory)
+	nrp, currentLoadBalancersInNRP, currentNATGatewaysInNRP, azurePIPs, pipNameToIP, err := buildNRPState(ctx, config, networkClientFactory)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build NRP state: %w", err)
 	}
+
+	// Existence set of every Azure PIP name, independent of whether its address has been allocated
+	// yet. pipNameToIP only contains PIPs with an allocated IPAddress, so it must NOT be used to
+	// decide whether a PIP resource exists: a crash right after PIP creation (address still nil)
+	// would otherwise make finalizer/orphan recovery treat the PIP as absent and leak it.
+	pipNamesInAzure := pipNamesInAzureFromList(azurePIPs)
 
 	// Initialize DiffTracker with computed state
 	diffTracker, err := initializeDiffTrackerWithState(log.FromContextOrBackground(ctx), k8s, nrp, config, networkClientFactory, kubeClient)
@@ -101,7 +107,7 @@ func InitializeFromCluster(
 	// Recover resources stuck with finalizers from a previous crash
 	// This must happen BEFORE informers start to avoid race conditions
 	// Reuse lists from buildK8sState (avoids duplicate API calls)
-	recoverStuckFinalizers(ctx, diffTracker, serviceList, egressPodList, endpointSliceList, currentLoadBalancersInNRP, currentNATGatewaysInNRP, pipNameToIP)
+	recoverStuckFinalizers(ctx, diffTracker, serviceList, egressPodList, endpointSliceList, currentLoadBalancersInNRP, currentNATGatewaysInNRP, pipNamesInAzure)
 
 	// Counter already initialized from K8s state during buildK8sState
 	// After initialization sync completes, NRP will match K8s, so counter reflects final state
@@ -129,7 +135,7 @@ func InitializeFromCluster(
 	// Orphaned resources are LBs/NATs/PIPs that exist in Azure but NOT in ServiceGateway.
 	// This happens when services are deleted while CCM is down, or from failed operations.
 	// We add them to NRPResources and call DeleteService to use the standard async deletion flow.
-	scheduleOrphanedResourceDeletions(diffTracker, currentLoadBalancersInNRP, currentNATGatewaysInNRP, pipNameToIP)
+	scheduleOrphanedResourceDeletions(diffTracker, currentLoadBalancersInNRP, currentNATGatewaysInNRP, pipNamesInAzure)
 
 	// Trigger initial location sync if needed:
 	// - For deletions: Clear orphaned locations so services can be deleted
@@ -257,7 +263,10 @@ func buildNodeNameToIPsMap(ctx context.Context, kubeClient kubernetes.Interface)
 		n := &nodeList.Items[i]
 		for _, addr := range n.Status.Addresses {
 			if addr.Type == v1.NodeInternalIP {
-				nodeNameToIPsMap[n.Name] = append(nodeNameToIPsMap[n.Name], addr.Address)
+				// Canonicalize so location keys match runtime (getPodIPToNodeIPMapFromEndpointSlice)
+				// and NRP state; a non-canonical IPv6 InternalIP would otherwise orphan the location
+				// across a restart diff.
+				nodeNameToIPsMap[n.Name] = append(nodeNameToIPsMap[n.Name], canonicalIP(addr.Address))
 			}
 		}
 	}
@@ -320,7 +329,7 @@ func recoverStuckFinalizers(
 	endpointSlices *discoveryv1.EndpointSliceList,
 	currentLBsInAzure *utilsets.IgnoreCaseSet,
 	currentNATsInAzure *utilsets.IgnoreCaseSet,
-	azurePIPNameToIP map[string]string,
+	azurePIPNames *utilsets.IgnoreCaseSet,
 ) {
 	logger := log.FromContextOrBackground(ctx)
 
@@ -373,8 +382,9 @@ func recoverStuckFinalizers(
 			// services that completed ServiceGateway registration (Step 4 of creation), so a crash
 			// after the PIP/LB were created but before registration leaves the resource present in
 			// Azure yet absent from NRPResources. Also consult the actual Azure LB/NAT/PIP enumeration
-			// so we do not strip the finalizer before the resource's cleanup is scheduled.
-			_, pipExistsInAzure := azurePIPNameToIP[uid+"-pip"]
+			// so we do not strip the finalizer before the resource's cleanup is scheduled. PIP existence
+			// is checked by name (not the allocated-IP map) so an address-less PIP still counts.
+			pipExistsInAzure := azurePIPNames != nil && azurePIPNames.Has(uid+"-pip")
 			hasAzureResource := dt.NRPResources.LoadBalancers.Has(uid) || dt.NRPResources.NATGateways.Has(uid) ||
 				(currentLBsInAzure != nil && currentLBsInAzure.Has(uid)) ||
 				(currentNATsInAzure != nil && currentNATsInAzure.Has(uid)) ||
@@ -588,11 +598,13 @@ func processK8sEndpoints(
 			for _, podIP := range endpoint.Addresses {
 				// Skip malformed addresses; a bad value would poison the AddressLocations payload and
 				// make NRP reject the whole batch (matches getPodIPToNodeIPMapFromEndpointSlice).
-				if _, err := netip.ParseAddr(podIP); err != nil {
+				// Canonicalize the address so the key matches the runtime path and NRP state.
+				addr, err := netip.ParseAddr(podIP)
+				if err != nil {
 					logger.V(4).Info("Skipped endpoint with malformed address", "namespace", endpointSlice.Namespace, "endpointSlice", endpointSlice.Name, "address", podIP)
 					continue
 				}
-				addInboundIdentityToPod(k8s, nodeIP, podIP, serviceUID)
+				addInboundIdentityToPod(k8s, nodeIP, addr.String(), serviceUID)
 			}
 		}
 		processedCount++
@@ -662,11 +674,12 @@ func processK8sEgresses(
 			continue
 		}
 
-		k8s.Egresses.Insert(egressVal)
-
-		// Seed each address under its same-family node location (see PodNodeLocationsByFamily),
-		// matching the runtime path (podInformerAddPod).
+		// Seed each address under its same-family node location (see PodNodeLocationsByFamily). Mark the
+		// egress desired only once at least one address maps to a same-family location, matching the
+		// runtime path (podInformerAddPod), so init never provisions a NAT Gateway with no backing pod
+		// address (e.g. an IPv6 PodIP on a node exposing only an IPv4 InternalIP).
 		hostByFamily := PodNodeLocationsByFamily(&pod)
+		seeded := false
 		for _, podIP := range validAddrs {
 			nodeIP, ok := NodeLocationForAddress(hostByFamily, podIP)
 			if !ok {
@@ -675,6 +688,10 @@ func processK8sEgresses(
 			}
 			ensureNodeExists(k8s, nodeIP)
 			addOutboundIdentityToPod(k8s, nodeIP, podIP, egressVal)
+			seeded = true
+		}
+		if seeded {
+			k8s.Egresses.Insert(egressVal)
 		}
 	}
 	logger.V(2).Info("Processed Kubernetes egress services", "egresses", k8s.Egresses.Len())
@@ -690,7 +707,6 @@ func buildNRPState(
 	config Config,
 	networkClientFactory azclient.ClientFactory,
 ) (NRPState, *utilsets.IgnoreCaseSet, *utilsets.IgnoreCaseSet, []*armnetwork.PublicIPAddress, map[string]string, error) {
-	logger := log.FromContextOrBackground(ctx)
 	nrp := NRPState{
 		LoadBalancers: utilsets.NewString(),
 		NATGateways:   utilsets.NewString(),
@@ -719,13 +735,15 @@ func buildNRPState(
 		return NRPState{}, nil, nil, nil, nil, err
 	}
 
-	// Fetch Azure Public IPs - both for External IP recovery (map) and orphan cleanup (raw slice)
+	// Fetch Azure Public IPs - both for External IP recovery (map) and orphan cleanup (raw slice).
+	// This is fatal like the LB/NAT fetches above: the PIP enumeration is required to backfill a
+	// crashed-mid-provisioning Service's ingress IP (recoverServiceExternalIPs is the only recovery
+	// path, and it runs once at init) and to clean up orphaned PIPs. Silently continuing with an
+	// empty list would permanently drop those recoveries until the next restart, so fail init and
+	// let it be retried instead.
 	azurePIPs, pipNameToIP, err := fetchAzurePublicIPs(ctx, config, networkClientFactory)
 	if err != nil {
-		// Non-fatal: External IP recovery and orphan cleanup will just skip if this fails
-		logger.V(4).Info("Could not fetch Public IPs", "err", err)
-		azurePIPs = nil
-		pipNameToIP = make(map[string]string)
+		return NRPState{}, nil, nil, nil, nil, fmt.Errorf("failed to fetch Azure public IPs: %w", err)
 	}
 
 	return nrp, currentLBs, currentNATs, azurePIPs, pipNameToIP, nil
@@ -872,6 +890,21 @@ func fetchAzurePublicIPs(
 	}
 	logger.V(2).Info("Fetched Azure Public IPs", "publicIPs", len(pips), "allocatedAddresses", len(pipNameToIP))
 	return pips, pipNameToIP, nil
+}
+
+// pipNamesInAzureFromList collects every Public IP name from an Azure PIP enumeration, independent of
+// whether its address has been allocated. It is the resource-existence oracle for finalizer/orphan
+// recovery: unlike pipNameToIP (built only from PIPs with a non-nil IPAddress), it also counts a PIP
+// that was created but whose static address has not been allocated yet (a crash-window state), so
+// recovery neither strips a Service finalizer nor skips an orphan PIP that actually exists.
+func pipNamesInAzureFromList(pips []*armnetwork.PublicIPAddress) *utilsets.IgnoreCaseSet {
+	names := utilsets.NewString()
+	for _, pip := range pips {
+		if pip.Name != nil {
+			names.Insert(*pip.Name)
+		}
+	}
+	return names
 }
 
 // initializeDiffTrackerWithState creates a DiffTracker and populates initial state
@@ -1038,7 +1071,7 @@ func recoverServiceExternalIPs(ctx context.Context, diffTracker *DiffTracker, se
 //
 // If a resource exists in K8s, reconcileServices will handle it - don't delete it!
 // This uses the Engine's DeleteService flow with isOrphan=true to bypass the NRP existence check.
-func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzure, currentNATsInAzure *utilsets.IgnoreCaseSet, pipNameToIP map[string]string) {
+func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzure, currentNATsInAzure, pipNamesInAzure *utilsets.IgnoreCaseSet) {
 	logger := log.Background().WithName("difftracker")
 
 	var orphanedLBs, orphanedNATs, orphanedPIPOnly []string
@@ -1093,7 +1126,8 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 	// Routing through DeleteService(isOrphan) runs deleteInboundService, which deletes the PIP
 	// (Step 4) AND removes the finalizer (Step 6); the missing LB/SGW steps are 404-safe no-ops.
 	orphanLBSet := utilsets.NewString(orphanedLBs...)
-	for pipName := range pipNameToIP {
+	for _, pipName := range pipNamesInAzure.UnsortedList() {
+		pipName = strings.ToLower(pipName)
 		if !strings.HasSuffix(pipName, "-pip") || pipName == "default-natgw-pip" {
 			continue
 		}

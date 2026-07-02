@@ -1254,19 +1254,27 @@ func (dt *DiffTracker) DeletePod(serviceUID, location string, addresses []string
 	// finalizer). The finalizer is removed only after every recorded address has drained from NRP,
 	// never inline on the delete event; removing it earlier would let the pod (and its IPs) be
 	// reclaimed while NRP still maps an address to this service's NAT Gateway.
-	if namespace != "" && name != "" && len(drainGated) > 0 {
+	if namespace != "" && name != "" {
 		podKey := fmt.Sprintf("%s/%s", namespace, name)
-		dt.pendingPodDeletions[podKey] = &PendingPodDeletion{
-			Namespace:  namespace,
-			Name:       name,
-			UID:        uid,
-			ServiceUID: serviceUID,
-			Addresses:  drainGated,
-			IsLastPod:  result.IsLastPod,
-			Timestamp:  time.Now().Format(time.RFC3339),
+		if len(drainGated) > 0 {
+			dt.pendingPodDeletions[podKey] = &PendingPodDeletion{
+				Namespace:  namespace,
+				Name:       name,
+				UID:        uid,
+				ServiceUID: serviceUID,
+				Addresses:  drainGated,
+				IsLastPod:  result.IsLastPod,
+				Timestamp:  time.Now().Format(time.RFC3339),
+			}
+			result.Enqueued = true
+			dt.logger.V(5).Info("Added pending pod deletion", "pod", podKey, "isLastPod", result.IsLastPod, "addresses", drainGated)
+		} else if existing, ok := dt.pendingPodDeletions[podKey]; ok && (uid == "" || existing.UID == uid) {
+			// A prior delete event already drain-gated this pod; a duplicate or subsequent
+			// terminating-status event drains nothing new but must still report Enqueued so
+			// podInformerRemovePod does not strip the finalizer while that drain is pending.
+			// UID-guarded so a same-name replacement pod is not gated by a stale record.
+			result.Enqueued = true
 		}
-		result.Enqueued = true
-		dt.logger.V(5).Info("Added pending pod deletion", "pod", podKey, "isLastPod", result.IsLastPod, "addresses", drainGated)
 	}
 
 	if triggerSync {

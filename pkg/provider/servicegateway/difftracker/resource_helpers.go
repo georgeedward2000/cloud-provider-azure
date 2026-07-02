@@ -33,13 +33,16 @@ import (
 
 // egressIdentityRegex matches a valid (lowercased) Azure NAT Gateway resource name: it starts with
 // an alphanumeric, contains only alphanumerics, hyphens, underscores and periods, ends with an
-// alphanumeric or underscore, and is 1-80 characters long.
-var egressIdentityRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]{0,78}[a-z0-9_])?$`)
+// alphanumeric or underscore, and is 1-76 characters long. The 76 cap (not Azure's 80) reserves room
+// for the 4-char "-pip" suffix so the derived Public IP name (identity+"-pip") stays within Azure's
+// 80-char publicIPAddresses limit.
+var egressIdentityRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]{0,74}[a-z0-9_])?$`)
 
 // IsValidEgressIdentity reports whether name is a safe egress identity. The identity is derived from
-// a user-controllable pod label and is used verbatim as the NAT Gateway name and interpolated into
-// its ARM resource ID, so it must be validated to avoid malformed ARM requests (for example a
-// path-traversal value like "../foo") and the resulting endless create retries.
+// a user-controllable pod label and is used verbatim as the NAT Gateway name and as the stem of the
+// Public IP name (identity+"-pip"), and is interpolated into their ARM resource IDs, so it must be
+// validated to avoid malformed ARM requests (for example a path-traversal value like "../foo") or a
+// PIP name that overflows Azure's 80-char limit, either of which causes endless create retries.
 func IsValidEgressIdentity(name string) bool {
 	return egressIdentityRegex.MatchString(name)
 }

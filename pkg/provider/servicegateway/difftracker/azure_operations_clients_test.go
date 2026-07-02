@@ -400,3 +400,34 @@ func TestConvertLocationDTOsToAddressLocations(t *testing.T) {
 		assert.Equal(t, "fd00::a", *locs[0].AddressLocation)
 	})
 }
+
+// TestBuildNRPState_FailsOnPublicIPListError verifies that a transient Public IP List failure fails
+// init rather than being swallowed. The PIP enumeration is the only source for backfilling a
+// crashed-mid-provisioning Service's ingress IP (recoverServiceExternalIPs runs once at init) and for
+// orphan PIP cleanup, so silently continuing with an empty list would permanently drop those
+// recoveries until the next restart. Failing lets the CCM retry init when Azure is healthy again.
+func TestBuildNRPState_FailsOnPublicIPListError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockFactory := mock_azclient.NewMockClientFactory(ctrl)
+	mockSGW := mock_servicegatewayclient.NewMockInterface(ctrl)
+	mockLB := mock_loadbalancerclient.NewMockInterface(ctrl)
+	mockNAT := mock_natgatewayclient.NewMockInterface(ctrl)
+	mockPIP := mock_publicipaddressclient.NewMockInterface(ctrl)
+
+	mockFactory.EXPECT().GetServiceGatewayClient().Return(mockSGW).AnyTimes()
+	mockFactory.EXPECT().GetLoadBalancerClient().Return(mockLB).AnyTimes()
+	mockFactory.EXPECT().GetNatGatewayClient().Return(mockNAT).AnyTimes()
+	mockFactory.EXPECT().GetPublicIPAddressClient().Return(mockPIP).AnyTimes()
+
+	// The four upstream fetches succeed with empty state; only the Public IP List fails.
+	mockSGW.EXPECT().GetServices(gomock.Any(), "rg", "sgw").Return(nil, nil)
+	mockSGW.EXPECT().GetAddressLocations(gomock.Any(), "rg", "sgw").Return(nil, nil)
+	mockLB.EXPECT().List(gomock.Any(), "rg").Return(nil, nil)
+	mockNAT.EXPECT().List(gomock.Any(), "rg").Return(nil, nil)
+	mockPIP.EXPECT().List(gomock.Any(), "rg").Return(nil, errors.New("transient ARM list failure"))
+
+	_, _, _, _, _, err := buildNRPState(context.Background(), testConfig(), mockFactory)
+	assert.Error(t, err, "a Public IP List failure must fail init so recovery is retried, not silently skipped")
+}

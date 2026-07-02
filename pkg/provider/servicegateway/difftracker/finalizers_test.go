@@ -562,7 +562,8 @@ func TestAddPodFinalizer(t *testing.T) {
 		}
 
 		err := dt.AddPodFinalizer(ctx, intended)
-		assert.NoError(t, err)
+		assert.ErrorIs(t, err, ErrPodGoneOrReplaced,
+			"a same-name replacement (UID mismatch) must be signalled so the caller skips registering the stale pod")
 
 		got, err := kubeClient.CoreV1().Pods("default").Get(ctx, "test-pod", metav1.GetOptions{})
 		assert.NoError(t, err)

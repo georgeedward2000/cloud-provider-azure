@@ -692,7 +692,7 @@ func TestIsValidEgressIdentity(t *testing.T) {
 		"my_egress.gw-1",
 		"a",
 		"e0",
-		strings.Repeat("a", 80), // max length
+		strings.Repeat("a", 76), // max length (reserves 4 chars for the "-pip" suffix)
 	}
 	for _, n := range valid {
 		assert.True(t, IsValidEgressIdentity(n), "expected %q to be a valid egress identity", n)
@@ -708,11 +708,17 @@ func TestIsValidEgressIdentity(t *testing.T) {
 		"trailing-hyphen-",      // must end with an alphanumeric or underscore
 		"has space",             // whitespace
 		"UPPER",                 // callers lowercase first; raw uppercase is rejected
+		strings.Repeat("a", 77), // exceeds 76: derived PIP name would overflow Azure's 80-char limit
 		strings.Repeat("a", 81), // too long
 	}
 	for _, n := range invalid {
 		assert.False(t, IsValidEgressIdentity(n), "expected %q to be an invalid egress identity", n)
 	}
+
+	// A max-length egress identity must yield a Public IP name within Azure's 80-char limit.
+	_, pipName := buildOutboundResourceNames(strings.Repeat("a", 76))
+	assert.LessOrEqual(t, len(pipName), 80,
+		"PIP name derived from a max-length egress identity must fit Azure's 80-char publicIPAddresses limit")
 }
 
 func TestExtractInboundConfigFromService_DropsAffinityAndIdleTimeout(t *testing.T) {

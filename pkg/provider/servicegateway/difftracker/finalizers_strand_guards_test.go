@@ -173,9 +173,7 @@ func TestGuardOrphanCleanup_PIPOnlyServiceScheduledForDeletion(t *testing.T) {
 	uid := "11111111-1111-1111-1111-111111111111" // must be a valid service UUID
 	dt := newTestDiffTracker()
 
-	scheduleOrphanedResourceDeletions(dt, utilsets.NewString(), utilsets.NewString(), map[string]string{
-		uid + "-pip": "52.0.0.10",
-	})
+	scheduleOrphanedResourceDeletions(dt, utilsets.NewString(), utilsets.NewString(), utilsets.NewString(uid+"-pip"))
 
 	op, ok := dt.pendingServiceOps[uid]
 	if !assert.True(t, ok, "a PIP-only orphan must be scheduled for deletion, not ignored") {
@@ -199,11 +197,11 @@ func TestGuardOrphanCleanup_PIPNotScheduledWhenDesiredOrHasLB(t *testing.T) {
 	dt.K8sResources.Services.Insert(uidDesired)       // desired in K8s -> reconcileServices owns it
 	dt.NRPResources.LoadBalancers.Insert(uidHasNRPLB) // registered LB -> not orphaned
 
-	scheduleOrphanedResourceDeletions(dt, utilsets.NewString(uidHasLB), utilsets.NewString(), map[string]string{
-		uidDesired + "-pip":  "52.0.0.1",
-		uidHasLB + "-pip":    "52.0.0.2", // its LB is the orphan; the LB path deletes the PIP
-		uidHasNRPLB + "-pip": "52.0.0.3",
-	})
+	scheduleOrphanedResourceDeletions(dt, utilsets.NewString(uidHasLB), utilsets.NewString(), utilsets.NewString(
+		uidDesired+"-pip",
+		uidHasLB+"-pip", // its LB is the orphan; the LB path deletes the PIP
+		uidHasNRPLB+"-pip",
+	))
 
 	_, desiredScheduled := dt.pendingServiceOps[uidDesired]
 	assert.False(t, desiredScheduled, "a PIP whose service is desired in K8s must not be scheduled for deletion")

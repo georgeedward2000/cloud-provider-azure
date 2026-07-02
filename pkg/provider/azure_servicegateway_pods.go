@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"maps"
 	"math/big"
@@ -253,7 +254,7 @@ func (az *Cloud) podInformerAddPod(pod *v1.Pod) {
 		klog.Warningf("podInformerAddPod: pod %s/%s has an invalid egress gateway label %q; skipping egress registration",
 			pod.Namespace, pod.Name, egressName)
 		az.Event(pod, v1.EventTypeWarning, "ServiceGatewayInvalidEgressLabel",
-			fmt.Sprintf("Invalid egress gateway label %q: must be a valid Azure resource name (alphanumerics, '-', '_', '.'; start alphanumeric; 1-80 chars)", egressName))
+			fmt.Sprintf("Invalid egress gateway label %q: must be a valid Azure resource name (alphanumerics, '-', '_', '.'; start alphanumeric; 1-76 chars)", egressName))
 		return
 	}
 	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
@@ -265,6 +266,13 @@ func (az *Cloud) podInformerAddPod(pod *v1.Pod) {
 	// (returning would kill its egress) but without the cleanup finalizer, losing NRP-drain
 	// protection on a later delete; surface that via a metric + Event.
 	if err := az.diffTracker.AddPodFinalizer(context.Background(), pod); err != nil {
+		if errors.Is(err, difftracker.ErrPodGoneOrReplaced) {
+			// The named pod is gone or already replaced by a same-name pod with a different UID.
+			// Registering this stale event pod's address would add an unprotected NRP mapping (no
+			// finalizer to drain it); the live replacement registers itself via its own Add event.
+			klog.V(4).Infof("podInformerAddPod: pod %s gone or replaced; skipping stale egress registration", podKey)
+			return
+		}
 		klog.Warningf("podInformerAddPod: registering egress pod %s WITHOUT cleanup finalizer after retries: %v", podKey, err)
 		difftracker.RecordPodFinalizerAddFailed()
 		az.Event(pod, v1.EventTypeWarning, "ServiceGatewayFinalizerAddFailed",

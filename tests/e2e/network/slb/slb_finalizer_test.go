@@ -648,4 +648,108 @@ var _ = Describe("Container Load Balancer Finalizer Tests", Label(slbTestLabel, 
 		utils.Logf("  - Non-last pods: deleted instantly (finalizer removed quickly)")
 		utils.Logf("  - Last pod: blocked by finalizer until Azure NAT Gateway cleanup")
 	})
+
+	// Test 3: Drain-gate survives the multi-event terminating sequence.
+	// A terminating pod is delivered to the informer several times (deletionTimestamp set,
+	// then terminating status updates). Only the first event drains the address; the later
+	// events must not strip the pod finalizer while the NRP drain is still pending. Uses a
+	// single (last) pod and a non-zero grace period to widen the multi-event window, then
+	// asserts the finalizer is held continuously until Azure NAT Gateway cleanup.
+	It("should retain egress pod finalizer across the multi-event terminating window until Azure cleanup", func() {
+		const (
+			targetPort    = 8080
+			provisionTime = 90 * time.Second
+			gracePeriod   = int64(30)
+		)
+
+		egressName := ns.Name
+		ctx := context.Background()
+		podName := "egress-draingate-pod"
+
+		By(fmt.Sprintf("Creating a single egress pod '%s' with label '%s=%s'", podName, egressLabel, egressName))
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      podName,
+				Namespace: ns.Name,
+				Labels:    map[string]string{egressLabel: egressName},
+			},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name:            "test-app",
+						Image:           utils.AgnhostImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Args:            []string{"netexec", fmt.Sprintf("--http-port=%d", targetPort)},
+					},
+				},
+			},
+		}
+		_, err := cs.CoreV1().Pods(ns.Name).Create(ctx, pod, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Waiting for the pod to be ready")
+		Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
+
+		By("Waiting for Azure NAT Gateway provisioning and pod registration")
+		Eventually(func() error {
+			return egressRegisteredErr(egressName, 1)
+		}, provisionTime, 10*time.Second).Should(Succeed(),
+			"egress service should be reconciled with NAT Gateway and the registered pod")
+
+		By("Resolving the NAT Gateway for the egress service")
+		sgResponse, err := queryServiceGatewayServices()
+		Expect(err).NotTo(HaveOccurred())
+		var natGatewayID string
+		for _, svc := range sgResponse.Value {
+			if svc.Name == egressName && svc.Properties.ServiceType == "Outbound" {
+				natGatewayID = svc.Properties.PublicNatGatewayID
+				break
+			}
+		}
+		Expect(natGatewayID).NotTo(BeEmpty(), "NAT Gateway ID should not be empty")
+		Expect(verifyNATGatewayAndPIPExist(natGatewayID)).To(Succeed(), "Azure NAT Gateway and PIP should exist")
+
+		By("Verifying the pod carries the ServiceGateway pod finalizer")
+		got, err := cs.CoreV1().Pods(ns.Name).Get(ctx, podName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hasFinalizer(got.Finalizers, serviceGatewayPodFinalizer)).To(BeTrue(),
+			"Pod %s should have ServiceGateway pod finalizer before deletion", podName)
+
+		By("Deleting the last egress pod with a non-zero grace period")
+		gp := gracePeriod
+		err = cs.CoreV1().Pods(ns.Name).Delete(ctx, podName, metav1.DeleteOptions{GracePeriodSeconds: &gp})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Asserting the finalizer is never transiently stripped while the NRP drain is pending")
+		// While the pod still exists with a deletionTimestamp, the drain-gate finalizer must
+		// stay present on every observation; a single premature removal (the W2-1 defect) would
+		// let the pod and its egress IP be reclaimed while NRP still maps the address.
+		Consistently(func() bool {
+			p, getErr := cs.CoreV1().Pods(ns.Name).Get(ctx, podName, metav1.GetOptions{})
+			if apierrors.IsNotFound(getErr) {
+				return true // fully drained and removed; acceptable terminal state
+			}
+			Expect(getErr).NotTo(HaveOccurred())
+			if p.DeletionTimestamp == nil {
+				return true
+			}
+			return hasFinalizer(p.Finalizers, serviceGatewayPodFinalizer)
+		}, 20*time.Second, 1*time.Second).Should(BeTrue(),
+			"pod finalizer must be held continuously while terminating until NRP drain completes")
+
+		By("Waiting for the pod to be fully deleted after Azure NAT Gateway cleanup")
+		Eventually(func() bool {
+			_, getErr := cs.CoreV1().Pods(ns.Name).Get(ctx, podName, metav1.GetOptions{})
+			return apierrors.IsNotFound(getErr)
+		}, 3*time.Minute, 5*time.Second).Should(BeTrue(),
+			"pod %s should be deleted after Azure cleanup", podName)
+
+		By("Verifying the NAT Gateway and PIP are cleaned up")
+		Eventually(func() error {
+			return verifyNATGatewayAndPIPDeleted(natGatewayID)
+		}, 2*time.Minute, 10*time.Second).Should(Succeed(),
+			"Azure NAT Gateway and PIP should be deleted once the egress pod drains")
+
+		utils.Logf("✓ Test completed: drain-gate finalizer retained across the multi-event terminating window")
+	})
 })
