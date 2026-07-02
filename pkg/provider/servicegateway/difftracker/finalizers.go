@@ -52,13 +52,12 @@ const (
 
 // PendingPodDeletion tracks a pod waiting for its location to be synced to NRP before finalizer removal
 type PendingPodDeletion struct {
-	Namespace  string // Pod namespace
-	Name       string // Pod name
-	UID        string // Pod UID; guards against stripping a same-name replacement pod's finalizer
-	ServiceUID string // Egress service this pod belongs to
-	Address    string // PodIP
-	Location   string // HostIP (NodeIP)
-	IsLastPod  bool   // True if this was the last pod for the service (finalizer removed after NAT GW deletion)
+	Namespace  string   // Pod namespace
+	Name       string   // Pod name
+	UID        string   // Pod UID; guards against stripping a same-name replacement pod's finalizer
+	ServiceUID string   // Egress service this pod belongs to
+	Addresses  []string // PodIPs; a dual-stack pod contributes one address per IP family
+	IsLastPod  bool     // True if this was the last pod for the service (finalizer removed after NAT GW deletion)
 	Timestamp  string
 }
 
@@ -228,19 +227,15 @@ func (dt *DiffTracker) getPodByNamespaceName(ctx context.Context, namespace, nam
 	return pod, nil
 }
 
-// AddPodFinalizer adds the ServiceGateway pod cleanup finalizer to the pod.
-// This is called from pod informer before registering the pod with the engine.
-// It prevents Kubernetes from deleting the pod until location is synced to NRP.
-// It runs during the pod's IP-assignment status burst, so it gets a fresh copy and retries with
-// exponential backoff to survive the resulting 409/transient conflicts (mirroring the other
-// finalizer mutators); a missing pod is treated as success.
+// AddPodFinalizer adds the ServiceGateway pod cleanup finalizer, gating pod deletion until the
+// address is synced out of NRP. It always GETs a fresh copy (retrying with backoff on conflicts;
+// a missing pod is success) rather than trusting the informer-cache finalizer list, so it re-adds a
+// concurrently-stripped finalizer. It is UID-guarded so a same-name replacement pod is never given
+// the finalizer (removePodFinalizer would then refuse to strip it, stranding the replacement).
 func (dt *DiffTracker) AddPodFinalizer(ctx context.Context, pod *v1.Pod) error {
-	if hasPodFinalizer(pod) {
-		return nil
-	}
-
 	namespace := pod.Namespace
 	name := pod.Name
+	intendedUID := string(pod.UID)
 	var lastErr error
 
 	retryErr := wait.ExponentialBackoff(finalizerRetryBackoff, func() (bool, error) {
@@ -254,6 +249,14 @@ func (dt *DiffTracker) AddPodFinalizer(ctx context.Context, pod *v1.Pod) error {
 			lastErr = err
 			dt.logger.V(4).Info("Transient error getting pod, will retry", "namespace", namespace, "name", name, "err", err)
 			return false, nil // Retry
+		}
+
+		// The named pod is now a different instance (the original target was deleted and a same-name
+		// pod recreated). Do NOT add this finalizer to the replacement: removePodFinalizer is
+		// UID-guarded and would refuse to strip it, stranding the replacement in Terminating.
+		if intendedUID != "" && string(currentPod.UID) != intendedUID {
+			dt.logger.V(4).Info("Pod UID changed (replacement pod); not adding finalizer", "namespace", namespace, "name", name, "wantUID", intendedUID, "gotUID", string(currentPod.UID))
+			return true, nil
 		}
 
 		// Check if already has finalizer (may have been added by a concurrent operation)
@@ -381,16 +384,17 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) (readyRemov
 			continue
 		}
 
-		// For non-last pods, check if the address has been removed from NRP
-		// This means the location sync is complete
-		addressInNRP := dt.isAddressInNRPLocked(pending.ServiceUID, pending.Location, pending.Address)
-		if addressInNRP {
-			dt.logger.V(4).Info("Address still in NRP for pod, waiting", "address", pending.Address, "pod", podKey)
+		// For non-last pods, remove the finalizer only once ALL of the pod's addresses have drained
+		// from NRP. A dual-stack pod registers one address per IP family under the same location, so
+		// stripping the finalizer while any address is still mapped would let the pod (and that IP) be
+		// reclaimed while NRP still routes it.
+		if addr, waiting := dt.podAddressStillInNRPLocked(pending); waiting {
+			dt.logger.V(4).Info("Address still in NRP for pod, waiting", "address", addr, "pod", podKey)
 			continue
 		}
 
-		// Address is no longer in NRP, collect for finalizer removal
-		dt.logger.V(5).Info("Address removed from NRP, will remove finalizer from pod", "address", pending.Address, "pod", podKey)
+		// All addresses are no longer in NRP, collect for finalizer removal
+		dt.logger.V(5).Info("All addresses removed from NRP, will remove finalizer from pod", "addresses", pending.Addresses, "pod", podKey)
 
 		toProcess = append(toProcess, pendingPodToProcess{
 			Key:       podKey,
@@ -467,24 +471,39 @@ func (dt *DiffTracker) CheckPendingPodDeletions(ctx context.Context) (readyRemov
 	return len(toProcess) > len(processed)
 }
 
-// isAddressInNRPLocked checks if a specific address exists in NRP for a service/location
-// Must be called with dt.mu held
-func (dt *DiffTracker) isAddressInNRPLocked(serviceUID, location, address string) bool {
-	nrpLocation, exists := dt.NRPResources.Locations[location]
-	if !exists {
-		return false
+// podAddressStillInNRPLocked reports whether any of a pending pod's addresses is still in NRP for its
+// service, searching every location (a dual-stack pod's families live under per-family node
+// locations). The caller keeps the finalizer until every address has left NRP. Requires dt.mu held.
+func (dt *DiffTracker) podAddressStillInNRPLocked(pending *PendingPodDeletion) (string, bool) {
+	for _, address := range pending.Addresses {
+		if dt.outboundAddressInAnyNRPLocationLocked(pending.ServiceUID, address) {
+			return address, true
+		}
 	}
+	return "", false
+}
 
-	nrpAddress, exists := nrpLocation.Addresses[address]
-	if !exists {
-		return false
+// outboundAddressInAnyNRPLocationLocked reports whether the given address is registered in NRP for
+// the service under any node location. Must be called with dt.mu held.
+func (dt *DiffTracker) outboundAddressInAnyNRPLocationLocked(serviceUID, address string) bool {
+	for _, nrpLocation := range dt.NRPResources.Locations {
+		nrpAddress, ok := nrpLocation.Addresses[address]
+		if !ok {
+			continue
+		}
+		if nrpAddress.Services != nil && nrpAddress.Services.Has(serviceUID) {
+			return true
+		}
 	}
+	return false
+}
 
-	// Check if this service still has this address registered
-	if nrpAddress.Services == nil {
-		return false
+// appendAddressIfAbsent returns addresses with addr appended, unless it is already present.
+func appendAddressIfAbsent(addresses []string, addr string) []string {
+	if slices.Contains(addresses, addr) {
+		return addresses
 	}
-	return nrpAddress.Services.Has(serviceUID)
+	return append(addresses, addr)
 }
 
 // ================================================================================================

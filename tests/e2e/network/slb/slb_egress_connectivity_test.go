@@ -156,6 +156,84 @@ var _ = Describe("SLB - Egress SNAT Connectivity", Label(slbTestLabel), func() {
 
 		utils.Logf("\n✓ Egress NAT gateway contract verified: NAT gateway %s with public IP(s) %v, %d egress pod IP(s) registered", natGatewayID, natGatewayPIPs, registered)
 	})
+
+	It("provisions a dual-stack egress pod under a NAT gateway with family-pure locations and observes SNAT per family", func() {
+		const (
+			egressName = "snat-egress-ds"
+			podName    = "egress-snat-ds-pod"
+			targetPort = 8080
+			waitTime   = 2 * time.Minute
+		)
+
+		By("Creating a dual-stack egress pod")
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: ns.Name, Labels: map[string]string{egressLabel: egressName}},
+			Spec: v1.PodSpec{Containers: []v1.Container{{
+				Name:            "test-app",
+				Image:           utils.AgnhostImage,
+				ImagePullPolicy: v1.PullIfNotPresent,
+				Args:            []string{"netexec", fmt.Sprintf("--http-port=%d", targetPort)},
+			}}},
+		}
+		_, err := cs.CoreV1().Pods(ns.Name).Create(context.TODO(), pod, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
+
+		ready, err := cs.CoreV1().Pods(ns.Name).Get(context.TODO(), podName, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		if len(ready.Status.PodIPs) < 2 {
+			Skip(fmt.Sprintf("cluster does not assign dual-stack pod IPs (PodIPs=%v)", ready.Status.PodIPs))
+		}
+		ips := make([]string, 0, len(ready.Status.PodIPs))
+		for _, p := range ready.Status.PodIPs {
+			ips = append(ips, p.IP)
+		}
+
+		By("Waiting for both families to register, then asserting family-pure address locations")
+		eventuallyEgressRegistered(egressName, len(ips), waitTime)
+		assertAddressLocationFamilyPurity()
+
+		By("Resolving the NAT gateway and its public IP(s)")
+		natGatewayID := ""
+		sgResponse, err := queryServiceGatewayServices()
+		Expect(err).NotTo(HaveOccurred())
+		for _, svc := range sgResponse.Value {
+			if svc.Properties.ServiceType == "Outbound" && svc.Name == egressName {
+				natGatewayID = svc.Properties.PublicNatGatewayID
+				break
+			}
+		}
+		Expect(natGatewayID).NotTo(BeEmpty(), "the dual-stack outbound service should have a NAT gateway ID")
+		natGatewayPIPs, err := getNatGatewayPublicIPs(natGatewayID)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(natGatewayPIPs).NotTo(BeEmpty(), "the NAT gateway should expose at least one public IP")
+		pipSet := map[string]bool{}
+		for _, ip := range natGatewayPIPs {
+			pipSet[ip] = true
+		}
+
+		// Per-family dataplane observation only. The standalone test cluster routes pod egress through
+		// the node's default outbound, not the SGW NAT gateway, so the observed source is not the NAT
+		// gateway public IP here; this step therefore never fails the spec. On a traffic-carrying
+		// dual-stack cluster it surfaces the real per-family SNAT source for inspection.
+		observe := func(family, curlArg, endpoint string) {
+			out, _ := utils.RunKubectl(ns.Name, "exec", podName, "--",
+				"/bin/sh", "-c", fmt.Sprintf("curl -s -m 10 %s %s || true", curlArg, endpoint))
+			switch observed := ipv4Regexp.FindString(out); {
+			case observed == "":
+				utils.Logf("  %s egress produced no IPv4 source (expected for the IPv6 probe, or where the dataplane does not route SGW egress)", family)
+			case pipSet[observed]:
+				utils.Logf("  ✓ %s egress SNAT observed as NAT gateway public IP %s", family, observed)
+			default:
+				utils.Logf("  %s egress observed as %s (not a NAT gateway public IP %v); SGW dataplane SNAT is not active in this environment", family, observed, natGatewayPIPs)
+			}
+		}
+		By("Observing per-family egress SNAT (informational)")
+		observe("IPv4", "-4", "ifconfig.me/ip")
+		observe("IPv6", "-6", "ifconfig.co/ip")
+
+		utils.Logf("\n✓ Dual-stack egress contract verified: families %v under family-pure locations; NAT gateway %s public IP(s) %v", ips, natGatewayID, natGatewayPIPs)
+	})
 })
 
 // getNatGatewayPublicIPs resolves the public IP address strings attached to the given NAT

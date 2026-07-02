@@ -22,7 +22,6 @@ import (
 
 // Public engine methods should remain race-safe under concurrent load.
 func TestGuardConcurrency_PublicMethodStorm(t *testing.T) {
-	t.Skip("pending: concurrent logging reads opState fields after unlock and triggers race detector")
 	dt := newTestDiffTracker()
 
 	const (
@@ -76,7 +75,7 @@ func TestGuardConcurrency_PublicMethodStorm(t *testing.T) {
 		euid := fmt.Sprintf("egress-%d", u%uids)
 		addr := fmt.Sprintf("10.244.0.%d", (u%250)+1)
 		loc := fmt.Sprintf("10.0.0.%d", (u%200)+1)
-		dt.DeletePod(euid, loc, addr, "ns", fmt.Sprintf("p-%d", u), "")
+		dt.DeletePod(euid, loc, []string{addr}, "ns", fmt.Sprintf("p-%d", u), "")
 	})
 	launch(func(u int) {
 		uid := fmt.Sprintf("svc-%d", u%uids)
@@ -163,7 +162,7 @@ func TestGuardConcurrency_AddPodDeletePod_RefCountSymmetry(t *testing.T) {
 			<-start2
 			loc := fmt.Sprintf("10.0.0.%d", (idx%50)+1)
 			addr := fmt.Sprintf("10.244.0.%d", (idx%200)+1)
-			dt.DeletePod(euid, loc, addr, "ns", fmt.Sprintf("p-%d", idx), "")
+			dt.DeletePod(euid, loc, []string{addr}, "ns", fmt.Sprintf("p-%d", idx), "")
 		}(i)
 	}
 	close(start2)

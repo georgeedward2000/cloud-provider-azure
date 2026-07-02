@@ -25,18 +25,28 @@ import (
 func newProviderDiffTracker(t *testing.T, az *Cloud, kubeClient kubernetes.Interface) *difftracker.DiffTracker {
 	t.Helper()
 
+	return seededProviderDiffTracker(t, az, kubeClient, difftracker.K8sState{
+		Services: utilsets.NewString(),
+		Egresses: utilsets.NewString(),
+		Nodes:    make(map[string]difftracker.Node),
+	}, difftracker.NRPState{
+		LoadBalancers: utilsets.NewString(),
+		NATGateways:   utilsets.NewString(),
+		Locations:     make(map[string]difftracker.NRPLocation),
+	})
+}
+
+// seededProviderDiffTracker builds a real engine pre-seeded with the given K8s and NRP state, so a
+// test can start from live egress pods (New seeds the outbound ref-counter from k8s.Nodes) rather
+// than driving the full create lifecycle. Used to exercise the informer's delete/drain paths against
+// an engine that already tracks the pods.
+func seededProviderDiffTracker(t *testing.T, az *Cloud, kubeClient kubernetes.Interface, k8s difftracker.K8sState, nrp difftracker.NRPState) *difftracker.DiffTracker {
+	t.Helper()
+
 	dt, err := difftracker.New(
 		log.Noop(),
-		difftracker.K8sState{
-			Services: utilsets.NewString(),
-			Egresses: utilsets.NewString(),
-			Nodes:    make(map[string]difftracker.Node),
-		},
-		difftracker.NRPState{
-			LoadBalancers: utilsets.NewString(),
-			NATGateways:   utilsets.NewString(),
-			Locations:     make(map[string]difftracker.NRPLocation),
-		},
+		k8s,
+		nrp,
 		difftracker.Config{
 			SubscriptionID:             az.SubscriptionID,
 			ResourceGroup:              az.ResourceGroup,

@@ -497,9 +497,18 @@ func convertServiceDTOsToServiceRequests(services []ServiceDTO, config Config) (
 
 func convertLocationDTOsToAddressLocations(locations []LocationDTO) []*armnetwork.ServiceGatewayAddressLocation {
 	armLocations := make([]*armnetwork.ServiceGatewayAddressLocation, 0, len(locations))
+	// Key by canonical IP and drop duplicates: NRP rejects a request that lists the same location
+	// twice (DuplicateLocationsInRequest), which can otherwise arise from mixed IPv6 representations.
+	seen := make(map[string]struct{}, len(locations))
 	for _, loc := range locations {
+		key := canonicalIP(loc.Location)
+		if _, dup := seen[key]; dup {
+			log.Background().WithName("difftracker").V(4).Info("Skipped duplicate address location", "location", loc.Location)
+			continue
+		}
+		seen[key] = struct{}{}
 		armLoc := &armnetwork.ServiceGatewayAddressLocation{
-			AddressLocation: ptr.To(loc.Location),
+			AddressLocation: ptr.To(key),
 		}
 
 		// Set address update action. Mirror the service/location action converters by

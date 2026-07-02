@@ -387,4 +387,16 @@ func TestConvertLocationDTOsToAddressLocations(t *testing.T) {
 		assert.NotNil(t, locs[0].AddressUpdateAction)
 		assert.Equal(t, armnetwork.AddressUpdateActionPartialUpdate, *locs[0].AddressUpdateAction)
 	})
+
+	t.Run("dedupes locations that differ only by IPv6 representation", func(t *testing.T) {
+		// NRP rejects a request listing the same location twice (DuplicateLocationsInRequest).
+		// An expanded/uppercase form and the compressed/lowercase form of one IPv6 node must
+		// collapse to a single, canonical location.
+		locs := convertLocationDTOsToAddressLocations([]LocationDTO{
+			{Location: "FD00:0:0:0:0:0:0:A", AddressUpdateAction: PartialUpdate, Addresses: []AddressDTO{}},
+			{Location: "fd00::a", AddressUpdateAction: PartialUpdate, Addresses: []AddressDTO{}},
+		})
+		assert.Len(t, locs, 1)
+		assert.Equal(t, "fd00::a", *locs[0].AddressLocation)
+	})
 }

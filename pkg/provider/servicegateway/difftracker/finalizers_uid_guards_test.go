@@ -60,8 +60,7 @@ func TestGuardPendingPodDeletion_DoesNotStripReplacementPodFinalizer(t *testing.
 		Name:       "foo",
 		UID:        "uid-OLD",
 		ServiceUID: euid,
-		Address:    "10.244.0.7",
-		Location:   "10.0.0.1",
+		Addresses:  []string{"10.244.0.7"},
 		IsLastPod:  false,
 	}
 
@@ -89,8 +88,7 @@ func TestGuardLastPodFinalizer_DoesNotStripReplacementPod(t *testing.T) {
 		Name:       "foo",
 		UID:        "uid-OLD",
 		ServiceUID: euid,
-		Address:    "10.244.0.7",
-		Location:   "10.0.0.1",
+		Addresses:  []string{"10.244.0.7"},
 		IsLastPod:  true,
 	}
 
@@ -116,8 +114,7 @@ func TestGuardFinalizers_PositiveStripRemovesFinalizer(t *testing.T) {
 		Name:       "foo",
 		UID:        "uid-LIVE",
 		ServiceUID: euid,
-		Address:    "10.244.0.7",
-		Location:   "10.0.0.1",
+		Addresses:  []string{"10.244.0.7"},
 		IsLastPod:  true,
 	}
 

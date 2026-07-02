@@ -196,10 +196,10 @@ func TestEgressRefCountSoundness(t *testing.T) {
 		}
 		dt.AddPod(uid, "ns/pod-a", "10.0.0.1", "10.244.0.5")
 
-		first := dt.DeletePod(uid, "10.0.0.1", "10.244.0.5", "ns", "pod-a", "")
+		first := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "")
 		assert.True(t, first.IsLastPod, "first delete of the sole pod must report IsLastPod=true")
 
-		second := dt.DeletePod(uid, "10.0.0.1", "10.244.0.5", "ns", "pod-a", "")
+		second := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "")
 		assert.False(t, second.IsLastPod, "duplicate delete must be a no-op")
 
 		if v, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(uid)); ok {
@@ -217,10 +217,10 @@ func TestEgressRefCountSoundness(t *testing.T) {
 		dt.AddPod(uid, "ns/p", "10.0.0.1", "10.244.0.1")
 		dt.AddPod(uid, "ns/q", "10.0.0.1", "10.244.0.2")
 
-		notLast := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "p", "")
+		notLast := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.1"}, "ns", "p", "")
 		assert.False(t, notLast.IsLastPod, "first delete of two pods must not be last-pod")
 
-		last := dt.DeletePod(uid, "10.0.0.1", "10.244.0.2", "ns", "q", "")
+		last := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.2"}, "ns", "q", "")
 		assert.True(t, last.IsLastPod, "deleting the final pod must report IsLastPod=true")
 
 		_, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(uid))

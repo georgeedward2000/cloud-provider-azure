@@ -66,8 +66,7 @@ func TestGuardCheckPendingPodDeletions_TransientGetErrorKeepsEntryForRetry(t *te
 		Namespace:  "ns",
 		Name:       "p",
 		ServiceUID: "egress-1",
-		Address:    "10.244.0.1",
-		Location:   "10.0.0.1",
+		Addresses:  []string{"10.244.0.1"},
 		IsLastPod:  false,
 		Timestamp:  time.Now().Format(time.RFC3339),
 	}
@@ -79,14 +78,13 @@ func TestGuardCheckPendingPodDeletions_TransientGetErrorKeepsEntryForRetry(t *te
 		"a transient (non-NotFound) GET error must not drop the pending pod deletion, else the pod is stranded Terminating")
 }
 
-// TestGuardDeletePod_PodDeletedWhileBuffered_FinalizerNotStranded verifies that when an egress pod is
-// deleted while it is still buffered for an in-flight service creation, DeletePod returns early via
-// cancelBufferedPodLocked BEFORE recording a pendingPodDeletions entry. Since the finalizer-handling
-// refactor removed the inline non-last finalizer removal in podInformerRemovePod, nothing removes the
-// pod's ServiceGatewayPodCleanupFinalizer, so it is stranded (pod stuck Terminating forever).
-func TestGuardDeletePod_PodDeletedWhileBuffered_FinalizerNotStranded(t *testing.T) {
-	t.Skip("pending: a pod deleted while buffered returns early in cancelBufferedPodLocked before the pendingPodDeletions insert, so with the inline removal gone its finalizer is stranded; DeletePod must still schedule finalizer removal for a buffered pod")
-
+// TestGuardDeletePod_PodDeletedWhileBuffered_EnqueuesNoRecord verifies the contract for a pod deleted
+// while still buffered for an in-flight service creation: the pod never reached live state or NRP, so
+// DeletePod cancels the buffered add and enqueues NO drain-gated record (Enqueued=false,
+// IsLastPod=false). There is nothing to drain, so the caller (podInformerRemovePod) removes the
+// finalizer directly - see TestPodInformerRemovePod_UntrackedPodFinalizerRemovedDirectly. Enqueuing a
+// record here would strand the pod Terminating forever, because no NRP address will ever release it.
+func TestGuardDeletePod_PodDeletedWhileBuffered_EnqueuesNoRecord(t *testing.T) {
 	dt := newTestDiffTracker()
 	const svc, ns, name, location, address = "egress-buffered", "default", "pod-buf", "10.0.0.1", "10.244.0.7"
 
@@ -103,12 +101,14 @@ func TestGuardDeletePod_PodDeletedWhileBuffered_FinalizerNotStranded(t *testing.
 		Timestamp: time.Now().Format(time.RFC3339),
 	}}
 
-	dt.DeletePod(svc, location, address, ns, name, "")
+	res := dt.DeletePod(svc, location, []string{address}, ns, name, "")
 
-	// The buffered pod's finalizer removal must still be scheduled (tracked), not stranded.
+	assert.False(t, res.Enqueued,
+		"a buffered pod has nothing in NRP to drain, so DeletePod must not enqueue a drain-gated record; the provider removes the finalizer directly instead")
+	assert.False(t, res.IsLastPod)
 	_, tracked := dt.pendingPodDeletions[ns+"/"+name]
-	assert.True(t, tracked,
-		"a pod deleted while buffered must still have its finalizer removal scheduled, else it is stranded Terminating")
+	assert.False(t, tracked,
+		"a buffered pod must not be drain-gated, else its finalizer is stranded (no NRP address will ever release it)")
 }
 
 // TestGuardLocationsUpdaterReschedulesOnReadyFinalizerRemovalFailure verifies that when a ready
@@ -140,8 +140,7 @@ func TestGuardLocationsUpdaterReschedulesOnReadyFinalizerRemovalFailure(t *testi
 		Namespace:  "ns",
 		Name:       "p",
 		ServiceUID: "egress-1",
-		Address:    "10.244.0.1",
-		Location:   "10.0.0.1",
+		Addresses:  []string{"10.244.0.1"},
 		IsLastPod:  false,
 		Timestamp:  time.Now().Format(time.RFC3339),
 	}

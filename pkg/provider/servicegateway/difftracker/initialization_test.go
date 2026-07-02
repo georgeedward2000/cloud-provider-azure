@@ -482,7 +482,7 @@ func TestInitOutboundRefCount_NotNegativeOnServiceUIDEgressLabelCollision(t *tes
 		"the outbound ref-count must equal the egress pod count (1)")
 
 	// A correct (non-negative) counter must allow DeletePod to complete.
-	res := dt.DeletePod(collideID, nodeIP, podIP, "default", "pod-collide", "")
+	res := dt.DeletePod(collideID, nodeIP, []string{podIP}, "default", "pod-collide", "")
 	assert.True(t, res.IsLastPod,
 		"with exactly one live egress pod the ref-count must be 1 (last pod)")
 	assert.False(t, podIPTracked(&dt.K8sResources, podIP),
@@ -573,6 +573,39 @@ func TestRecoverStuckFinalizers_RemovesFinalizerWhenNoAzureResource(t *testing.T
 	assert.NoError(t, err)
 	assert.False(t, hasServiceGatewayFinalizer(got),
 		"finalizer with no Azure resource must be removed since there is nothing to clean up")
+}
+
+// TestRecoverStuckFinalizers_SeedsAllDualStackAddresses verifies that a Terminating dual-stack egress
+// pod recovered at cold start is seeded with EVERY IP family, so its drain-gated finalizer is held
+// until both families leave NRP (a single-address seed would release the finalizer while the secondary
+// family is still mapped).
+func TestRecoverStuckFinalizers_SeedsAllDualStackAddresses(t *testing.T) {
+	delTime := metav1.Now()
+	const v4, v6, hostIP = "10.244.9.1", "fd00::9", "10.0.0.60"
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "ds-terminating",
+			Namespace:         "default",
+			UID:               types.UID("uid-ds-term"),
+			DeletionTimestamp: &delTime,
+			Finalizers:        []string{ServiceGatewayPodCleanupFinalizer},
+			Labels:            map[string]string{consts.PodLabelServiceEgressGateway: "corp-egress"},
+		},
+		Status: v1.PodStatus{HostIP: hostIP, PodIP: v4, PodIPs: []v1.PodIP{{IP: v4}, {IP: v6}}},
+	}
+	kube := fake.NewSimpleClientset(pod)
+	dt := newTestDiffTracker()
+	dt.kubeClient = kube
+
+	egressPods := &v1.PodList{Items: []v1.Pod{*pod}}
+	recoverStuckFinalizers(context.Background(), dt, nil, egressPods, nil, utilsets.NewString(), utilsets.NewString(), nil)
+
+	entry := dt.pendingPodDeletions["default/ds-terminating"]
+	if assert.NotNil(t, entry, "a Terminating dual-stack egress pod must be seeded for drain-gated finalizer removal") {
+		assert.ElementsMatch(t, []string{v4, v6}, entry.Addresses,
+			"recovery must seed every IP family so the finalizer waits for both to drain")
+		assert.Equal(t, "corp-egress", entry.ServiceUID)
+	}
 }
 
 // TestCheckInitializationComplete_ParkedOpDoesNotBlockCompletion verifies that
@@ -668,7 +701,7 @@ func TestEgressRefCount_Robust(t *testing.T) {
 
 	// Removing the last pod must report IsLastPod=true and drop the counter entry to 0
 	// (the sync.Map key is removed on counter==1 by decrementOutboundRefCount).
-	res := dt.DeletePod(uid, node, podIP, "ns", "pod-a", "")
+	res := dt.DeletePod(uid, node, []string{podIP}, "ns", "pod-a", "")
 	assert.True(t, res.IsLastPod, "removing the only pod must report IsLastPod=true exactly once")
 	_, stillExists := dt.outboundIdentityPodRefCount.Load(strings.ToLower(uid))
 	assert.False(t, stillExists,
@@ -686,7 +719,7 @@ func TestEgressRefCount_Robust(t *testing.T) {
 	// A stale duplicate DeletePod must be a no-op (the pod is no longer in live state) and
 	// must not drive the counter negative. We can also call AddPod again as the same pod
 	// (synthesizing a same-name replacement) and re-delete it without a negative counter.
-	dup := dt.DeletePod(uid, node, podIP, "ns", "pod-a", "")
+	dup := dt.DeletePod(uid, node, []string{podIP}, "ns", "pod-a", "")
 	assert.False(t, dup.IsLastPod, "stale duplicate DeletePod must be a no-op (IsLastPod=false)")
 	if v, ok := dt.outboundIdentityPodRefCount.Load(strings.ToLower(uid)); ok {
 		if cnt, _ := v.(int); cnt < 0 {
@@ -749,6 +782,91 @@ func TestProcessK8sEgresses_SkipsMalformedIPs(t *testing.T) {
 	assert.True(t, podIPTracked(&k8s, goodPodIP), "an egress pod with valid IPs must be imported")
 	assert.False(t, podIPTracked(&k8s, "10.244.6.3"), "an egress pod with a malformed HostIP must be skipped")
 	assert.False(t, podIPTracked(&k8s, "not-an-ip"), "an egress pod with a malformed PodIP must be skipped")
+}
+
+// TestProcessK8sEgresses_ImportsAllDualStackAddresses verifies the cold-start seeder registers every
+// IP family of a dual-stack egress pod (Status.PodIPs), so the secondary family's egress is restored
+// after a CCM restart instead of being silently dropped.
+func TestProcessK8sEgresses_ImportsAllDualStackAddresses(t *testing.T) {
+	const (
+		egressVal = "corp-egress"
+		nodeName  = "node-1"
+		hostIP    = "10.0.0.50"
+		v6Host    = "fd00::50"
+		v4        = "10.244.7.1"
+		v6        = "fd00::7"
+	)
+
+	pod := newEgressPod("pod-dualstack", "default", egressVal, nodeName, v4, hostIP, v1.PodRunning)
+	pod.Status.PodIPs = []v1.PodIP{{IP: v4}, {IP: v6}}
+	pod.Status.HostIPs = []v1.HostIP{{IP: hostIP}, {IP: v6Host}}
+
+	k8s := newK8sStateForSeeders()
+	kube := fake.NewSimpleClientset(pod)
+
+	_, err := processK8sEgresses(context.Background(), kube, &k8s)
+	assert.NoError(t, err)
+
+	assert.True(t, podIPTracked(&k8s, v4), "the primary (IPv4) egress address must be imported")
+	assert.True(t, podIPTracked(&k8s, v6), "the secondary (IPv6) egress address must be imported")
+	// The IPv6 address must be filed under the IPv6 node location, never under the IPv4 HostIP.
+	assert.NotContains(t, k8s.Nodes[hostIP].Pods, v6, "the IPv6 address must not be filed under the IPv4 node location")
+	assert.Contains(t, k8s.Nodes[v6Host].Pods, v6, "the IPv6 address must be filed under the IPv6 node location")
+}
+
+// TestPodEgressAddresses verifies the egress address extractor prefers Status.PodIPs (all IP
+// families) and falls back to the single Status.PodIP, skipping empty entries.
+func TestPodEgressAddresses(t *testing.T) {
+	tests := []struct {
+		name string
+		pod  *v1.Pod
+		want []string
+	}{
+		{
+			name: "dual-stack uses every PodIPs entry",
+			pod:  &v1.Pod{Status: v1.PodStatus{PodIP: "10.0.0.1", PodIPs: []v1.PodIP{{IP: "10.0.0.1"}, {IP: "fd00::1"}}}},
+			want: []string{"10.0.0.1", "fd00::1"},
+		},
+		{
+			name: "single-stack uses the sole PodIPs entry",
+			pod:  &v1.Pod{Status: v1.PodStatus{PodIP: "10.0.0.1", PodIPs: []v1.PodIP{{IP: "10.0.0.1"}}}},
+			want: []string{"10.0.0.1"},
+		},
+		{
+			name: "falls back to PodIP when PodIPs is empty",
+			pod:  &v1.Pod{Status: v1.PodStatus{PodIP: "10.0.0.1"}},
+			want: []string{"10.0.0.1"},
+		},
+		{
+			name: "no addresses when both are empty",
+			pod:  &v1.Pod{Status: v1.PodStatus{}},
+			want: nil,
+		},
+		{
+			name: "canonicalizes IPv6 representation (uppercase/expanded to lowercase/compressed)",
+			pod:  &v1.Pod{Status: v1.PodStatus{PodIPs: []v1.PodIP{{IP: "10.0.0.1"}, {IP: "FD00:0:0:0:0:0:0:1"}}}},
+			want: []string{"10.0.0.1", "fd00::1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, PodEgressAddresses(tt.pod))
+		})
+	}
+}
+
+// TestPodNodeLocationsByFamily_CanonicalizesRepresentation verifies node locations are keyed by the
+// canonical IP form, so NRP's uppercase/expanded IPv6 and the pod's lowercase/compressed form are a
+// single key (avoiding a duplicate location across a CCM restart).
+func TestPodNodeLocationsByFamily_CanonicalizesRepresentation(t *testing.T) {
+	pod := &v1.Pod{Status: v1.PodStatus{
+		HostIP:  "10.0.0.1",
+		HostIPs: []v1.HostIP{{IP: "10.0.0.1"}, {IP: "FD61:4620:4C96:C887:0:0:0:4"}},
+	}}
+	got := PodNodeLocationsByFamily(pod)
+	assert.Equal(t, "10.0.0.1", got[false])
+	assert.Equal(t, "fd61:4620:4c96:c887::4", got[true], "the IPv6 node location must be canonical")
 }
 
 // TestProcessK8sEndpoints_SkipsMalformedAddresses verifies the cold-start seeder rejects malformed

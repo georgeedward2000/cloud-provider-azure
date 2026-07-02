@@ -50,8 +50,7 @@ func TestRemoveLastPodFinalizers_SurfacesRetryExhaustion(t *testing.T) {
 		Namespace:  "default",
 		Name:       "stuck",
 		ServiceUID: euid,
-		Address:    "10.244.0.1",
-		Location:   "10.0.0.1",
+		Addresses:  []string{"10.244.0.1"},
 		IsLastPod:  true,
 	}
 
@@ -73,8 +72,7 @@ func TestCheckInitializationComplete_WaitsForPendingPodDeletions(t *testing.T) {
 		Namespace:  "default",
 		Name:       "foo",
 		ServiceUID: "egress",
-		Address:    "10.244.0.1",
-		Location:   "10.0.0.1",
+		Addresses:  []string{"10.244.0.1"},
 		IsLastPod:  false,
 	}
 

@@ -52,11 +52,11 @@ func TestGuardLifecycle_StaleDeletePodIsNoOp(t *testing.T) {
 
 	dt.AddPod(uid, "ns/pod-a", "10.0.0.1", "10.244.0.5")
 
-	first := dt.DeletePod(uid, "10.0.0.1", "10.244.0.5", "ns", "pod-a", "")
+	first := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "")
 	if !first.IsLastPod {
 		t.Fatalf("delete of the only pod should report IsLastPod=true, got false")
 	}
-	second := dt.DeletePod(uid, "10.0.0.1", "10.244.0.5", "ns", "pod-a", "")
+	second := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "")
 	if second.IsLastPod {
 		t.Fatalf("duplicate delete must be a no-op (IsLastPod=false), got true")
 	}

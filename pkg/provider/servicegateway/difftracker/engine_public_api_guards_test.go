@@ -298,11 +298,11 @@ func TestGuardAddPod_ExistingNRPNATGatewayAddsImmediately(t *testing.T) {
 // TestGuardDeletePod_InvalidParamsIsNoOp verifies the validation rule.
 func TestGuardDeletePod_InvalidParamsIsNoOp(t *testing.T) {
 	dt := newTestDiffTracker()
-	res := dt.DeletePod("", "loc", "addr", "ns", "p", "")
+	res := dt.DeletePod("", "loc", []string{"addr"}, "ns", "p", "")
 	assert.False(t, res.IsLastPod)
-	res = dt.DeletePod("uid", "", "addr", "ns", "p", "")
+	res = dt.DeletePod("uid", "", []string{"addr"}, "ns", "p", "")
 	assert.False(t, res.IsLastPod)
-	res = dt.DeletePod("uid", "loc", "", "ns", "p", "")
+	res = dt.DeletePod("uid", "loc", []string{""}, "ns", "p", "")
 	assert.False(t, res.IsLastPod)
 }
 
@@ -323,14 +323,13 @@ func TestGuardDeletePod_NonLastEnqueuesPendingPodDeletion(t *testing.T) {
 	dt.AddPod(uid, "ns/a", "10.0.0.1", "10.244.0.1")
 	dt.AddPod(uid, "ns/b", "10.0.0.1", "10.244.0.2")
 
-	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "a", "")
+	res := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.1"}, "ns", "a", "")
 	assert.False(t, res.IsLastPod)
 	assert.True(t, res.Enqueued, "a tracked non-last delete must report Enqueued so the caller defers to drain-gated removal")
 	ppd, ok := dt.pendingPodDeletions["ns/a"]
 	if assert.True(t, ok, "non-last DeletePod must enqueue a drain-gated PendingPodDeletion") {
 		assert.False(t, ppd.IsLastPod, "non-last entry must have IsLastPod=false")
-		assert.Equal(t, "10.244.0.1", ppd.Address)
-		assert.Equal(t, "10.0.0.1", ppd.Location)
+		assert.Equal(t, []string{"10.244.0.1"}, ppd.Addresses)
 	}
 }
 
@@ -349,14 +348,46 @@ func TestGuardDeletePod_LastPodWithNamespaceNameTracksLastPodEntry(t *testing.T)
 	}
 	dt.AddPod(uid, "ns/only", "10.0.0.1", "10.244.0.7")
 
-	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.7", "ns", "only", "")
+	res := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.7"}, "ns", "only", "")
 	assert.True(t, res.IsLastPod, "removing the sole pod must be the last-pod case")
 	entry, ok := dt.pendingPodDeletions["ns/only"]
 	if assert.True(t, ok, "last pod with ns/name must enqueue PendingPodDeletion") {
 		assert.True(t, entry.IsLastPod)
 		assert.Equal(t, uid, entry.ServiceUID)
-		assert.Equal(t, "10.244.0.7", entry.Address)
-		assert.Equal(t, "10.0.0.1", entry.Location)
+		assert.Equal(t, []string{"10.244.0.7"}, entry.Addresses)
+	}
+}
+
+// TestGuardDeletePod_MixedDualStackInputAggregatesOnlyLiveAddresses verifies the atomic multi-address
+// delete when the caller passes a mix of live, duplicate, and stale addresses (as can happen from an
+// informer resync or an at-least-once event). Only the two genuinely live addresses (one per family)
+// are drained and recorded; a duplicate is deduplicated and a never-registered address is a no-op.
+// The single record must carry exactly the deduplicated live set and IsLastPod must reflect that the
+// whole dual-stack pod was the service's last pod.
+func TestGuardDeletePod_MixedDualStackInputAggregatesOnlyLiveAddresses(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "egress-mixed"
+	const location, v4, v6, stale = "10.0.0.1", "10.244.0.1", "fd00::1", "10.244.9.9"
+	dt.NRPResources.NATGateways.Insert(uid)
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     NewOutboundServiceConfig(uid, nil),
+		State:      StateCreated,
+	}
+	// One dual-stack pod: one address per family under the same location.
+	dt.AddPod(uid, "ns/ds", location, v4)
+	dt.AddPod(uid, "ns/ds", location, v6)
+
+	// Delete input mixes both live addresses, a duplicate of one, and a never-registered address.
+	res := dt.DeletePod(uid, location, []string{v4, v6, v6, stale}, "ns", "ds", "")
+
+	assert.True(t, res.IsLastPod, "draining both live addresses of the only pod is the last-pod case")
+	assert.True(t, res.Enqueued, "a live drain must enqueue exactly one drain-gated record")
+	entry, ok := dt.pendingPodDeletions["ns/ds"]
+	if assert.True(t, ok, "the dual-stack pod must enqueue a single record covering its live addresses") {
+		assert.ElementsMatch(t, []string{v4, v6}, entry.Addresses,
+			"the record must carry the deduplicated live address set (no duplicate, no stale address)")
+		assert.True(t, entry.IsLastPod)
 	}
 }
 

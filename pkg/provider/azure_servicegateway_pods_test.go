@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -19,6 +20,7 @@ import (
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
+	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
 // mockDiffTracker tracks calls to AddPod and DeletePod for testing
@@ -37,7 +39,7 @@ type addPodCall struct {
 type deletePodCall struct {
 	serviceUID string
 	location   string
-	address    string
+	addresses  []string
 	namespace  string
 	name       string
 	uid        string
@@ -52,11 +54,11 @@ func (m *mockDiffTracker) AddPod(serviceUID, podKey, location, address string) {
 	})
 }
 
-func (m *mockDiffTracker) DeletePod(serviceUID, location, address, namespace, name, uid string) difftracker.DeletePodResult {
+func (m *mockDiffTracker) DeletePod(serviceUID, location string, addresses []string, namespace, name, uid string) difftracker.DeletePodResult {
 	m.deletePodCalls = append(m.deletePodCalls, deletePodCall{
 		serviceUID: serviceUID,
 		location:   location,
-		address:    address,
+		addresses:  addresses,
 		namespace:  namespace,
 		name:       name,
 		uid:        uid,
@@ -94,6 +96,19 @@ func newTestPod(namespace, name, egressLabel, hostIP, podIP string, phase v1.Pod
 		pod.DeletionTimestamp = deletionTimestamp
 	}
 
+	return pod
+}
+
+// withPodIPs sets a pod's Status.PodIPs (and keeps Status.PodIP aligned with PodIPs[0], per the
+// Kubernetes API), so tests can exercise dual-stack egress pods.
+func withPodIPs(pod *v1.Pod, ips ...string) *v1.Pod {
+	pod.Status.PodIPs = nil
+	for _, ip := range ips {
+		pod.Status.PodIPs = append(pod.Status.PodIPs, v1.PodIP{IP: ip})
+	}
+	if len(ips) > 0 {
+		pod.Status.PodIP = ips[0]
+	}
 	return pod
 }
 
@@ -229,6 +244,56 @@ func TestPodInformerAddPod(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPodInformerDualStackRegistersEveryFamily verifies the egress informer registers each IP family
+// of a dual-stack pod under its SAME-FAMILY node location - the IPv6 PodIP under the node's IPv6 IP
+// (Status.HostIPs), NOT under the (IPv4) HostIP. NRP rejects a location that mixes families
+// (IPv4LocationCannotContainIPv6Addresses), so filing the IPv6 address under the IPv4 node location
+// makes the whole registration fail. It runs against a real engine (NAT gateway pre-seeded so the pod
+// registers live rather than buffering) and fails if the add path drops a family or misfiles it.
+func TestPodInformerDualStackRegistersEveryFamily(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const (
+		egress = "egress-a"
+		v4Node = "10.0.0.1"
+		v6Node = "fd00::a"
+		v4Pod  = "10.244.0.1"
+		v6Pod  = "fd00:244::1"
+	)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ds", Namespace: "default", UID: types.UID("uid-ds"),
+			Labels: map[string]string{consts.PodLabelServiceEgressGateway: egress},
+		},
+		Status: v1.PodStatus{
+			HostIP:  v4Node,
+			HostIPs: []v1.HostIP{{IP: v4Node}, {IP: v6Node}},
+			PodIP:   v4Pod,
+			PodIPs:  []v1.PodIP{{IP: v4Pod}, {IP: v6Pod}},
+			Phase:   v1.PodRunning,
+		},
+	}
+
+	kube := fake.NewSimpleClientset(pod)
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = seededProviderDiffTracker(t, az, kube,
+		difftracker.K8sState{Services: utilsets.NewString(), Egresses: utilsets.NewString(egress), Nodes: map[string]difftracker.Node{}},
+		difftracker.NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(egress), Locations: map[string]difftracker.NRPLocation{}})
+
+	az.podInformerAddPod(pod)
+	v4Pods := az.diffTracker.K8sResources.Nodes[v4Node].Pods
+	v6Pods := az.diffTracker.K8sResources.Nodes[v6Node].Pods
+	assert.Contains(t, v4Pods, v4Pod, "the IPv4 PodIP must register under the IPv4 node location")
+	assert.Contains(t, v6Pods, v6Pod, "the IPv6 PodIP must register under the IPv6 node location")
+	assert.NotContains(t, v4Pods, v6Pod, "the IPv6 PodIP must NOT be filed under the IPv4 node location (NRP rejects mixed-family locations)")
+
+	az.podInformerRemovePod(pod)
+	assert.NotContains(t, az.diffTracker.K8sResources.Nodes[v4Node].Pods, v4Pod, "the IPv4 family must drain on remove")
+	assert.NotContains(t, az.diffTracker.K8sResources.Nodes[v6Node].Pods, v6Pod, "the IPv6 family must drain on remove")
 }
 
 // TestPodInformerAddPod_FinalizerAddFailureRegistersAndAlerts verifies that when AddPodFinalizer fails
@@ -413,8 +478,8 @@ func TestPodInformerRemovePod(t *testing.T) {
 				if tt.expectedHostIP != "" && call.location != tt.expectedHostIP {
 					t.Errorf("Expected location (HostIP) %s, got %s", tt.expectedHostIP, call.location)
 				}
-				if tt.expectedPodIP != "" && call.address != tt.expectedPodIP {
-					t.Errorf("Expected address (PodIP) %s, got %s", tt.expectedPodIP, call.address)
+				if tt.expectedPodIP != "" && (len(call.addresses) == 0 || call.addresses[0] != tt.expectedPodIP) {
+					t.Errorf("Expected address (PodIP) %s, got %v", tt.expectedPodIP, call.addresses)
 				}
 			}
 		})
@@ -483,199 +548,390 @@ func TestPodInformerRemovePod_NoIPPodFinalizerRemovedDirectly(t *testing.T) {
 		"a no-IP egress pod's finalizer must be removed directly so it is not stranded")
 }
 
-// TestPodInformerUpdateFunc tests the UpdateFunc logic in the informer
-func TestPodInformerUpdateFunc(t *testing.T) {
+// TestPodInformerDrainForReplace_LiveReRegistrationDoesNotStripFinalizer proves the live
+// re-registration drain enqueues no strippable finalizer record. Two live pods share the service (so
+// removing one is a non-last delete) and the address is absent from NRP, so a pending record would be
+// strippable at once; the contrast sub-test uses podInformerRemovePod to show the record path would
+// strip the finalizer.
+func TestPodInformerDrainForReplace_LiveReRegistrationDoesNotStripFinalizer(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const (
+		egress = "egress-svc"
+		hostIP = "10.0.0.1"
+		addrA  = "10.244.0.1"
+		addrB  = "10.244.0.2"
+	)
+
+	// Two live pods on the same node/egress service so removing pod A is a non-last delete. New()
+	// seeds the outbound ref-counter to 2 from these pods.
+	seedState := func() difftracker.K8sState {
+		return difftracker.K8sState{
+			Services: utilsets.NewString(),
+			Egresses: utilsets.NewString(egress),
+			Nodes: map[string]difftracker.Node{
+				hostIP: {Pods: map[string]difftracker.Pod{
+					addrA: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
+					addrB: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
+				}},
+			},
+		}
+	}
+	// addrA is not registered in NRP (already drained), so a non-last pending record would strip at once.
+	drainedNRP := func() difftracker.NRPState {
+		return difftracker.NRPState{
+			LoadBalancers: utilsets.NewString(),
+			NATGateways:   utilsets.NewString(egress),
+			Locations:     make(map[string]difftracker.NRPLocation),
+		}
+	}
+	podA := func(ip string) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "pod-a",
+				Namespace:  "default",
+				UID:        types.UID("uid-a"),
+				Labels:     map[string]string{consts.PodLabelServiceEgressGateway: egress},
+				Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+			},
+			Status: v1.PodStatus{HostIP: hostIP, PodIP: ip, PodIPs: []v1.PodIP{{IP: ip}}, Phase: v1.PodRunning},
+		}
+	}
+
+	t.Run("drainForReplace leaves the live pod's finalizer intact", func(t *testing.T) {
+		kube := fake.NewSimpleClientset(podA(addrA))
+		az := GetTestCloudWithContainerLoadBalancer(ctrl)
+		az.KubeClient = kube
+		az.diffTracker = seededProviderDiffTracker(t, az, kube, seedState(), drainedNRP())
+
+		// A same-service address change (addrA -> addrC) drains addrA with empty namespace/name, so
+		// no finalizer-deletion record is enqueued for the still-live pod.
+		az.podInformerDrainForReplace(podA(addrA), podA("10.244.0.3"))
+		az.diffTracker.CheckPendingPodDeletions(context.Background())
+
+		got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-a", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Contains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+			"a live re-registration drain must not enqueue a strippable record, so the finalizer must survive")
+	})
+
+	t.Run("contrast: the record-enqueuing removal path would strip it", func(t *testing.T) {
+		kube := fake.NewSimpleClientset(podA(addrA))
+		az := GetTestCloudWithContainerLoadBalancer(ctrl)
+		az.KubeClient = kube
+		az.diffTracker = seededProviderDiffTracker(t, az, kube, seedState(), drainedNRP())
+
+		az.podInformerRemovePod(podA(addrA)) // enqueues a non-last drain-gated record
+		az.diffTracker.CheckPendingPodDeletions(context.Background())
+
+		got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-a", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.NotContains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+			"the record-enqueuing removal drains the address then strips the finalizer once it has left NRP")
+	})
+}
+
+// TestPodInformerDrainForReplace_SoleDualStackGainKeepsSharedAddress guards the delta-drain: a sole
+// egress pod gaining a secondary family ([v4] -> [v4,v6]) must NOT drain the shared v4. Draining the
+// full old set would drop the sole pod's service ref-count to zero, transiently marking the NAT
+// Gateway for deletion - which a concurrent ServiceUpdater could act on and tear down under the
+// still-live pod (egress outage). Only (old - new) is drained, which is empty here.
+func TestPodInformerDrainForReplace_SoleDualStackGainKeepsSharedAddress(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const (
+		egress = "egress-svc"
+		hostIP = "10.0.0.1"
+		v4     = "10.244.0.1"
+		v6     = "fd00::1"
+	)
+
+	// A single live pod carrying only v4: New() seeds the ref-count to 1.
+	k8s := difftracker.K8sState{
+		Services: utilsets.NewString(),
+		Egresses: utilsets.NewString(egress),
+		Nodes: map[string]difftracker.Node{
+			hostIP: {Pods: map[string]difftracker.Pod{
+				v4: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
+			}},
+		},
+	}
+	nrp := difftracker.NRPState{
+		LoadBalancers: utilsets.NewString(),
+		NATGateways:   utilsets.NewString(egress),
+		Locations:     make(map[string]difftracker.NRPLocation),
+	}
+	pod := func(ips ...string) *v1.Pod {
+		podIPs := make([]v1.PodIP, 0, len(ips))
+		for _, ip := range ips {
+			podIPs = append(podIPs, v1.PodIP{IP: ip})
+		}
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "pod-a", Namespace: "default", UID: types.UID("uid-a"),
+				Labels:     map[string]string{consts.PodLabelServiceEgressGateway: egress},
+				Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+			},
+			Status: v1.PodStatus{HostIP: hostIP, PodIP: ips[0], PodIPs: podIPs, Phase: v1.PodRunning},
+		}
+	}
+
+	kube := fake.NewSimpleClientset(pod(v4, v6))
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = seededProviderDiffTracker(t, az, kube, k8s, nrp)
+
+	az.podInformerDrainForReplace(pod(v4), pod(v4, v6))
+
+	// v4 must still be the sole live address: draining it now is the last-pod case. Had the full old
+	// set been drained, v4 would already be gone and this would be a no-op (IsLastPod=false).
+	res := az.diffTracker.DeletePod(egress, hostIP, []string{v4}, "default", "pod-a", "uid-a")
+	assert.True(t, res.IsLastPod,
+		"a dual-stack gain must keep the shared v4 registered, so the sole pod's service is never emptied/torn down mid-replace")
+	assert.True(t, res.Enqueued)
+}
+
+// TestReconcileEgressPodUpdate_LiveReRegistrationKeepsFinalizerAndReAdds drives the real update
+// executor end-to-end on a live engine: a dual-stack pod that gains a secondary family
+// ([v4] -> [v4,v6]) is a live re-registration. The executor must drain the old set without a
+// finalizer record and re-add the full set, leaving the pod finalized and both addresses tracked.
+func TestReconcileEgressPodUpdate_LiveReRegistrationKeepsFinalizerAndReAdds(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const (
+		egress = "egress-svc"
+		hostIP = "10.0.0.1"
+		v6Node = "fd00::a"
+		v4     = "10.244.0.1"
+		v6     = "fd00::1"
+		other  = "10.244.0.9"
+	)
+
+	// One live pod (v4) plus a second pod so the service is not torn down mid-update.
+	k8s := difftracker.K8sState{
+		Services: utilsets.NewString(),
+		Egresses: utilsets.NewString(egress),
+		Nodes: map[string]difftracker.Node{
+			hostIP: {Pods: map[string]difftracker.Pod{
+				v4:    {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
+				other: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
+			}},
+		},
+	}
+	nrp := difftracker.NRPState{
+		LoadBalancers: utilsets.NewString(),
+		NATGateways:   utilsets.NewString(egress),
+		Locations:     make(map[string]difftracker.NRPLocation),
+	}
+
+	pod := func(ips ...string) *v1.Pod {
+		podIPs := make([]v1.PodIP, 0, len(ips))
+		for _, ip := range ips {
+			podIPs = append(podIPs, v1.PodIP{IP: ip})
+		}
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "pod-a",
+				Namespace:  "default",
+				UID:        types.UID("uid-a"),
+				Labels:     map[string]string{consts.PodLabelServiceEgressGateway: egress},
+				Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+			},
+			Status: v1.PodStatus{HostIP: hostIP, HostIPs: []v1.HostIP{{IP: hostIP}, {IP: v6Node}}, PodIP: ips[0], PodIPs: podIPs, Phase: v1.PodRunning},
+		}
+	}
+
+	oldPod, newPod := pod(v4), pod(v4, v6)
+	kube := fake.NewSimpleClientset(newPod)
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = seededProviderDiffTracker(t, az, kube, k8s, nrp)
+
+	az.reconcileEgressPodUpdate(oldPod, newPod)
+	az.diffTracker.CheckPendingPodDeletions(context.Background())
+
+	got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-a", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Contains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+		"a live re-registration must leave the pod finalized")
+	assert.True(t, az.diffTracker.IsServiceTracked(egress), "the egress service must remain tracked")
+
+	// Both IP families must be registered under their SAME-FAMILY node location: the dual-stack gain
+	// added v6 under the node's IPv6 IP and kept the shared v4 under the IPv4 node IP.
+	v4Pods := az.diffTracker.K8sResources.Nodes[hostIP].Pods
+	v6Pods := az.diffTracker.K8sResources.Nodes[v6Node].Pods
+	if assert.Contains(t, v4Pods, v4, "the primary family must remain registered under the IPv4 node location") {
+		assert.Equal(t, egress, v4Pods[v4].PublicOutboundIdentity)
+	}
+	if assert.Contains(t, v6Pods, v6, "the gained secondary family must be registered under the IPv6 node location") {
+		assert.Equal(t, egress, v6Pods[v6].PublicOutboundIdentity)
+	}
+	assert.NotContains(t, v4Pods, v6, "the IPv6 address must not be filed under the IPv4 node location")
+}
+
+// TestEgressPodUpdateActions verifies the pure UPDATE decision function directly: for each pod
+// transition it must report whether the pod has to be removed from its old gateway and/or (re-)added
+// to its current one. Driving egressPodUpdateActions itself (rather than a mock informer) keeps this
+// a genuine guard - the routing that consumes these decisions is covered by the real-Cloud tests
+// (TestPodInformerDrainForReplace_*, TestReconcileEgressPodUpdate_*).
+func TestEgressPodUpdateActions(t *testing.T) {
 	now := metav1.Now()
 
 	tests := []struct {
-		name                string
-		oldPod              *v1.Pod
-		newPod              *v1.Pod
-		expectedAddCalls    int
-		expectedDeleteCalls int
-		description         string
+		name       string
+		oldPod     *v1.Pod
+		newPod     *v1.Pod
+		wantRemove bool
+		wantAdd    bool
 	}{
 		{
-			name:                "Label change from A to B with IPs",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-b", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			expectedAddCalls:    1,
-			expectedDeleteCalls: 1,
-			description:         "Should remove from A and add to B",
+			name:       "Label change from A to B with IPs",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-b", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			wantRemove: true,
+			wantAdd:    true,
 		},
 		{
-			name:                "Pod gets IPs AND label changes (race condition test)",
-			oldPod:              newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
-			newPod:              newTestPod("default", "test", "egress-b", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			expectedAddCalls:    1,
-			expectedDeleteCalls: 0,
-			description:         "Should only add to B (no remove since pod never had IPs in A)",
+			name:    "Pod gets IPs AND label changes (never had IPs in A)",
+			oldPod:  newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
+			newPod:  newTestPod("default", "test", "egress-b", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			wantAdd: true,
 		},
 		{
-			name:                "Pod just gets IPs (no label change)",
-			oldPod:              newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			expectedAddCalls:    1,
-			expectedDeleteCalls: 0,
-			description:         "Should add to A",
+			name:    "Pod just gets IPs (no label change)",
+			oldPod:  newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
+			newPod:  newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			wantAdd: true,
 		},
 		{
-			name:                "IP change (pod moved to different node)",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "10.0.0.2", "10.0.1.2", v1.PodRunning, nil),
-			expectedAddCalls:    1,
-			expectedDeleteCalls: 1,
-			description:         "Should remove old IPs and add new IPs",
+			name:       "IP change (pod moved to different node)",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-a", "10.0.0.2", "10.0.1.2", v1.PodRunning, nil),
+			wantRemove: true,
+			wantAdd:    true,
 		},
 		{
-			name:                "Pod loses IPs (edge case)",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "", "", v1.PodRunning, nil),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 1,
-			description:         "Should remove from A",
+			name:       "Dual-stack secondary IP changes while primary PodIP is unchanged",
+			oldPod:     withPodIPs(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), "10.0.1.1", "fd00::old"),
+			newPod:     withPodIPs(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), "10.0.1.1", "fd00::new"),
+			wantRemove: true,
+			wantAdd:    true,
 		},
 		{
-			name:                "Label removed (pod no longer egress)",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 1,
-			description:         "Should remove from A",
+			name:       "Dual-stack secondary IP added after the primary",
+			oldPod:     withPodIPs(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), "10.0.1.1"),
+			newPod:     withPodIPs(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), "10.0.1.1", "fd00::1"),
+			wantRemove: true,
+			wantAdd:    true,
 		},
 		{
-			name:                "Pod transitions to Failed phase",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 1,
-			description:         "Should remove from A when pod fails",
+			name:       "Dual-stack pod downgraded to single stack (loses its secondary family)",
+			oldPod:     withPodIPs(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), "10.0.1.1", "fd00::1"),
+			newPod:     withPodIPs(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), "10.0.1.1"),
+			wantRemove: true,
+			wantAdd:    true,
 		},
 		{
-			name:                "Pod transitions to Succeeded phase",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodSucceeded, nil),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 1,
-			description:         "Should remove from A when pod succeeds",
+			name:       "Pod loses IPs",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-a", "", "", v1.PodRunning, nil),
+			wantRemove: true,
 		},
 		{
-			name:                "Pod gets DeletionTimestamp",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, &now),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 1,
-			description:         "Should remove from A when pod starts terminating",
+			name:       "Label removed (pod no longer egress)",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			wantRemove: true,
 		},
 		{
-			name:                "Pod gets DeletionTimestamp AND label changes",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-b", "10.0.0.1", "10.0.1.1", v1.PodRunning, &now),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 1,
-			description:         "Should remove from A but not add to B (terminating pod rejected by AddPod)",
+			name:       "Pod transitions to Failed phase",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil),
+			wantRemove: true,
 		},
 		{
-			name:                "No relevant changes (same state)",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 0,
-			description:         "Should do nothing",
+			name:       "Pod transitions to Succeeded phase",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodSucceeded, nil),
+			wantRemove: true,
 		},
 		{
-			name:                "Pod in Pending without IPs stays in Pending without IPs",
-			oldPod:              newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 0,
-			description:         "Should do nothing (waiting for IPs)",
+			name:       "Pod gets DeletionTimestamp",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, &now),
+			wantRemove: true,
 		},
 		{
-			name:                "IP change on terminating pod",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "10.0.0.2", "10.0.1.2", v1.PodRunning, &now),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 1,
-			description:         "Should only remove (terminating pod not re-added)",
+			name:       "Pod gets DeletionTimestamp AND label changes",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-b", "10.0.0.1", "10.0.1.1", v1.PodRunning, &now),
+			wantRemove: true,
 		},
 		{
-			name:                "Pod transitions from Failed to Running (recovery scenario)",
-			oldPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil),
-			newPod:              newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
-			expectedAddCalls:    0,
-			expectedDeleteCalls: 0,
-			description:         "Should do nothing (pod wasn't previously valid, so wasn't tracked). Note: This is an edge case where pod state transitions from invalid to valid - in practice, we rely on initial AddFunc when pod first becomes valid",
+			name:   "No relevant changes (same state)",
+			oldPod: newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod: newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+		},
+		{
+			name:   "Pod in Pending without IPs stays in Pending without IPs",
+			oldPod: newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
+			newPod: newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
+		},
+		{
+			name:       "IP change on terminating pod",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-a", "10.0.0.2", "10.0.1.2", v1.PodRunning, &now),
+			wantRemove: true,
+		},
+		{
+			name:   "Pod transitions from Failed to Running (was not previously tracked)",
+			oldPod: newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil),
+			newPod: newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mock := &mockDiffTracker{}
-			az := &testCloudWithMockDiffTracker{
-				mock: mock,
-			}
-
-			// Simulate UpdateFunc logic
-			// Extract egress gateway names from labels
-			var prevEgressGatewayName, currEgressGatewayName string
-			if tt.oldPod.Labels != nil {
-				prevEgressGatewayName = tt.oldPod.Labels[consts.PodLabelServiceEgressGateway]
-			}
-			if tt.newPod.Labels != nil {
-				currEgressGatewayName = tt.newPod.Labels[consts.PodLabelServiceEgressGateway]
-			}
-
-			// Detect relevant changes
-			labelChanged := prevEgressGatewayName != currEgressGatewayName
-			oldHadIPs := tt.oldPod.Status.HostIP != "" && tt.oldPod.Status.PodIP != ""
-			newHasIPs := tt.newPod.Status.HostIP != "" && tt.newPod.Status.PodIP != ""
-			ipsChanged := tt.oldPod.Status.HostIP != tt.newPod.Status.HostIP || tt.oldPod.Status.PodIP != tt.newPod.Status.PodIP
-
-			oldWasValid := tt.oldPod.DeletionTimestamp == nil &&
-				(tt.oldPod.Status.Phase == v1.PodRunning || tt.oldPod.Status.Phase == v1.PodPending)
-			newIsValid := tt.newPod.DeletionTimestamp == nil &&
-				(tt.newPod.Status.Phase == v1.PodRunning || tt.newPod.Status.Phase == v1.PodPending)
-
-			var needsRemove, needsAdd bool
-
-			if labelChanged {
-				needsRemove = prevEgressGatewayName != "" && oldHadIPs
-				needsAdd = currEgressGatewayName != "" && newHasIPs && newIsValid
-			} else if currEgressGatewayName != "" {
-				if oldWasValid && !newIsValid && oldHadIPs {
-					needsRemove = true
-				} else if !oldHadIPs && newHasIPs && newIsValid {
-					needsAdd = true
-				} else if oldHadIPs && !newHasIPs {
-					needsRemove = true
-				} else if oldHadIPs && newHasIPs && ipsChanged && newIsValid {
-					needsRemove = true
-					needsAdd = true
-				} else if oldHadIPs && newHasIPs && !newIsValid {
-					needsRemove = true
-				}
-			}
-
-			if needsRemove {
-				az.podInformerRemovePod(tt.oldPod)
-			}
-			if needsAdd {
-				az.podInformerAddPod(tt.newPod)
-			}
-
-			if len(mock.addPodCalls) != tt.expectedAddCalls {
-				t.Errorf("%s: Expected %d AddPod calls, got %d", tt.description, tt.expectedAddCalls, len(mock.addPodCalls))
-			}
-
-			if len(mock.deletePodCalls) != tt.expectedDeleteCalls {
-				t.Errorf("%s: Expected %d DeletePod calls, got %d", tt.description, tt.expectedDeleteCalls, len(mock.deletePodCalls))
-			}
+			needsRemove, needsAdd, _ := egressPodUpdateActions(tt.oldPod, tt.newPod)
+			assert.Equal(t, tt.wantRemove, needsRemove, "needsRemove")
+			assert.Equal(t, tt.wantAdd, needsAdd, "needsAdd")
 		})
 	}
 }
 
-// TestPodInformerDeleteFunc tests the DeleteFunc logic including tombstone handling
+// TestEgressPodUpdateActions_NodeLocationChange verifies re-registration is triggered when a
+// secondary-family node IP (Status.HostIPs) changes or appears, even though PodIPs and the primary
+// HostIP are unchanged - otherwise the stale IPv6 location leaks or the IPv6 address never registers.
+func TestEgressPodUpdateActions_NodeLocationChange(t *testing.T) {
+	const v4, v6, v4Node, v6NodeOld, v6NodeNew = "10.244.0.1", "fd00::1", "10.0.0.1", "fd00::a", "fd00::b"
+	dsPod := func(hostV6 string) *v1.Pod {
+		hostIPs := []v1.HostIP{{IP: v4Node}}
+		if hostV6 != "" {
+			hostIPs = append(hostIPs, v1.HostIP{IP: hostV6})
+		}
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "p", Namespace: "default",
+				Labels: map[string]string{consts.PodLabelServiceEgressGateway: "egress-a"},
+			},
+			Status: v1.PodStatus{HostIP: v4Node, HostIPs: hostIPs, PodIP: v4, PodIPs: []v1.PodIP{{IP: v4}, {IP: v6}}, Phase: v1.PodRunning},
+		}
+	}
+
+	t.Run("secondary-family node IP change re-registers", func(t *testing.T) {
+		needsRemove, needsAdd, _ := egressPodUpdateActions(dsPod(v6NodeOld), dsPod(v6NodeNew))
+		assert.True(t, needsRemove)
+		assert.True(t, needsAdd)
+	})
+	t.Run("secondary-family node IP appearing re-registers", func(t *testing.T) {
+		needsRemove, needsAdd, _ := egressPodUpdateActions(dsPod(""), dsPod(v6NodeNew))
+		assert.True(t, needsRemove)
+		assert.True(t, needsAdd)
+	})
+}
 func TestPodInformerDeleteFunc(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -782,7 +1038,7 @@ func (tc *testCloudWithMockDiffTracker) podInformerAddPod(pod *v1.Pod) {
 	}
 
 	// Validate pod has required IPs
-	if pod.Status.HostIP == "" || pod.Status.PodIP == "" {
+	if pod.Status.HostIP == "" || len(difftracker.PodEgressAddresses(pod)) == 0 {
 		return
 	}
 
@@ -792,8 +1048,10 @@ func (tc *testCloudWithMockDiffTracker) podInformerAddPod(pod *v1.Pod) {
 	}
 	podKey := pod.Namespace + "/" + pod.Name
 
-	// Call mock instead of real diffTracker
-	tc.mock.AddPod(egressName, podKey, pod.Status.HostIP, pod.Status.PodIP)
+	// Call mock instead of real diffTracker, once per pod IP (mirrors the real dual-stack loop)
+	for _, podIP := range difftracker.PodEgressAddresses(pod) {
+		tc.mock.AddPod(egressName, podKey, pod.Status.HostIP, podIP)
+	}
 }
 
 // podInformerRemovePod mimics the real implementation but uses our mock
@@ -804,12 +1062,12 @@ func (tc *testCloudWithMockDiffTracker) podInformerRemovePod(pod *v1.Pod) {
 	}
 
 	// Need IPs to identify which location/address to remove
-	if pod.Status.HostIP == "" || pod.Status.PodIP == "" {
+	if pod.Status.HostIP == "" || len(difftracker.PodEgressAddresses(pod)) == 0 {
 		return
 	}
 
 	egressName := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
 
 	// Call mock instead of real diffTracker
-	tc.mock.DeletePod(egressName, pod.Status.HostIP, pod.Status.PodIP, pod.Namespace, pod.Name, string(pod.UID))
+	tc.mock.DeletePod(egressName, pod.Status.HostIP, difftracker.PodEgressAddresses(pod), pod.Namespace, pod.Name, string(pod.UID))
 }

@@ -426,17 +426,16 @@ func recoverStuckFinalizers(
 				continue
 			}
 
-			// Get addresses - may be empty if pod was already terminating. Use pod.Status.HostIP as
-			// the location, matching the runtime egress path (AddPod/DeletePod) and processK8sEgresses,
-			// so the drain-gated finalizer entry targets the same NRP location runtime uses.
-			podIP := pod.Status.PodIP
+			// Addresses may be empty if the pod was already terminating. The drain-gated entry holds
+			// the finalizer until every address leaves NRP (checked across all node locations).
+			podIPs := PodEgressAddresses(pod)
 			nodeIP := pod.Status.HostIP
 
 			// If we don't have addresses, we can't track for sync through DeletePod
 			// (DeletePod rejects empty location/address). Directly remove finalizer since
 			// there's nothing to sync out of NRP anyway.
-			if podIP == "" || nodeIP == "" {
-				logger.V(4).Info("Removed pod finalizer with missing addresses", "namespace", pod.Namespace, "pod", pod.Name, "podIP", podIP, "nodeIP", nodeIP)
+			if len(podIPs) == 0 || nodeIP == "" {
+				logger.V(4).Info("Removed pod finalizer with missing addresses", "namespace", pod.Namespace, "pod", pod.Name, "podIPs", podIPs, "nodeIP", nodeIP)
 				if err := dt.removePodFinalizer(ctx, pod); err != nil {
 					logger.V(4).Info("Could not remove pod finalizer", "namespace", pod.Namespace, "pod", pod.Name, "err", err)
 				} else {
@@ -445,7 +444,7 @@ func recoverStuckFinalizers(
 				continue
 			}
 
-			logger.V(2).Info("Recovered stuck pod finalizer", "namespace", pod.Namespace, "pod", pod.Name, "egress", egressLabel, "location", nodeIP, "address", podIP)
+			logger.V(2).Info("Recovered stuck pod finalizer", "namespace", pod.Namespace, "pod", pod.Name, "egress", egressLabel, "location", nodeIP, "addresses", podIPs)
 			recordFinalizerRecovered()
 
 			// Collect for batch insertion (Issue 2.4: avoid lock contention)
@@ -459,8 +458,7 @@ func recoverStuckFinalizers(
 				Name:       pod.Name,
 				UID:        string(pod.UID),
 				ServiceUID: egressLabel,
-				Address:    podIP,
-				Location:   nodeIP,
+				Addresses:  podIPs,
 				// IsLastPod=false is INTENTIONAL even if this was actually the last pod.
 				// During initialization, NAT Gateway deletion is handled by the DIFF mechanism:
 				// - processK8sEgresses skips this pod → egress NOT in K8s.Egresses
@@ -638,33 +636,46 @@ func processK8sEgresses(
 		}
 
 		egressVal := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
-		if egressVal == "" || pod.Status.PodIP == "" || pod.Status.HostIP == "" || pod.Spec.NodeName == "" || !IsValidEgressIdentity(egressVal) {
+		if egressVal == "" || len(PodEgressAddresses(&pod)) == 0 || pod.Status.HostIP == "" || pod.Spec.NodeName == "" || !IsValidEgressIdentity(egressVal) {
 			logger.V(5).Info("Skipped invalid egress pod", "namespace", pod.Namespace, "pod", pod.Name, "label", egressVal, "podIP", pod.Status.PodIP, "hostIP", pod.Status.HostIP, "node", pod.Spec.NodeName)
 			continue
 		}
 
-		// Validate the IPs before they enter the address/location payload (matches podInformerAddPod);
-		// a malformed HostIP or PodIP would make NRP reject the whole batch and stall location sync.
+		// Validate HostIP before it becomes the location key (matches podInformerAddPod); a malformed
+		// value would make NRP reject the whole batch and stall location sync.
 		if _, err := netip.ParseAddr(pod.Status.HostIP); err != nil {
 			logger.V(4).Info("Skipped egress pod with malformed HostIP", "namespace", pod.Namespace, "pod", pod.Name, "hostIP", pod.Status.HostIP)
 			continue
 		}
-		if _, err := netip.ParseAddr(pod.Status.PodIP); err != nil {
-			logger.V(4).Info("Skipped egress pod with malformed PodIP", "namespace", pod.Namespace, "pod", pod.Name, "podIP", pod.Status.PodIP)
+
+		// A dual-stack pod contributes one address per IP family (Status.PodIPs); register each so the
+		// secondary family egresses through the NAT Gateway too. Skip individually malformed addresses.
+		var validAddrs []string
+		for _, podIP := range PodEgressAddresses(&pod) {
+			if _, err := netip.ParseAddr(podIP); err != nil {
+				logger.V(4).Info("Skipped egress pod with malformed PodIP", "namespace", pod.Namespace, "pod", pod.Name, "podIP", podIP)
+				continue
+			}
+			validAddrs = append(validAddrs, podIP)
+		}
+		if len(validAddrs) == 0 {
 			continue
 		}
 
 		k8s.Egresses.Insert(egressVal)
 
-		// Use pod.Status.HostIP as the location key, matching the runtime egress path
-		// (podInformerAddPod -> AddPod(egressName, podKey, pod.Status.HostIP, pod.Status.PodIP)).
-		// Keying by a node-list InternalIP instead would diverge from runtime on dual-stack nodes
-		// (where HostIP may be a different family than the node's first InternalIP), orphaning the
-		// egress location across a CCM restart.
-		nodeIP := pod.Status.HostIP
-
-		ensureNodeExists(k8s, nodeIP)
-		addOutboundIdentityToPod(k8s, nodeIP, pod.Status.PodIP, egressVal)
+		// Seed each address under its same-family node location (see PodNodeLocationsByFamily),
+		// matching the runtime path (podInformerAddPod).
+		hostByFamily := PodNodeLocationsByFamily(&pod)
+		for _, podIP := range validAddrs {
+			nodeIP, ok := NodeLocationForAddress(hostByFamily, podIP)
+			if !ok {
+				logger.V(4).Info("Skipped egress pod address with no same-family node IP", "namespace", pod.Namespace, "pod", pod.Name, "podIP", podIP, "hostIPs", pod.Status.HostIPs)
+				continue
+			}
+			ensureNodeExists(k8s, nodeIP)
+			addOutboundIdentityToPod(k8s, nodeIP, podIP, egressVal)
+		}
 	}
 	logger.V(2).Info("Processed Kubernetes egress services", "egresses", k8s.Egresses.Len())
 	return egressPods, nil
@@ -784,7 +795,7 @@ func fetchServiceGatewayLocations(
 		}
 
 		addresses := parseLocationAddresses(location)
-		nrp.Locations[*location.AddressLocation] = NRPLocation{Addresses: addresses}
+		nrp.Locations[canonicalIP(*location.AddressLocation)] = NRPLocation{Addresses: addresses}
 	}
 	logger.V(2).Info("Processed ServiceGateway locations", "locations", len(nrp.Locations))
 	return nil
@@ -1204,6 +1215,75 @@ func addOutboundIdentityToPod(k8s *K8sState, nodeIP, podIP, egressVal string) {
 	k8s.Nodes[nodeIP].Pods[podIP] = pod
 }
 
+// PodEgressAddresses returns a pod's egress IP addresses, preferring Status.PodIPs (which carries
+// every IP family for a dual-stack pod) and falling back to the single Status.PodIP. Empty entries
+// are skipped. Per the Kubernetes API, PodIPs[0] matches PodIP when both are set.
+func PodEgressAddresses(pod *v1.Pod) []string {
+	if len(pod.Status.PodIPs) > 0 {
+		addrs := make([]string, 0, len(pod.Status.PodIPs))
+		for _, podIP := range pod.Status.PodIPs {
+			if podIP.IP != "" {
+				addrs = append(addrs, canonicalIP(podIP.IP))
+			}
+		}
+		if len(addrs) > 0 {
+			return addrs
+		}
+	}
+	if pod.Status.PodIP != "" {
+		return []string{canonicalIP(pod.Status.PodIP)}
+	}
+	return nil
+}
+
+// canonicalIP returns the canonical text form of an IP (netip String: lowercase, zero-compressed for
+// IPv6), or the input unchanged if it does not parse. Locations and addresses are keyed by this so
+// the same IP in different representations (NRP's uppercase IPv6 vs the pod's lowercase) is a single
+// key, avoiding a duplicate location/address across a CCM restart.
+func canonicalIP(s string) string {
+	if addr, err := netip.ParseAddr(s); err == nil {
+		return addr.String()
+	}
+	return s
+}
+
+// PodNodeLocationsByFamily maps each IP family (false=IPv4, true=IPv6) to the node IP of that family
+// from pod.Status.HostIPs. NRP registers a pod address under a node "location" and requires the
+// location to be the SAME family as the address (an IPv4 location cannot hold an IPv6 address), so a
+// dual-stack pod's IPv6 PodIP must be registered under the node's IPv6 IP, not its (IPv4) HostIP.
+// Status.HostIPs carries every family of the node; it falls back to the single Status.HostIP when
+// HostIPs is not yet populated (older kubelets / single-stack). The first entry of a family wins.
+func PodNodeLocationsByFamily(pod *v1.Pod) map[bool]string {
+	byFamily := make(map[bool]string, 2)
+	for _, hostIP := range pod.Status.HostIPs {
+		addr, err := netip.ParseAddr(hostIP.IP)
+		if err != nil {
+			continue
+		}
+		if _, ok := byFamily[addr.Is6()]; !ok {
+			byFamily[addr.Is6()] = addr.String()
+		}
+	}
+	if len(byFamily) == 0 && pod.Status.HostIP != "" {
+		if addr, err := netip.ParseAddr(pod.Status.HostIP); err == nil {
+			byFamily[addr.Is6()] = addr.String()
+		}
+	}
+	return byFamily
+}
+
+// NodeLocationForAddress returns the same-family node location for a pod address from a
+// PodNodeLocationsByFamily map, and whether one exists (an address whose family has no node IP
+// cannot be registered).
+func NodeLocationForAddress(byFamily map[bool]string, address string) (string, bool) {
+	addr, err := netip.ParseAddr(address)
+	if err != nil {
+		return "", false
+	}
+	loc, ok := byFamily[addr.Is6()]
+	return loc, ok
+}
+
 // ================================================================================================
 // NRP state helper functions
 // ================================================================================================
@@ -1276,7 +1356,7 @@ func parseLocationAddresses(location interface{}) map[string]NRPAddress {
 				services.Insert(svcVal.String())
 			}
 		}
-		addresses[address] = NRPAddress{Services: services}
+		addresses[canonicalIP(address)] = NRPAddress{Services: services}
 	}
 	return addresses
 }
@@ -1413,45 +1493,6 @@ func extractNewEndpointsFromK8s(serviceUID string, endpointSliceList *discoveryv
 	}
 
 	return newEndpoints
-}
-
-// extractOldPodsFromNRP extracts the current pod state from NRP for a given outbound service
-// Returns map[location:address]struct{} as a set
-func extractOldPodsFromNRP(serviceUID string, nrp NRPState) map[string]struct{} {
-	oldPods := make(map[string]struct{})
-
-	// Iterate through all NRP locations to find addresses with this service's PublicOutboundIdentity
-	for location, nrpLocation := range nrp.Locations {
-		for address, nrpAddress := range nrpLocation.Addresses {
-			if nrpAddress.Services.Has(serviceUID) {
-				// Create composite key for location:address
-				key := location + ":" + address
-				oldPods[key] = struct{}{}
-			}
-		}
-	}
-
-	return oldPods
-}
-
-// extractNewPodsFromK8s extracts pod state from K8s nodes for a given egress service
-// Returns map[location:address]podKey where podKey is used for logging
-func extractNewPodsFromK8s(serviceUID string, k8sNodes map[string]Node) map[string]string {
-	newPods := make(map[string]string)
-
-	// Iterate through all nodes and pods to find pods with this PublicOutboundIdentity
-	for nodeIP, node := range k8sNodes {
-		for podIP, pod := range node.Pods {
-			if strings.ToLower(pod.PublicOutboundIdentity) == serviceUID {
-				// Create composite key for location:address
-				key := nodeIP + ":" + podIP
-				// Store podKey (using podIP as key for now since we don't have full pod metadata)
-				newPods[key] = podIP
-			}
-		}
-	}
-
-	return newPods
 }
 
 // enhanceNRPStateWithOrphans adds orphaned Azure resources to NRP state for deletion tracking
@@ -1640,7 +1681,7 @@ func (dt *DiffTracker) reconcileOutboundPods(nrp NRPState, k8sNodes map[string]N
 					serviceUID, location, address)
 				// During initialization, we don't have namespace/name - pass empty strings
 				// This is fine because orphaned NRP entries don't need pod finalizer tracking
-				dt.DeletePod(serviceUID, location, address, "", "", "")
+				dt.DeletePod(serviceUID, location, []string{address}, "", "", "")
 				deleteCount++
 			}
 		}

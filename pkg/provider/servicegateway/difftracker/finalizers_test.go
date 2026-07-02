@@ -502,6 +502,73 @@ func TestAddPodFinalizer(t *testing.T) {
 		err := dt.AddPodFinalizer(ctx, pod)
 		assert.NoError(t, err)
 	})
+
+	t.Run("re-adds finalizer when the live pod lacks it despite the passed object showing it", func(t *testing.T) {
+		// The passed informer-cache object still lists the finalizer, but the live pod has had it
+		// stripped by an interleaved drain-gated removal during an IP-change reconcile. AddPodFinalizer
+		// must decide against a fresh GET and re-add it, otherwise the live pod is left unprotected.
+		staleObj := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "test-pod",
+				Namespace:  "default",
+				UID:        "uid-live",
+				Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
+			},
+		}
+		livePod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-pod",
+				Namespace: "default",
+				UID:       "uid-live",
+			},
+		}
+
+		kubeClient := fake.NewSimpleClientset(livePod)
+		dt := &DiffTracker{
+			kubeClient: kubeClient,
+		}
+
+		err := dt.AddPodFinalizer(ctx, staleObj)
+		assert.NoError(t, err)
+
+		updatedPod, err := kubeClient.CoreV1().Pods("default").Get(ctx, "test-pod", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.True(t, hasPodFinalizer(updatedPod),
+			"finalizer must be re-added against the fresh pod even though the passed object still showed it")
+	})
+
+	t.Run("does not add finalizer to a same-name replacement pod (UID mismatch)", func(t *testing.T) {
+		// The intended pod (uid-original) was deleted and a same-name pod (uid-replacement) recreated
+		// before AddPodFinalizer's GET. Adding the finalizer to the replacement would strand it in
+		// Terminating, because removePodFinalizer is UID-guarded and would refuse to strip it.
+		intended := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-pod",
+				Namespace: "default",
+				UID:       "uid-original",
+			},
+		}
+		replacement := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-pod",
+				Namespace: "default",
+				UID:       "uid-replacement",
+			},
+		}
+
+		kubeClient := fake.NewSimpleClientset(replacement)
+		dt := &DiffTracker{
+			kubeClient: kubeClient,
+		}
+
+		err := dt.AddPodFinalizer(ctx, intended)
+		assert.NoError(t, err)
+
+		got, err := kubeClient.CoreV1().Pods("default").Get(ctx, "test-pod", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.False(t, hasPodFinalizer(got),
+			"a same-name replacement pod (different UID) must not be given the cleanup finalizer")
+	})
 }
 
 func TestRemovePodFinalizer(t *testing.T) {
@@ -560,7 +627,7 @@ func TestCheckPendingPodDeletions_PreservesReplacementPodEntry(t *testing.T) {
 	// Original entry (uid-a); its address is not in NRP, so it is collected for finalizer removal.
 	dt.pendingPodDeletions[key] = &PendingPodDeletion{
 		Namespace: "default", Name: "test-pod", ServiceUID: "egress-1",
-		Address: "10.0.0.1", Location: "192.168.1.1", IsLastPod: false,
+		Addresses: []string{"10.0.0.1"}, IsLastPod: false,
 		UID: "uid-a", Timestamp: time.Now().Format(time.RFC3339),
 	}
 
@@ -572,7 +639,7 @@ func TestCheckPendingPodDeletions_PreservesReplacementPodEntry(t *testing.T) {
 			dt.mu.Lock()
 			dt.pendingPodDeletions[key] = &PendingPodDeletion{
 				Namespace: "default", Name: "test-pod", ServiceUID: "egress-1",
-				Address: "10.0.0.2", Location: "192.168.1.1", IsLastPod: false,
+				Addresses: []string{"10.0.0.2"}, IsLastPod: false,
 				UID: "uid-b", Timestamp: time.Now().Format(time.RFC3339),
 			}
 			dt.mu.Unlock()
@@ -616,8 +683,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 			Namespace:  "default",
 			Name:       "test-pod",
 			ServiceUID: "egress-1",
-			Address:    "10.0.0.1",
-			Location:   "192.168.1.1",
+			Addresses:  []string{"10.0.0.1"},
 			IsLastPod:  false,
 			Timestamp:  time.Now().Format(time.RFC3339),
 		}
@@ -664,8 +730,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 			Namespace:  "default",
 			Name:       "test-pod",
 			ServiceUID: "egress-1",
-			Address:    "10.0.0.1",
-			Location:   "192.168.1.1",
+			Addresses:  []string{"10.0.0.1"},
 			IsLastPod:  false,
 			Timestamp:  time.Now().Format(time.RFC3339),
 		}
@@ -704,8 +769,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 			Namespace:  "default",
 			Name:       "test-pod",
 			ServiceUID: "egress-1",
-			Address:    "10.0.0.1",
-			Location:   "192.168.1.1",
+			Addresses:  []string{"10.0.0.1"},
 			IsLastPod:  true, // Last pod!
 			Timestamp:  time.Now().Format(time.RFC3339),
 		}
@@ -736,8 +800,7 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 			Namespace:  "default",
 			Name:       "missing-pod",
 			ServiceUID: "egress-1",
-			Address:    "10.0.0.1",
-			Location:   "192.168.1.1",
+			Addresses:  []string{"10.0.0.1"},
 			IsLastPod:  false,
 			Timestamp:  time.Now().Format(time.RFC3339),
 		}
@@ -760,6 +823,57 @@ func TestCheckPendingPodDeletions(t *testing.T) {
 
 		// Should not panic
 		dt.CheckPendingPodDeletions(ctx)
+	})
+
+	t.Run("keeps finalizer until every address of a dual-stack pod drains", func(t *testing.T) {
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "test-pod",
+				Namespace:  "default",
+				Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
+			},
+		}
+
+		kubeClient := fake.NewSimpleClientset(pod)
+		dt := &DiffTracker{
+			kubeClient:          kubeClient,
+			pendingPodDeletions: make(map[string]*PendingPodDeletion),
+			NRPResources: NRPState{
+				Locations: map[string]NRPLocation{
+					"192.168.1.1": {
+						Addresses: map[string]NRPAddress{
+							"fd00::1": {Services: utilsets.NewString("egress-1")},
+						},
+					},
+				},
+			},
+		}
+
+		// A dual-stack pod contributes both its IPv4 and IPv6 addresses; only the IPv6 address is
+		// still mapped in NRP.
+		dt.pendingPodDeletions["default/test-pod"] = &PendingPodDeletion{
+			Namespace:  "default",
+			Name:       "test-pod",
+			ServiceUID: "egress-1",
+			Addresses:  []string{"10.0.0.1", "fd00::1"},
+			IsLastPod:  false,
+			Timestamp:  time.Now().Format(time.RFC3339),
+		}
+
+		// The IPv4 address has drained but IPv6 has not: the finalizer must stay.
+		dt.CheckPendingPodDeletions(ctx)
+		stillPod, err := kubeClient.CoreV1().Pods("default").Get(ctx, "test-pod", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.True(t, hasPodFinalizer(stillPod), "finalizer must persist while the IPv6 address is still in NRP")
+		assert.Len(t, dt.pendingPodDeletions, 1)
+
+		// Drain the IPv6 address too; now the finalizer can be removed.
+		delete(dt.NRPResources.Locations["192.168.1.1"].Addresses, "fd00::1")
+		dt.CheckPendingPodDeletions(ctx)
+		updatedPod, err := kubeClient.CoreV1().Pods("default").Get(ctx, "test-pod", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.False(t, hasPodFinalizer(updatedPod), "finalizer must be removed once all addresses have drained")
+		assert.Empty(t, dt.pendingPodDeletions)
 	})
 }
 
@@ -803,7 +917,7 @@ func TestGuardNonLastPodFinalizerRemovedOnlyAfterNRPDrain(t *testing.T) {
 	}
 
 	// Delete the non-last pod "a".
-	res := dt.DeletePod(uid, "10.0.0.1", "10.244.0.1", "ns", "a", "")
+	res := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.1"}, "ns", "a", "")
 	assert.False(t, res.IsLastPod, "deleting one of two pods is not the last-pod case")
 
 	// It must be enqueued for drain-gated finalizer removal, not stripped inline.
@@ -870,8 +984,7 @@ func TestGuardNonLastPodFinalizerRetriesOnTransientUpdateError(t *testing.T) {
 		Namespace:  "ns",
 		Name:       "p",
 		ServiceUID: "egress-1",
-		Address:    "10.244.0.1",
-		Location:   "10.0.0.1",
+		Addresses:  []string{"10.244.0.1"},
 		IsLastPod:  false,
 		Timestamp:  time.Now().Format(time.RFC3339),
 	}
@@ -931,7 +1044,7 @@ func TestGuardAddPodFinalizerRetriesOnConflict(t *testing.T) {
 // isAddressInNRPLocked TESTS
 // ================================================================================================
 
-func TestIsAddressInNRPLocked(t *testing.T) {
+func TestOutboundAddressInAnyNRPLocationLocked(t *testing.T) {
 	tests := []struct {
 		name       string
 		nrpState   NRPState
@@ -1030,7 +1143,7 @@ func TestIsAddressInNRPLocked(t *testing.T) {
 				NRPResources: tt.nrpState,
 			}
 
-			result := dt.isAddressInNRPLocked(tt.serviceUID, tt.location, tt.address)
+			result := dt.outboundAddressInAnyNRPLocationLocked(tt.serviceUID, tt.address)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -1066,8 +1179,7 @@ func TestPendingPodDeletionType(t *testing.T) {
 		Namespace:  "default",
 		Name:       "test-pod",
 		ServiceUID: "egress-service",
-		Address:    "10.0.0.1",
-		Location:   "192.168.1.1",
+		Addresses:  []string{"10.0.0.1"},
 		IsLastPod:  true,
 		Timestamp:  "2026-01-12T10:00:00Z",
 	}
@@ -1075,8 +1187,7 @@ func TestPendingPodDeletionType(t *testing.T) {
 	assert.Equal(t, "default", pending.Namespace)
 	assert.Equal(t, "test-pod", pending.Name)
 	assert.Equal(t, "egress-service", pending.ServiceUID)
-	assert.Equal(t, "10.0.0.1", pending.Address)
-	assert.Equal(t, "192.168.1.1", pending.Location)
+	assert.Equal(t, []string{"10.0.0.1"}, pending.Addresses)
 	assert.True(t, pending.IsLastPod)
 	assert.Equal(t, "2026-01-12T10:00:00Z", pending.Timestamp)
 }
@@ -1109,8 +1220,7 @@ func TestCheckPendingPodDeletions_Concurrent(t *testing.T) {
 		Namespace:  "default",
 		Name:       "test-pod",
 		ServiceUID: "egress-1",
-		Address:    "10.0.0.1",
-		Location:   "192.168.1.1",
+		Addresses:  []string{"10.0.0.1"},
 		IsLastPod:  false,
 		Timestamp:  time.Now().Format(time.RFC3339),
 	}
@@ -1155,8 +1265,7 @@ func TestAddPodPreservesFinalizerOnEgressIdentityChange(t *testing.T) {
 		Name:       "foo",
 		UID:        "uid-live",
 		ServiceUID: oldEgress,
-		Address:    address,
-		Location:   location,
+		Addresses:  []string{address},
 	}
 	dt.NRPResources.NATGateways.Insert(newEgress)
 
