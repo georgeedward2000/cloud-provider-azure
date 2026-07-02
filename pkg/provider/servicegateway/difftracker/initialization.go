@@ -17,7 +17,6 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	utilnet "k8s.io/utils/net"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
@@ -274,28 +273,45 @@ func buildNodeNameToIPsMap(ctx context.Context, kubeClient kubernetes.Interface)
 	return nodeNameToIPsMap, nil
 }
 
+// SelectSameFamilyNodeIP returns the deterministic node location key for a pod address of the given
+// family (wantIPv6) from a node's InternalIPs. It parses and canonicalizes each candidate, skipping
+// malformed entries so a bad node IP never becomes a location key (which would poison the whole NRP
+// batch). When a node exposes more than one InternalIP of the family, it returns the smallest
+// canonical form so init and runtime - and repeated syncs - always agree on ONE location key; a
+// non-deterministic pick (e.g. from an unordered cache list) would otherwise flap the location across
+// reconciles and restarts. ok is false when the node has no valid InternalIP of the requested family.
+func SelectSameFamilyNodeIP(nodeIPs []string, wantIPv6 bool) (string, bool) {
+	best := ""
+	for _, ip := range nodeIPs {
+		addr, err := netip.ParseAddr(ip)
+		if err != nil {
+			continue
+		}
+		if addr.Is6() != wantIPv6 {
+			continue
+		}
+		if canonical := addr.String(); best == "" || canonical < best {
+			best = canonical
+		}
+	}
+	return best, best != ""
+}
+
 // nodeIPForEndpointSlice returns the node InternalIP whose IP family matches the EndpointSlice's
 // AddressType, mirroring the runtime getPodIPToNodeIPMapFromEndpointSlice selection. ok is false
 // for an unsupported AddressType (e.g. FQDN — not a PodIP backend address) or when the node has no
 // internal IP of the required family. This keeps the init-time location key identical to the
 // runtime key so the restart diff is empty for an unchanged dual-stack cluster.
 func nodeIPForEndpointSlice(nodeIPs []string, addressType discoveryv1.AddressType) (string, bool) {
-	var wantIPv6 bool
 	switch addressType {
 	case discoveryv1.AddressTypeIPv4:
-		wantIPv6 = false
+		return SelectSameFamilyNodeIP(nodeIPs, false)
 	case discoveryv1.AddressTypeIPv6:
-		wantIPv6 = true
+		return SelectSameFamilyNodeIP(nodeIPs, true)
 	default:
 		// FQDN or unknown AddressType: not a PodIP backend address, skip.
 		return "", false
 	}
-	for _, ip := range nodeIPs {
-		if utilnet.IsIPv6String(ip) == wantIPv6 {
-			return ip, true
-		}
-	}
-	return "", false
 }
 
 // ================================================================================================
@@ -1170,14 +1186,12 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 	for _, lbName := range orphanedLBs {
 		logger.V(5).Info("Scheduled orphaned load balancer deletion", "loadBalancer", lbName)
 		diffTracker.DeleteService(lbName, true, true) // inbound, isOrphan=true
-		recordOrphanedResourceCleaned()
 	}
 
 	// Schedule orphaned NAT Gateways for deletion
 	for _, natName := range orphanedNATs {
 		logger.V(5).Info("Scheduled orphaned NAT gateway deletion", "natGateway", natName)
 		diffTracker.DeleteService(natName, false, true) // outbound, isOrphan=true
-		recordOrphanedResourceCleaned()
 	}
 
 	// Schedule orphaned PIP-only services for deletion. Use the inbound path: deleteInboundService
@@ -1187,7 +1201,6 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 	for _, uid := range orphanedPIPOnly {
 		logger.V(5).Info("Scheduled orphaned PIP-only service deletion", "service", uid)
 		diffTracker.DeleteService(uid, true, true) // inbound, isOrphan=true
-		recordOrphanedResourceCleaned()
 	}
 
 	logger.V(2).Info("Scheduled orphaned resource deletions", "resources", totalOrphans)

@@ -250,3 +250,30 @@ func TestGuardMetrics_LocationsAndAddressesTotals_ReflectNRPTotalsEveryCycle(t *
 	assert.NoError(t, err)
 	assert.Equal(t, 2.0, gotAddr, "addresses_total must equal the post-sync NRP total, not the diff size")
 }
+
+// TestTrackedServicesMetric_RefreshedOnServiceCompletion verifies the tracked_services gauge is
+// refreshed to match the NRP tracked sets when a service operation completes. The NRP
+// LoadBalancer/NATGateway sets are mutated on async create/delete success, and without a refresh in
+// OnServiceCreationComplete the gauge stays stale (e.g. never decremented after the last delete).
+func TestTrackedServicesMetric_RefreshedOnServiceCompletion(t *testing.T) {
+	RegisterMetrics()
+	dt := newTestDiffTracker()
+	uid := "svc-tracked-refresh"
+
+	dt.NRPResources.LoadBalancers.Insert(uid)
+	updateTrackedServicesMetric(dt) // baseline: gauge reflects one tracked NRP LB
+	v, err := testutil.GetGaugeMetricValue(trackedServices.WithLabelValues("nrp_loadbalancers"))
+	assert.NoError(t, err)
+	assert.Equal(t, float64(1), v)
+
+	// The NRP set shrinks on delete (as UpdateNRPLoadBalancers does) with no explicit metric refresh.
+	dt.NRPResources.LoadBalancers.Delete(uid)
+
+	// A service completion callback must refresh the tracked gauge to match the mutated set.
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	v, err = testutil.GetGaugeMetricValue(trackedServices.WithLabelValues("nrp_loadbalancers"))
+	assert.NoError(t, err)
+	assert.Equal(t, float64(0), v,
+		"tracked_services{nrp_loadbalancers} must be refreshed to match the NRP set after a service completion")
+}

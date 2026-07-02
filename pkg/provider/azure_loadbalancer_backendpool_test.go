@@ -1351,3 +1351,19 @@ func TestPodIPBackendPool_EnsureHostsInPoolIsNoOp(t *testing.T) {
 	// no addresses here.
 	assert.Empty(t, backendPool.Properties.LoadBalancerBackendAddresses)
 }
+
+// TestGetBackendPoolNameForSLBService_EmptyIPFamiliesNoPanic verifies the defensive guard: a Service
+// with no IP families returns an error instead of panicking on IPFamilies[0]. (Admitted Services
+// are always family-defaulted, so this is unreachable in practice - a robustness guard only.)
+func TestGetBackendPoolNameForSLBService_EmptyIPFamiliesNoPanic(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	az := GetTestCloud(ctrl)
+
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "no-family", UID: "uid-no-family"}}
+
+	assert.NotPanics(t, func() {
+		_, err := az.getBackendPoolNameForSLBService(svc)
+		assert.Error(t, err, "an empty IPFamilies must return an error, not index IPFamilies[0]")
+	})
+}

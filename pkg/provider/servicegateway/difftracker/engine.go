@@ -462,6 +462,7 @@ func (dt *DiffTracker) DeleteService(serviceUID string, isInbound bool, isOrphan
 		updatePendingServiceOperationsMetric(dt)
 		updatePendingServiceDeletionsMetric(dt)
 		updatePendingOperationOldestAgeMetric(dt)
+		updateTrackedServicesMetric(dt)
 	}()
 
 	dt.mu.Lock()
@@ -618,6 +619,10 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 	defer func() {
 		updatePendingServiceOperationsMetric(dt)
 		updatePendingOperationOldestAgeMetric(dt)
+		// The NRP LoadBalancer/NATGateway tracked sets are mutated (via UpdateNRPLoadBalancers/
+		// UpdateNRPNATGateways) before this completion callback, so refresh the tracked_services gauge
+		// here too - otherwise it stays stale after an async create/delete until the next Add/Update.
+		updateTrackedServicesMetric(dt)
 	}()
 
 	dt.mu.Lock()
@@ -650,6 +655,19 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		(opState.State == StateDeletionInProgress && opState.InFlightConfig != nil) {
 		dt.logger.V(4).Info("Routed completed in-flight service operation to deletion", "service", serviceUID, "success", success)
 		opState.InFlightConfig = nil
+		// The in-flight create/update just completed (success or err) before being routed to deletion;
+		// record it once so the completion is counted like every other branch (the delete itself is
+		// recorded separately when it completes). Infer the op type from LastAppliedConfig: a service
+		// that was never successfully applied was mid-CREATE, otherwise mid-UPDATE.
+		preemptOp := "create"
+		if opState.LastAppliedConfig != nil {
+			preemptOp = "update"
+		}
+		preemptErrCode := ""
+		if err != nil {
+			_, preemptErrCode = extractAzureErrorInfo(err)
+		}
+		recordServiceOperation(preemptOp, opState.Config.IsInbound, startTime, err, preemptErrCode, opState.IsOrphan)
 		hasLocations := dt.serviceHasLocationsInNRP(serviceUID)
 		if !hasLocations {
 			// Ready for immediate deletion.
@@ -760,6 +778,11 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		if success {
 			dt.logger.V(2).Info("Deleted service", "service", serviceUID)
 			recordServiceOperation("delete", opState.Config.IsInbound, startTime, nil, "", opState.IsOrphan)
+			if opState.IsOrphan {
+				// Count the orphan only once its async deletion actually succeeded (not at schedule
+				// time), so a failed cleanup does not over-report orphaned_resources_cleaned_total.
+				recordOrphanedResourceCleaned()
+			}
 
 			// If pods arrived while the deletion was in flight (buffered by the
 			// StateDeletionInProgress branch of AddPod), or a re-create was requested

@@ -218,11 +218,11 @@ func TestUpdatePendingOperationOldestAgeMetric_IncludesUpdateInProgress(t *testi
 	assert.Greater(t, v, 3000.0, "the update_in_progress oldest-age series must be emitted")
 }
 
-// TestOnServiceCreationComplete_PreEmptDoesNotRecordOperationMetric verifies the pre-empt branch:
+// TestOnServiceCreationComplete_PreEmptRecordsCompletedInFlightOperation verifies the pre-empt branch:
 // when a delete arrived while a create/update was in flight, OnServiceCreationComplete routes the
-// completed in-flight operation to the deletion flow and does not increment the service-operation
-// counter for the pre-empted create/update (the subsequent delete records its own metric).
-func TestOnServiceCreationComplete_PreEmptDoesNotRecordOperationMetric(t *testing.T) {
+// completed in-flight operation to the deletion flow and records that create/update exactly once
+// (the subsequent delete records its own metric when it completes).
+func TestOnServiceCreationComplete_PreEmptRecordsCompletedInFlightOperation(t *testing.T) {
 	RegisterMetrics()
 	serviceOperationTotal.Reset()
 
@@ -249,19 +249,85 @@ func TestOnServiceCreationComplete_PreEmptDoesNotRecordOperationMetric(t *testin
 		assert.Nil(t, op.InFlightConfig, "pre-empt must clear InFlightConfig")
 	}
 
-	// The "create" metric for this service-type+success must NOT have been incremented.
+	// The completed in-flight create is recorded exactly once. LastAppliedConfig was nil, so the
+	// op is a CREATE; err was nil, so the success series is incremented.
 	got, err := testutil.GetCounterMetricValue(
 		serviceOperationTotal.WithLabelValues("create", "inbound", "success", "", "false"),
 	)
 	assert.NoError(t, err)
-	assert.Equal(t, 0.0, got,
-		"the pre-empt path does not record the create operation, so the counter stays 0")
+	assert.Equal(t, 1.0, got,
+		"the pre-empt path records the completed in-flight create once")
 
-	// The error series is also untouched: no metric is recorded on this path at all.
+	// The error series stays 0: a successful completion is not double-counted as an error.
 	gotErr, err := testutil.GetCounterMetricValue(
 		serviceOperationTotal.WithLabelValues("create", "inbound", "error", "", "false"),
 	)
 	assert.NoError(t, err)
 	assert.Equal(t, 0.0, gotErr,
-		"no metric is recorded on the pre-empt path (the error series also stays 0)")
+		"a successful pre-empt completion does not touch the error series")
+}
+
+func TestOnServiceCreationComplete_PreEmptRecordsInFlightUpdate(t *testing.T) {
+	RegisterMetrics()
+	serviceOperationTotal.Reset()
+
+	dt := newTestDiffTracker()
+	uid := "svc-preempt-update-metric"
+	// A service that was already applied once (LastAppliedConfig != nil) had an UPDATE in flight
+	// (InFlightConfig != nil) when a Delete pre-empted it. The completed in-flight op is an UPDATE.
+	cfg := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	applied := cfg
+	inflight := cfg
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID:        uid,
+		Config:            cfg,
+		LastAppliedConfig: &applied,
+		InFlightConfig:    &inflight,
+		State:             StateDeletionPending,
+	}
+	dt.pendingServiceDeletions[uid] = &PendingServiceDeletion{ServiceUID: uid, IsInbound: true}
+
+	// The in-flight update completes successfully; the pre-empt branch fires.
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	got, err := testutil.GetCounterMetricValue(
+		serviceOperationTotal.WithLabelValues("update", "inbound", "success", "", "false"),
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, got,
+		"the pre-empt path records the completed in-flight update once, on the update series")
+
+	// The create series is untouched: LastAppliedConfig != nil means the op is classified as update.
+	gotCreate, err := testutil.GetCounterMetricValue(
+		serviceOperationTotal.WithLabelValues("create", "inbound", "success", "", "false"),
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, 0.0, gotCreate,
+		"an already-applied service's pre-empted op is an update, not a create")
+}
+
+func TestOnServiceCreationComplete_OrphanDeleteSuccessCountsOrphanCleanup(t *testing.T) {
+	RegisterMetrics()
+
+	dt := newTestDiffTracker()
+	uid := "svc-orphan-delete-metric"
+	cfg := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid,
+		Config:     cfg,
+		State:      StateDeletionInProgress,
+		IsOrphan:   true,
+	}
+
+	// orphanedResourcesCleanedTotal has no labels and cannot be Reset between tests, so measure a delta.
+	before, err := testutil.GetCounterMetricValue(orphanedResourcesCleanedTotal)
+	assert.NoError(t, err)
+
+	// The orphan's asynchronous deletion completes successfully.
+	dt.OnServiceCreationComplete(uid, true, nil)
+
+	after, err := testutil.GetCounterMetricValue(orphanedResourcesCleanedTotal)
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, after-before,
+		"a successful orphan deletion counts exactly one orphaned_resources_cleaned_total")
 }

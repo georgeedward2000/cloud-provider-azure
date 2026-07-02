@@ -9704,3 +9704,28 @@ func TestServiceGateway_EnsureAndDelete(t *testing.T) {
 	err = az.EnsureLoadBalancerDeleted(context.Background(), testClusterName, &svc)
 	assert.NoError(t, err)
 }
+
+// TestServiceGatewayEnsureLoadBalancer_ZeroPortServiceNoPanic verifies the defensive guard for a
+// port-less Service (unreachable via admitted type=LoadBalancer Services, which the API forces to
+// have >=1 port): ExtractInboundConfigFromService returns nil, and EnsureLoadBalancer must return the
+// current status unchanged rather than dereferencing the nil InboundConfig.
+func TestServiceGatewayEnsureLoadBalancer_ZeroPortServiceNoPanic(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	svc := getTestService("clb-zero-port", v1.ProtocolTCP, nil, false)
+	svc.Spec.Ports = nil
+
+	kubeClient := fake.NewSimpleClientset(&svc)
+	az.KubeClient = kubeClient
+	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+
+	assert.NotPanics(t, func() {
+		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		assert.NoError(t, err)
+		assert.NotNil(t, status)
+	})
+	assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+		"a port-less service has no PodIP backend and must not be tracked")
+}

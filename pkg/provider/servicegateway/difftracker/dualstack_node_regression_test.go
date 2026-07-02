@@ -299,3 +299,32 @@ var _ = consts.PodLabelServiceEgressGateway
 
 // ensure types import is used (PodStatus phase enum reference for readers).
 var _ = types.UID("")
+
+// TestSelectSameFamilyNodeIP_DeterministicAndValidated covers the shared node-location selector used
+// by both the init and runtime EndpointSlice paths. It must (1) pick the same same-family IP
+// regardless of input order (a node with multiple same-family InternalIPs must not flap its location
+// between reconciles/restarts), (2) skip malformed node IPs (a bad value must never become a location
+// key and poison the NRP batch), and (3) canonicalize the result.
+func TestSelectSameFamilyNodeIP_DeterministicAndValidated(t *testing.T) {
+	// Order-independence: two orderings of the same set yield the same key.
+	a, okA := SelectSameFamilyNodeIP([]string{"10.0.0.20", "10.0.0.3"}, false)
+	b, okB := SelectSameFamilyNodeIP([]string{"10.0.0.3", "10.0.0.20"}, false)
+	assert.True(t, okA && okB)
+	assert.Equal(t, a, b, "selection must be order-independent for multiple same-family InternalIPs")
+
+	// Malformed node IPs are skipped, not used as a location key.
+	got, ok := SelectSameFamilyNodeIP([]string{"not-an-ip", "10.0.0.5"}, false)
+	assert.True(t, ok)
+	assert.Equal(t, "10.0.0.5", got, "a malformed node IP must be skipped, not used as a location key")
+
+	_, ok = SelectSameFamilyNodeIP([]string{"not-an-ip"}, false)
+	assert.False(t, ok, "a node with no valid same-family InternalIP yields ok=false")
+
+	// Result is canonicalized and family-matched.
+	v6, ok := SelectSameFamilyNodeIP([]string{"10.0.0.1", "2001:DB8::0010"}, true)
+	assert.True(t, ok)
+	assert.Equal(t, "2001:db8::10", v6, "the IPv6 family key must be canonical")
+
+	_, ok = SelectSameFamilyNodeIP([]string{"10.0.0.1"}, true)
+	assert.False(t, ok, "no IPv6 InternalIP -> ok=false for an IPv6 pod")
+}

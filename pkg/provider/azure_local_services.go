@@ -37,6 +37,7 @@ import (
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/errutils"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
@@ -584,23 +585,12 @@ func (az *Cloud) getPodIPToNodeIPMapFromEndpointSlice(es *discovery_v1.EndpointS
 			continue
 		}
 
-		// Find the first node IP matching the requested IP family. Canonicalize it so the location
-		// key matches init (buildNodeNameToIPsMap) and NRP state; mixed IPv6 representations would
-		// otherwise diff as spurious add/delete pairs.
-		var matchingNodeIP string
-		for _, nodeIP := range nodeIPs {
-			if utilnet.IsIPv6String(nodeIP) == ipv6 {
-				if addr, err := netip.ParseAddr(nodeIP); err == nil {
-					matchingNodeIP = addr.String()
-				} else {
-					matchingNodeIP = nodeIP
-				}
-				break
-			}
-		}
-
-		// Skip if no matching IP found for this node
-		if matchingNodeIP == "" {
+		// Select the deterministic, canonical same-family node location key (shared with the init
+		// path via difftracker.SelectSameFamilyNodeIP so a restart diff stays empty). It skips
+		// malformed node IPs and, for a node with multiple same-family InternalIPs, always picks the
+		// same one, so the location never flaps between reconciles.
+		matchingNodeIP, ok := difftracker.SelectSameFamilyNodeIP(nodeIPs, ipv6)
+		if !ok {
 			continue
 		}
 
@@ -862,6 +852,9 @@ func isDualStackService(service *v1.Service) bool {
 func (az *Cloud) getBackendPoolNameForSLBService(service *v1.Service) (string, error) {
 	if isDualStackService(service) {
 		return "", fmt.Errorf("dual-stack services are not supported when LB backend pool type is PodIP")
+	}
+	if len(service.Spec.IPFamilies) == 0 {
+		return "", fmt.Errorf("service %s has no IP family; cannot determine backend pool name", service.GetUID())
 	}
 
 	switch service.Spec.IPFamilies[0] {

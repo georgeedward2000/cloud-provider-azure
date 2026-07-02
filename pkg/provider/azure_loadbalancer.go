@@ -416,6 +416,12 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 
 		// Extract port configuration from service
 		inboundConfig := az.extractInboundConfigFromService(service)
+		if inboundConfig == nil {
+			// A type=LoadBalancer Service always has >=1 port (API-enforced), so this is defensive:
+			// a port-less Service has no PodIP backend to program. Return the current status unchanged
+			// rather than dereferencing a nil config below.
+			return service.Status.LoadBalancer.DeepCopy(), nil
+		}
 
 		// Fail fast on specs the PodIP backend cannot support and surface the reason on the Service.
 		// Otherwise the difftracker terminal-parks the create asynchronously and the Service sits
