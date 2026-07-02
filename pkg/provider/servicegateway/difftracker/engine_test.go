@@ -1149,3 +1149,50 @@ func TestEngineDeletePod_ReplacementUIDNotGatedByStaleRecord(t *testing.T) {
 	replacement := dt.DeletePod(uid, "10.0.0.1", []string{"10.244.0.5"}, "ns", "pod-a", "pod-b-uid")
 	assert.False(t, replacement.Enqueued, "a different-UID delete must not inherit the prior pod's drain gate")
 }
+
+// TestEngineOnServiceCreationComplete_DriftDuringTerminalFailureReDispatches proves a terminal CREATE
+// failure does not park the service when a mid-flight UpdateService already replaced the desired spec.
+// The in-flight attempt used the old (invalid) spec; the failure is for that stale spec, so the new
+// desired config must be re-dispatched (it may be valid) rather than parked forever.
+func TestEngineOnServiceCreationComplete_DriftDuringTerminalFailureReDispatches(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-create-drift"
+	inflight := NewInboundServiceConfig(uid, makeInboundConfig(80))    // stale spec that fails terminally
+	desired := NewInboundServiceConfig(uid, makeInboundConfig(8080))   // new spec that landed mid-flight
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid, Config: desired, InFlightConfig: &inflight, State: StateCreationInProgress,
+	}
+
+	dt.OnServiceCreationComplete(uid, false, newTerminalError(errors.New("unsupported protocol")))
+
+	op := dt.pendingServiceOps[uid]
+	if op == nil {
+		t.Fatalf("service must remain tracked after a terminal failure")
+	}
+	assert.False(t, op.CreationFailedTerminal,
+		"a terminal failure for a stale spec must not park the service when the desired config drifted mid-flight")
+	assert.Equal(t, StateNotStarted, op.State, "the drifted config must be re-dispatched")
+	assert.True(t, configsEqualForUpdate(&op.Config, &desired), "the re-dispatch must target the new desired config")
+}
+
+// TestEngineOnServiceCreationComplete_DriftDuringTerminalUpdateReDispatches is the update-path analogue.
+func TestEngineOnServiceCreationComplete_DriftDuringTerminalUpdateReDispatches(t *testing.T) {
+	dt := newTestDiffTracker()
+	uid := "svc-update-drift"
+	inflight := NewInboundServiceConfig(uid, makeInboundConfig(80))
+	desired := NewInboundServiceConfig(uid, makeInboundConfig(8080))
+	dt.pendingServiceOps[uid] = &ServiceOperationState{
+		ServiceUID: uid, Config: desired, InFlightConfig: &inflight, State: StateUpdateInProgress,
+	}
+
+	dt.OnServiceCreationComplete(uid, false, newTerminalError(errors.New("unsupported protocol")))
+
+	op := dt.pendingServiceOps[uid]
+	if op == nil {
+		t.Fatalf("service must remain tracked after a terminal update failure")
+	}
+	assert.False(t, op.CreationFailedTerminal,
+		"a terminal update failure for a stale spec must not park when the desired config drifted mid-flight")
+	assert.Equal(t, StateNotStarted, op.State, "the drifted config must be re-dispatched")
+	assert.True(t, configsEqualForUpdate(&op.Config, &desired), "the re-dispatch must target the new desired config")
+}

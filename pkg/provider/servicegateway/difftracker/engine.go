@@ -712,19 +712,33 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			dt.checkInitializationCompleteLocked()
 		} else {
 			dt.logger.V(4).Info("Could not update service", "err", err, "service", serviceUID)
+			// Capture the attempted config before clearing it, so the terminal branch can detect a
+			// desired-spec drift that landed while this update was in flight.
+			attempted := opState.InFlightConfig
 			opState.InFlightConfig = nil
 
 			if isTerminalError(err) {
-				// Deterministic, spec-driven update failure (e.g. unsupported protocol, port
-				// out of range, dual-stack). Retrying cannot succeed, so park the service
-				// instead of looping forever. Its existing Azure resources keep the
-				// last-applied config; a later UpdateService with a changed spec clears the park.
 				recordServiceOperation("update", opState.Config.IsInbound, startTime, err, "ValidationError", opState.IsOrphan)
-				opState.CreationFailedTerminal = true
-				opState.State = StateNotStarted
-				opState.LastAttempt = time.Now().Format(time.RFC3339)
-				dt.logger.V(4).Info("Parked service after non-retryable update error", "err", err, "service", serviceUID)
-				dt.checkInitializationCompleteLocked()
+				if attempted != nil && !configsEqualForUpdate(attempted, &opState.Config) {
+					// The desired config changed while this failing update was in flight; re-dispatch
+					// the new desired config (which may be valid) rather than parking on the replaced spec.
+					resetRetryStateLocked(opState)
+					opState.State = StateNotStarted
+					opState.LastAttempt = time.Now().Format(time.RFC3339)
+					dt.logger.V(5).Info("Re-dispatched service update after desired config drifted during a terminal failure", "service", serviceUID)
+					dt.triggerServiceUpdater()
+					dt.checkInitializationCompleteLocked()
+				} else {
+					// Deterministic, spec-driven update failure (e.g. unsupported protocol, port
+					// out of range, dual-stack). Retrying cannot succeed, so park the service
+					// instead of looping forever. Its existing Azure resources keep the
+					// last-applied config; a later UpdateService with a changed spec clears the park.
+					opState.CreationFailedTerminal = true
+					opState.State = StateNotStarted
+					opState.LastAttempt = time.Now().Format(time.RFC3339)
+					dt.logger.V(4).Info("Parked service after non-retryable update error", "err", err, "service", serviceUID)
+					dt.checkInitializationCompleteLocked()
+				}
 			} else {
 				_, errCode := extractAzureErrorInfo(err)
 				recordServiceOperation("update", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)
@@ -867,20 +881,34 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 
 		} else {
 			dt.logger.V(4).Info("Could not create service", "err", err, "service", serviceUID)
-			// Clear on failure (as the update path does): a stale snapshot makes a later
-			// delete-completion misfire the pre-empt block and dispatch a redundant delete.
+			// Capture the attempted config before clearing it (a stale snapshot would misfire a later
+			// delete-completion pre-empt), so the terminal branch can detect a desired-spec drift that
+			// landed while this attempt was in flight.
+			attempted := opState.InFlightConfig
 			opState.InFlightConfig = nil
 
 			if isTerminalError(err) {
-				// Deterministic, spec-driven failure (e.g. unsupported protocol, port out
-				// of range). Retrying cannot succeed, so park the service instead of looping
-				// forever. A later UpdateService with a changed spec clears the park.
 				recordServiceOperation("create", opState.Config.IsInbound, startTime, err, "ValidationError", opState.IsOrphan)
-				opState.CreationFailedTerminal = true
-				opState.State = StateNotStarted
-				opState.LastAttempt = time.Now().Format(time.RFC3339)
-				dt.logger.V(4).Info("Parked service after non-retryable creation error", "err", err, "service", serviceUID)
-				dt.checkInitializationCompleteLocked()
+				if attempted != nil && !configsEqualForUpdate(attempted, &opState.Config) {
+					// The desired config changed while this failing attempt was in flight, so the
+					// failure was for a stale spec; re-dispatch the new desired config (which may be
+					// valid) rather than parking on a spec the user has already replaced.
+					resetRetryStateLocked(opState)
+					opState.State = StateNotStarted
+					opState.LastAttempt = time.Now().Format(time.RFC3339)
+					dt.logger.V(5).Info("Re-dispatched service creation after desired config drifted during a terminal failure", "service", serviceUID)
+					dt.triggerServiceUpdater()
+					dt.checkInitializationCompleteLocked()
+				} else {
+					// Deterministic, spec-driven failure (e.g. unsupported protocol, port out
+					// of range). Retrying cannot succeed, so park the service instead of looping
+					// forever. A later UpdateService with a changed spec clears the park.
+					opState.CreationFailedTerminal = true
+					opState.State = StateNotStarted
+					opState.LastAttempt = time.Now().Format(time.RFC3339)
+					dt.logger.V(4).Info("Parked service after non-retryable creation error", "err", err, "service", serviceUID)
+					dt.checkInitializationCompleteLocked()
+				}
 			} else {
 				_, errCode := extractAzureErrorInfo(err)
 				recordServiceOperation("create", opState.Config.IsInbound, startTime, err, errCode, opState.IsOrphan)

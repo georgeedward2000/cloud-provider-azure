@@ -369,7 +369,10 @@ func (s *ServiceUpdater) runWorker(uid string, op func()) {
 func (s *ServiceUpdater) createInboundService(serviceUID string, config *InboundConfig, correlationID string) {
 	s.logger.V(5).Info("Started creating inbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	ctx := s.ctx
+	// Bound the operation so a hung/slow Azure call fails into retry instead of holding the
+	// ServiceUpdater semaphore slot forever (see nrpOperationTimeout).
+	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	defer cancel()
 
 	// Step 0: Add finalizer to K8s service to prevent deletion until Azure resources are cleaned up
 	svc, err := s.diffTracker.getServiceByUID(ctx, serviceUID)
@@ -507,7 +510,8 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 func (s *ServiceUpdater) updateInboundService(serviceUID string, config *InboundConfig, correlationID string) {
 	s.logger.V(5).Info("Started updating inbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	ctx := s.ctx
+	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	defer cancel()
 
 	// Rebuild the LB ARM model from the new config. We discard the PIP and DTO portions
 	// because we are doing a port-only/spec update; the underlying PIP is unchanged and
@@ -543,7 +547,8 @@ func (s *ServiceUpdater) updateInboundService(serviceUID string, config *Inbound
 func (s *ServiceUpdater) createOutboundService(serviceUID string, config *OutboundConfig, correlationID string, triggeringPodNS string, triggeringPodName string) {
 	s.logger.V(5).Info("Started creating outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "pod", triggeringPodNS+"/"+triggeringPodName)
 
-	ctx := s.ctx
+	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	defer cancel()
 
 	// Step 1: Build resources using shared helper
 	pipResource, natGatewayResource, servicesDTO := buildOutboundServiceResources(serviceUID, config, s.diffTracker.config)
@@ -593,7 +598,8 @@ func (s *ServiceUpdater) createOutboundService(serviceUID string, config *Outbou
 func (s *ServiceUpdater) deleteInboundService(serviceUID string, correlationID string) {
 	s.logger.V(5).Info("Started deleting inbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	ctx := s.ctx
+	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	defer cancel()
 	var lastErr error
 
 	// Step 1: Remove backend pool references from ServiceGateway
@@ -700,7 +706,8 @@ func (s *ServiceUpdater) deleteInboundService(serviceUID string, correlationID s
 func (s *ServiceUpdater) deleteOutboundService(serviceUID string, correlationID string) {
 	s.logger.V(5).Info("Started deleting outbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	ctx := s.ctx
+	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	defer cancel()
 	var lastErr error
 
 	// Step 1: Disassociate NAT Gateway from ServiceGateway

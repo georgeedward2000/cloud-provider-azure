@@ -17,6 +17,14 @@ const (
 	locationsRetryMaxDelay  = 30 * time.Second
 )
 
+// nrpOperationTimeout bounds a single NRP/Azure operation attempt (a location sync in the
+// LocationsUpdater, or a service create/update/delete in the ServiceUpdater). Normal operations
+// complete in seconds; the timeout exists only so a hung or pathologically slow ARM call fails into
+// the existing bounded-retry/park logic instead of pinning the single LocationsUpdater worker or
+// permanently holding a ServiceUpdater semaphore slot. It is generous to avoid aborting a legitimate
+// long-running LRO. A var (not const) so tests can shorten it.
+var nrpOperationTimeout = 5 * time.Minute
+
 // LocationsUpdater syncs location and address changes to NRP Service Gateway
 type LocationsUpdater struct {
 	diffTracker *DiffTracker
@@ -59,7 +67,11 @@ func (lu *LocationsUpdater) Run() {
 
 		case <-lu.diffTracker.locationsUpdaterTrigger:
 			lu.logger.V(4).Info("Triggered LocationsUpdater")
-			lu.process(lu.ctx)
+			// Bound each attempt so a hung/slow NRP call cannot pin the single worker and starve all
+			// other services' location/finalizer syncs; a timeout fails into the deferred backoffAndRetry.
+			attemptCtx, cancel := context.WithTimeout(lu.ctx, nrpOperationTimeout)
+			lu.process(attemptCtx)
+			cancel()
 		}
 	}
 }

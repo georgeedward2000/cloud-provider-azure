@@ -80,3 +80,59 @@ func TestLocationsUpdaterRetriesAfterSyncFailure(t *testing.T) {
 		return atomic.LoadInt32(&calls) >= 2
 	}, 5*time.Second, 20*time.Millisecond, "a failed location sync should be retried automatically")
 }
+
+// TestLocationsUpdater_HungSyncTimesOutAndRecovers proves the single LocationsUpdater worker is not
+// pinned by a hung NRP call. The first UpdateAddressLocations blocks until its context is cancelled;
+// only the per-attempt timeout (not the deadline-less component context) can unblock it, so the
+// worker recovers and the backoff retry issues a second sync. Without the timeout the worker would
+// stall on the first call forever, starving all other location/finalizer syncs cluster-wide.
+func TestLocationsUpdater_HungSyncTimesOutAndRecovers(t *testing.T) {
+	oldTimeout := nrpOperationTimeout
+	nrpOperationTimeout = 150 * time.Millisecond
+	defer func() { nrpOperationTimeout = oldTimeout }()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	var calls int32
+	mockFactory := mock_azclient.NewMockClientFactory(ctrl)
+	mockSGW := mock_servicegatewayclient.NewMockInterface(ctrl)
+	mockFactory.EXPECT().GetServiceGatewayClient().Return(mockSGW).AnyTimes()
+	mockSGW.EXPECT().UpdateAddressLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, _, _ string, _ armnetwork.ServiceGatewayUpdateAddressLocationsRequest) error {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				<-ctx.Done() // hang until the per-attempt timeout cancels this attempt
+				return ctx.Err()
+			}
+			return nil
+		}).AnyTimes()
+
+	dt := newTestDiffTracker()
+	dt.networkClientFactory = mockFactory
+	dt.config = testConfig()
+
+	pod := newPod()
+	pod.InboundIdentities = utilsets.NewString("svc")
+	node := newNode()
+	node.Pods["10.0.0.1"] = pod
+	dt.K8sResources.Nodes["node-1"] = node
+	dt.NRPResources.LoadBalancers.Insert("svc")
+	dt.pendingServiceOps["svc"] = &ServiceOperationState{ServiceUID: "svc", State: StateCreated}
+
+	lu := NewLocationsUpdater(context.Background(), dt)
+	stopped := make(chan struct{})
+	go func() {
+		lu.Run()
+		close(stopped)
+	}()
+	defer func() {
+		lu.Stop()
+		<-stopped
+	}()
+
+	dt.triggerLocationsUpdater()
+
+	assert.Eventually(t, func() bool {
+		return atomic.LoadInt32(&calls) >= 2
+	}, 5*time.Second, 20*time.Millisecond, "a hung location sync must time out so the worker recovers and retries")
+}
