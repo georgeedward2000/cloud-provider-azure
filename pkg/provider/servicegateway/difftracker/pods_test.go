@@ -1,9 +1,24 @@
-package provider
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package difftracker
 
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,98 +34,8 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
-
-// mockDiffTracker tracks calls to AddPod and DeletePod for testing
-type mockDiffTracker struct {
-	addPodCalls    []addPodCall
-	deletePodCalls []deletePodCall
-}
-
-type addPodCall struct {
-	serviceUID string
-	podKey     string
-	location   string
-	address    string
-}
-
-type deletePodCall struct {
-	serviceUID string
-	location   string
-	addresses  []string
-	namespace  string
-	name       string
-	uid        string
-}
-
-func (m *mockDiffTracker) AddPod(serviceUID, podKey, location, address string) {
-	m.addPodCalls = append(m.addPodCalls, addPodCall{
-		serviceUID: serviceUID,
-		podKey:     podKey,
-		location:   location,
-		address:    address,
-	})
-}
-
-func (m *mockDiffTracker) DeletePod(serviceUID, location string, addresses []string, namespace, name, uid string) difftracker.DeletePodResult {
-	m.deletePodCalls = append(m.deletePodCalls, deletePodCall{
-		serviceUID: serviceUID,
-		location:   location,
-		addresses:  addresses,
-		namespace:  namespace,
-		name:       name,
-		uid:        uid,
-	})
-	// Mock always returns non-last pod (tests can adjust if needed)
-	return difftracker.DeletePodResult{IsLastPod: false}
-}
-
-func (m *mockDiffTracker) reset() {
-	m.addPodCalls = nil
-	m.deletePodCalls = nil
-}
-
-// Helper to create a pod with specific attributes
-func newTestPod(namespace, name, egressLabel, hostIP, podIP string, phase v1.PodPhase, deletionTimestamp *metav1.Time) *v1.Pod {
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      name,
-		},
-		Status: v1.PodStatus{
-			HostIP: hostIP,
-			PodIP:  podIP,
-			Phase:  phase,
-		},
-	}
-
-	if egressLabel != "" {
-		pod.Labels = map[string]string{
-			consts.PodLabelServiceEgressGateway: egressLabel,
-		}
-	}
-
-	if deletionTimestamp != nil {
-		pod.DeletionTimestamp = deletionTimestamp
-	}
-
-	return pod
-}
-
-// withPodIPs sets a pod's Status.PodIPs (and keeps Status.PodIP aligned with PodIPs[0], per the
-// Kubernetes API), so tests can exercise dual-stack egress pods.
-func withPodIPs(pod *v1.Pod, ips ...string) *v1.Pod {
-	pod.Status.PodIPs = nil
-	for _, ip := range ips {
-		pod.Status.PodIPs = append(pod.Status.PodIPs, v1.PodIP{IP: ip})
-	}
-	if len(ips) > 0 {
-		pod.Status.PodIP = ips[0]
-	}
-	return pod
-}
 
 // TestPodInformerAddPod tests the podInformerAddPod function
 func TestPodInformerAddPod(t *testing.T) {
@@ -215,32 +140,31 @@ func TestPodInformerAddPod(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mock := &mockDiffTracker{}
-			// Create a wrapper struct that embeds Cloud but uses our mock for testing
-			az := &testCloudWithMockDiffTracker{
-				mock: mock,
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			dt := newProviderDiffTracker(t, ctrl, fake.NewSimpleClientset(tt.pod))
+
+			dt.podInformerAddPod(tt.pod)
+
+			// On an empty engine a registered egress pod is buffered under pendingPods, keyed by its
+			// (lowercased) egress identity and carrying the node location (HostIP) and address (PodIP).
+			if !tt.expectAddPod {
+				assert.Empty(t, dt.pendingPods, "a skipped pod must not be registered with the engine")
+				return
 			}
-
-			az.podInformerAddPod(tt.pod)
-
-			if len(mock.addPodCalls) != tt.expectedCalls {
-				t.Errorf("Expected %d AddPod calls, got %d", tt.expectedCalls, len(mock.addPodCalls))
+			assert.Len(t, dt.pendingPods, tt.expectedCalls)
+			buffered := dt.pendingPods[tt.expectedEgress]
+			if !assert.Len(t, buffered, 1, "expected the egress pod buffered under %q", tt.expectedEgress) {
+				return
 			}
-
-			if tt.expectAddPod && len(mock.addPodCalls) > 0 {
-				call := mock.addPodCalls[0]
-				if tt.expectedPodKey != "" && call.podKey != tt.expectedPodKey {
-					t.Errorf("Expected podKey %s, got %s", tt.expectedPodKey, call.podKey)
-				}
-				if tt.expectedEgress != "" && call.serviceUID != tt.expectedEgress {
-					t.Errorf("Expected serviceUID %s, got %s", tt.expectedEgress, call.serviceUID)
-				}
-				if tt.expectedHostIP != "" && call.location != tt.expectedHostIP {
-					t.Errorf("Expected location (HostIP) %s, got %s", tt.expectedHostIP, call.location)
-				}
-				if tt.expectedPodIP != "" && call.address != tt.expectedPodIP {
-					t.Errorf("Expected address (PodIP) %s, got %s", tt.expectedPodIP, call.address)
-				}
+			if tt.expectedPodKey != "" {
+				assert.Equal(t, tt.expectedPodKey, buffered[0].PodKey)
+			}
+			if tt.expectedHostIP != "" {
+				assert.Equal(t, tt.expectedHostIP, buffered[0].Location)
+			}
+			if tt.expectedPodIP != "" {
+				assert.Equal(t, tt.expectedPodIP, buffered[0].Address)
 			}
 		})
 	}
@@ -278,22 +202,20 @@ func TestPodInformerDualStackRegistersEveryFamily(t *testing.T) {
 	}
 
 	kube := fake.NewSimpleClientset(pod)
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = seededProviderDiffTracker(t, az, kube,
-		difftracker.K8sState{Services: utilsets.NewString(), Egresses: utilsets.NewString(egress), Nodes: map[string]difftracker.Node{}},
-		difftracker.NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(egress), Locations: map[string]difftracker.NRPLocation{}})
+	dt, _ := newSeededDiffTracker(t, ctrl, kube,
+		K8sState{Services: utilsets.NewString(), Egresses: utilsets.NewString(egress), Nodes: map[string]Node{}},
+		NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(egress), Locations: map[string]NRPLocation{}})
 
-	az.podInformerAddPod(pod)
-	v4Pods := az.diffTracker.K8sResources.Nodes[v4Node].Pods
-	v6Pods := az.diffTracker.K8sResources.Nodes[v6Node].Pods
+	dt.podInformerAddPod(pod)
+	v4Pods := dt.K8sResources.Nodes[v4Node].Pods
+	v6Pods := dt.K8sResources.Nodes[v6Node].Pods
 	assert.Contains(t, v4Pods, v4Pod, "the IPv4 PodIP must register under the IPv4 node location")
 	assert.Contains(t, v6Pods, v6Pod, "the IPv6 PodIP must register under the IPv6 node location")
 	assert.NotContains(t, v4Pods, v6Pod, "the IPv6 PodIP must NOT be filed under the IPv4 node location (NRP rejects mixed-family locations)")
 
-	az.podInformerRemovePod(pod)
-	assert.NotContains(t, az.diffTracker.K8sResources.Nodes[v4Node].Pods, v4Pod, "the IPv4 family must drain on remove")
-	assert.NotContains(t, az.diffTracker.K8sResources.Nodes[v6Node].Pods, v6Pod, "the IPv6 family must drain on remove")
+	dt.podInformerRemovePod(pod)
+	assert.NotContains(t, dt.K8sResources.Nodes[v4Node].Pods, v4Pod, "the IPv4 family must drain on remove")
+	assert.NotContains(t, dt.K8sResources.Nodes[v6Node].Pods, v6Pod, "the IPv6 family must drain on remove")
 }
 
 // TestPodInformerAddPod_FinalizerAddFailureRegistersAndAlerts verifies that when AddPodFinalizer fails
@@ -318,16 +240,14 @@ func TestPodInformerAddPod_FinalizerAddFailureRegistersAndAlerts(t *testing.T) {
 		return true, nil, apierrors.NewInternalError(fmt.Errorf("apiserver down"))
 	})
 
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = newProviderDiffTracker(t, az, kube)
+	dt := newProviderDiffTracker(t, ctrl, kube)
 	rec := record.NewFakeRecorder(10)
-	az.eventRecorder = rec
+	dt.eventRecorder = rec
 
-	az.podInformerAddPod(pod)
+	dt.podInformerAddPod(pod)
 
 	// The pod must still be registered with the engine despite the finalizer add failure.
-	assert.True(t, az.diffTracker.IsServiceTracked("egress-svc"),
+	assert.True(t, dt.IsServiceTracked("egress-svc"),
 		"pod must still be registered (AddPod called) even when the finalizer could not be added")
 
 	// And the rare unprotected-pod state must be surfaced as a warning Event.
@@ -357,15 +277,13 @@ func TestPodInformerAddPod_RejectsInvalidEgressLabel(t *testing.T) {
 	}
 	kube := fake.NewSimpleClientset(pod)
 
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = newProviderDiffTracker(t, az, kube)
+	dt := newProviderDiffTracker(t, ctrl, kube)
 	rec := record.NewFakeRecorder(10)
-	az.eventRecorder = rec
+	dt.eventRecorder = rec
 
-	az.podInformerAddPod(pod)
+	dt.podInformerAddPod(pod)
 
-	assert.False(t, az.diffTracker.IsServiceTracked("../hijacked-nat"),
+	assert.False(t, dt.IsServiceTracked("../hijacked-nat"),
 		"a pod with an invalid egress label must not be registered with the engine")
 
 	select {
@@ -409,15 +327,13 @@ func TestPodInformerAddPod_SkipsStaleReplacedPod(t *testing.T) {
 	}
 	kube := fake.NewSimpleClientset(livePod)
 
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = newProviderDiffTracker(t, az, kube)
+	dt := newProviderDiffTracker(t, ctrl, kube)
 
-	az.podInformerAddPod(stalePod)
+	dt.podInformerAddPod(stalePod)
 
-	assert.False(t, az.diffTracker.IsServiceTracked(egress),
+	assert.False(t, dt.IsServiceTracked(egress),
 		"a stale event for a UID-replaced pod must not register the stale address")
-	if node, ok := az.diffTracker.K8sResources.Nodes["10.0.0.1"]; ok {
+	if node, ok := dt.K8sResources.Nodes["10.0.0.1"]; ok {
 		assert.NotContains(t, node.Pods, "10.244.0.1",
 			"the stale pod's IP must not be registered under the node location")
 	}
@@ -437,15 +353,13 @@ func TestPodInformerAddPod_RejectsMalformedPodIP(t *testing.T) {
 	}
 	kube := fake.NewSimpleClientset(pod)
 
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = newProviderDiffTracker(t, az, kube)
+	dt := newProviderDiffTracker(t, ctrl, kube)
 	rec := record.NewFakeRecorder(10)
-	az.eventRecorder = rec
+	dt.eventRecorder = rec
 
-	az.podInformerAddPod(pod)
+	dt.podInformerAddPod(pod)
 
-	assert.False(t, az.diffTracker.IsServiceTracked("egress-svc"),
+	assert.False(t, dt.IsServiceTracked("egress-svc"),
 		"a pod with a malformed PodIP must not be registered with the engine")
 
 	select {
@@ -463,70 +377,64 @@ func TestPodInformerRemovePod(t *testing.T) {
 		name            string
 		pod             *v1.Pod
 		expectDeletePod bool
-		expectedCalls   int
-		expectedEgress  string
-		expectedHostIP  string
-		expectedPodIP   string
 	}{
 		{
 			name:            "Valid pod with egress label and IPs should trigger DeletePod",
 			pod:             newTestPod("default", "test-pod", "egress-gateway-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
 			expectDeletePod: true,
-			expectedCalls:   1,
-			expectedEgress:  "egress-gateway-a",
-			expectedHostIP:  "10.0.0.1",
-			expectedPodIP:   "10.0.1.1",
 		},
 		{
 			name:            "Pod without egress label should be skipped",
 			pod:             newTestPod("default", "no-label", "", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
 			expectDeletePod: false,
-			expectedCalls:   0,
 		},
 		{
 			name:            "Pod without HostIP should be skipped with warning",
 			pod:             newTestPod("default", "no-hostip", "egress-a", "", "10.0.1.1", v1.PodRunning, nil),
 			expectDeletePod: false,
-			expectedCalls:   0,
 		},
 		{
 			name:            "Pod without PodIP should be skipped with warning",
 			pod:             newTestPod("default", "no-podip", "egress-a", "10.0.0.1", "", v1.PodRunning, nil),
 			expectDeletePod: false,
-			expectedCalls:   0,
 		},
 		{
 			name:            "Pod in any phase with IPs should trigger DeletePod (phase doesn't matter for removal)",
 			pod:             newTestPod("default", "failed-pod", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil),
 			expectDeletePod: true,
-			expectedCalls:   1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mock := &mockDiffTracker{}
-			az := &testCloudWithMockDiffTracker{
-				mock: mock,
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			// Seed the engine so a valid pod's address is registered: routing it to DeletePod then
+			// drain-gates the address (observable via HasPendingPodDeletion), while the no-label and
+			// no-IP paths never reach DeletePod.
+			egress := tt.pod.Labels[consts.PodLabelServiceEgressGateway]
+			k8s := K8sState{Services: utilsets.NewString(), Egresses: utilsets.NewString(), Nodes: map[string]Node{}}
+			nrp := NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(), Locations: map[string]NRPLocation{}}
+			if egress != "" && tt.pod.Status.HostIP != "" && tt.pod.Status.PodIP != "" {
+				k8s.Egresses.Insert(egress)
+				k8s.Nodes[tt.pod.Status.HostIP] = Node{Pods: map[string]Pod{
+					tt.pod.Status.PodIP: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
+				}}
+				nrp.NATGateways.Insert(egress)
 			}
+			pod := tt.pod.DeepCopy()
+			pod.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}
+			dt := seededDT(t, ctrl, fake.NewSimpleClientset(pod), k8s, nrp)
 
-			az.podInformerRemovePod(tt.pod)
+			dt.podInformerRemovePod(pod)
 
-			if len(mock.deletePodCalls) != tt.expectedCalls {
-				t.Errorf("Expected %d DeletePod calls, got %d", tt.expectedCalls, len(mock.deletePodCalls))
-			}
-
-			if tt.expectDeletePod && len(mock.deletePodCalls) > 0 {
-				call := mock.deletePodCalls[0]
-				if tt.expectedEgress != "" && call.serviceUID != tt.expectedEgress {
-					t.Errorf("Expected serviceUID %s, got %s", tt.expectedEgress, call.serviceUID)
-				}
-				if tt.expectedHostIP != "" && call.location != tt.expectedHostIP {
-					t.Errorf("Expected location (HostIP) %s, got %s", tt.expectedHostIP, call.location)
-				}
-				if tt.expectedPodIP != "" && (len(call.addresses) == 0 || call.addresses[0] != tt.expectedPodIP) {
-					t.Errorf("Expected address (PodIP) %s, got %v", tt.expectedPodIP, call.addresses)
-				}
+			if tt.expectDeletePod {
+				assert.True(t, dt.HasPendingPodDeletion(pod.Namespace, pod.Name, string(pod.UID)),
+					"a valid egress pod must be routed to DeletePod, which drain-gates the registered address")
+			} else {
+				assert.False(t, dt.HasPendingPodDeletion(pod.Namespace, pod.Name, string(pod.UID)),
+					"a skipped pod must not be drain-gated")
 			}
 		})
 	}
@@ -546,21 +454,19 @@ func TestPodInformerRemovePod_UntrackedPodFinalizerRemovedDirectly(t *testing.T)
 			Name:       "egress-stale",
 			Namespace:  "default",
 			Labels:     map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
-			Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+			Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
 		},
 		Status: v1.PodStatus{HostIP: "10.0.0.1", PodIP: "10.244.0.1"},
 	}
 	kubeClient := fake.NewSimpleClientset(pod)
 
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kubeClient
-	az.diffTracker = newProviderDiffTracker(t, az, kubeClient) // empty engine state -> pod is untracked
+	dt := newProviderDiffTracker(t, ctrl, kubeClient)
 
-	az.podInformerRemovePod(pod)
+	dt.podInformerRemovePod(pod)
 
 	got, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "egress-stale", metav1.GetOptions{})
 	assert.NoError(t, err)
-	assert.NotContains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+	assert.NotContains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
 		"an untracked egress pod's finalizer must be removed directly so it is not stranded in Terminating")
 }
 
@@ -576,21 +482,19 @@ func TestPodInformerRemovePod_NoIPPodFinalizerRemovedDirectly(t *testing.T) {
 			Name:       "egress-noip",
 			Namespace:  "default",
 			Labels:     map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
-			Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+			Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
 		},
 		Status: v1.PodStatus{}, // no HostIP/PodIP
 	}
 	kubeClient := fake.NewSimpleClientset(pod)
 
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kubeClient
-	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+	dt := newProviderDiffTracker(t, ctrl, kubeClient)
 
-	az.podInformerRemovePod(pod)
+	dt.podInformerRemovePod(pod)
 
 	got, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "egress-noip", metav1.GetOptions{})
 	assert.NoError(t, err)
-	assert.NotContains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+	assert.NotContains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
 		"a no-IP egress pod's finalizer must be removed directly so it is not stranded")
 }
 
@@ -612,12 +516,12 @@ func TestPodInformerDrainForReplace_LiveReRegistrationDoesNotStripFinalizer(t *t
 
 	// Two live pods on the same node/egress service so removing pod A is a non-last delete. New()
 	// seeds the outbound ref-counter to 2 from these pods.
-	seedState := func() difftracker.K8sState {
-		return difftracker.K8sState{
+	seedState := func() K8sState {
+		return K8sState{
 			Services: utilsets.NewString(),
 			Egresses: utilsets.NewString(egress),
-			Nodes: map[string]difftracker.Node{
-				hostIP: {Pods: map[string]difftracker.Pod{
+			Nodes: map[string]Node{
+				hostIP: {Pods: map[string]Pod{
 					addrA: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
 					addrB: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
 				}},
@@ -625,11 +529,11 @@ func TestPodInformerDrainForReplace_LiveReRegistrationDoesNotStripFinalizer(t *t
 		}
 	}
 	// addrA is not registered in NRP (already drained), so a non-last pending record would strip at once.
-	drainedNRP := func() difftracker.NRPState {
-		return difftracker.NRPState{
+	drainedNRP := func() NRPState {
+		return NRPState{
 			LoadBalancers: utilsets.NewString(),
 			NATGateways:   utilsets.NewString(egress),
-			Locations:     make(map[string]difftracker.NRPLocation),
+			Locations:     make(map[string]NRPLocation),
 		}
 	}
 	podA := func(ip string) *v1.Pod {
@@ -639,7 +543,7 @@ func TestPodInformerDrainForReplace_LiveReRegistrationDoesNotStripFinalizer(t *t
 				Namespace:  "default",
 				UID:        types.UID("uid-a"),
 				Labels:     map[string]string{consts.PodLabelServiceEgressGateway: egress},
-				Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+				Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
 			},
 			Status: v1.PodStatus{HostIP: hostIP, PodIP: ip, PodIPs: []v1.PodIP{{IP: ip}}, Phase: v1.PodRunning},
 		}
@@ -647,33 +551,29 @@ func TestPodInformerDrainForReplace_LiveReRegistrationDoesNotStripFinalizer(t *t
 
 	t.Run("drainForReplace leaves the live pod's finalizer intact", func(t *testing.T) {
 		kube := fake.NewSimpleClientset(podA(addrA))
-		az := GetTestCloudWithContainerLoadBalancer(ctrl)
-		az.KubeClient = kube
-		az.diffTracker = seededProviderDiffTracker(t, az, kube, seedState(), drainedNRP())
+		dt := seededDT(t, ctrl, kube, seedState(), drainedNRP())
 
 		// A same-service address change (addrA -> addrC) drains addrA with empty namespace/name, so
 		// no finalizer-deletion record is enqueued for the still-live pod.
-		az.podInformerDrainForReplace(podA(addrA), podA("10.244.0.3"))
-		az.diffTracker.CheckPendingPodDeletions(context.Background())
+		dt.podInformerDrainForReplace(podA(addrA), podA("10.244.0.3"))
+		dt.CheckPendingPodDeletions(context.Background())
 
 		got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-a", metav1.GetOptions{})
 		assert.NoError(t, err)
-		assert.Contains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+		assert.Contains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
 			"a live re-registration drain must not enqueue a strippable record, so the finalizer must survive")
 	})
 
 	t.Run("contrast: the record-enqueuing removal path would strip it", func(t *testing.T) {
 		kube := fake.NewSimpleClientset(podA(addrA))
-		az := GetTestCloudWithContainerLoadBalancer(ctrl)
-		az.KubeClient = kube
-		az.diffTracker = seededProviderDiffTracker(t, az, kube, seedState(), drainedNRP())
+		dt := seededDT(t, ctrl, kube, seedState(), drainedNRP())
 
-		az.podInformerRemovePod(podA(addrA)) // enqueues a non-last drain-gated record
-		az.diffTracker.CheckPendingPodDeletions(context.Background())
+		dt.podInformerRemovePod(podA(addrA)) // enqueues a non-last drain-gated record
+		dt.CheckPendingPodDeletions(context.Background())
 
 		got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-a", metav1.GetOptions{})
 		assert.NoError(t, err)
-		assert.NotContains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+		assert.NotContains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
 			"the record-enqueuing removal drains the address then strips the finalizer once it has left NRP")
 	})
 }
@@ -695,19 +595,19 @@ func TestPodInformerDrainForReplace_SoleDualStackGainKeepsSharedAddress(t *testi
 	)
 
 	// A single live pod carrying only v4: New() seeds the ref-count to 1.
-	k8s := difftracker.K8sState{
+	k8s := K8sState{
 		Services: utilsets.NewString(),
 		Egresses: utilsets.NewString(egress),
-		Nodes: map[string]difftracker.Node{
-			hostIP: {Pods: map[string]difftracker.Pod{
+		Nodes: map[string]Node{
+			hostIP: {Pods: map[string]Pod{
 				v4: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
 			}},
 		},
 	}
-	nrp := difftracker.NRPState{
+	nrp := NRPState{
 		LoadBalancers: utilsets.NewString(),
 		NATGateways:   utilsets.NewString(egress),
-		Locations:     make(map[string]difftracker.NRPLocation),
+		Locations:     make(map[string]NRPLocation),
 	}
 	pod := func(ips ...string) *v1.Pod {
 		podIPs := make([]v1.PodIP, 0, len(ips))
@@ -718,22 +618,20 @@ func TestPodInformerDrainForReplace_SoleDualStackGainKeepsSharedAddress(t *testi
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "pod-a", Namespace: "default", UID: types.UID("uid-a"),
 				Labels:     map[string]string{consts.PodLabelServiceEgressGateway: egress},
-				Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+				Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
 			},
 			Status: v1.PodStatus{HostIP: hostIP, PodIP: ips[0], PodIPs: podIPs, Phase: v1.PodRunning},
 		}
 	}
 
 	kube := fake.NewSimpleClientset(pod(v4, v6))
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = seededProviderDiffTracker(t, az, kube, k8s, nrp)
+	dt, _ := newSeededDiffTracker(t, ctrl, kube, k8s, nrp)
 
-	az.podInformerDrainForReplace(pod(v4), pod(v4, v6))
+	dt.podInformerDrainForReplace(pod(v4), pod(v4, v6))
 
 	// v4 must still be the sole live address: draining it now is the last-pod case. Had the full old
 	// set been drained, v4 would already be gone and this would be a no-op (IsLastPod=false).
-	res := az.diffTracker.DeletePod(egress, hostIP, []string{v4}, "default", "pod-a", "uid-a")
+	res := dt.DeletePod(egress, hostIP, []string{v4}, "default", "pod-a", "uid-a")
 	assert.True(t, res.IsLastPod,
 		"a dual-stack gain must keep the shared v4 registered, so the sole pod's service is never emptied/torn down mid-replace")
 	assert.True(t, res.Enqueued)
@@ -753,19 +651,19 @@ func TestPodInformerRemovePod_NoIPDeleteKeepsFinalizerWhileDrainPending(t *testi
 		v4     = "10.244.0.1"
 	)
 
-	k8s := difftracker.K8sState{
+	k8s := K8sState{
 		Services: utilsets.NewString(),
 		Egresses: utilsets.NewString(egress),
-		Nodes: map[string]difftracker.Node{
-			hostIP: {Pods: map[string]difftracker.Pod{
+		Nodes: map[string]Node{
+			hostIP: {Pods: map[string]Pod{
 				v4: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
 			}},
 		},
 	}
-	nrp := difftracker.NRPState{
+	nrp := NRPState{
 		LoadBalancers: utilsets.NewString(),
 		NATGateways:   utilsets.NewString(egress),
-		Locations:     make(map[string]difftracker.NRPLocation),
+		Locations:     make(map[string]NRPLocation),
 	}
 
 	newPod := func(withIPs bool) *v1.Pod {
@@ -779,31 +677,29 @@ func TestPodInformerRemovePod_NoIPDeleteKeepsFinalizerWhileDrainPending(t *testi
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "pod-a", Namespace: "default", UID: types.UID("uid-a"),
 				Labels:     map[string]string{consts.PodLabelServiceEgressGateway: egress},
-				Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+				Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
 			},
 			Status: status,
 		}
 	}
 
 	kube := fake.NewSimpleClientset(newPod(true))
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = seededProviderDiffTracker(t, az, kube, k8s, nrp)
+	dt, _ := newSeededDiffTracker(t, ctrl, kube, k8s, nrp)
 
 	// First termination event still carries the IPs: it drain-gates the address (Enqueued) and keeps
 	// the finalizer for the drain-gate.
-	az.podInformerRemovePod(newPod(true))
-	assert.True(t, az.diffTracker.HasPendingPodDeletion("default", "pod-a", "uid-a"),
+	dt.podInformerRemovePod(newPod(true))
+	assert.True(t, dt.HasPendingPodDeletion("default", "pod-a", "uid-a"),
 		"the with-IP delete must record a pending drain")
 
 	// Second event arrives after the kubelet cleared the IPs. The finalizer must NOT be stripped.
-	az.podInformerRemovePod(newPod(false))
+	dt.podInformerRemovePod(newPod(false))
 
 	got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-a", metav1.GetOptions{})
 	assert.NoError(t, err)
-	assert.Contains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+	assert.Contains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
 		"a no-IP delete must not strip the finalizer while a drain is still pending")
-	assert.True(t, az.diffTracker.HasPendingPodDeletion("default", "pod-a", "uid-a"),
+	assert.True(t, dt.HasPendingPodDeletion("default", "pod-a", "uid-a"),
 		"the pending drain must remain until NRP confirms the address is gone")
 }
 
@@ -817,23 +713,20 @@ func TestPodInformerRemovePod_NoIPDeleteStripsUntrackedPod(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "pod-b", Namespace: "default", UID: types.UID("uid-b"),
 			Labels:     map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
-			Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+			Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
 		},
 		Status: v1.PodStatus{Phase: v1.PodFailed},
 	}
 	kube := fake.NewSimpleClientset(pod)
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = newProviderDiffTracker(t, az, kube)
+	dt := newProviderDiffTracker(t, ctrl, kube)
 
-	az.podInformerRemovePod(pod)
+	dt.podInformerRemovePod(pod)
 
 	got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-b", metav1.GetOptions{})
 	assert.NoError(t, err)
-	assert.NotContains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+	assert.NotContains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
 		"an untracked no-IP pod with no pending drain must have its finalizer removed to avoid stranding")
 }
-
 
 // TestReconcileEgressPodUpdate_LiveReRegistrationKeepsFinalizerAndReAdds drives the real update
 // executor end-to-end on a live engine: a dual-stack pod that gains a secondary family
@@ -853,20 +746,20 @@ func TestReconcileEgressPodUpdate_LiveReRegistrationKeepsFinalizerAndReAdds(t *t
 	)
 
 	// One live pod (v4) plus a second pod so the service is not torn down mid-update.
-	k8s := difftracker.K8sState{
+	k8s := K8sState{
 		Services: utilsets.NewString(),
 		Egresses: utilsets.NewString(egress),
-		Nodes: map[string]difftracker.Node{
-			hostIP: {Pods: map[string]difftracker.Pod{
+		Nodes: map[string]Node{
+			hostIP: {Pods: map[string]Pod{
 				v4:    {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
 				other: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
 			}},
 		},
 	}
-	nrp := difftracker.NRPState{
+	nrp := NRPState{
 		LoadBalancers: utilsets.NewString(),
 		NATGateways:   utilsets.NewString(egress),
-		Locations:     make(map[string]difftracker.NRPLocation),
+		Locations:     make(map[string]NRPLocation),
 	}
 
 	pod := func(ips ...string) *v1.Pod {
@@ -880,7 +773,7 @@ func TestReconcileEgressPodUpdate_LiveReRegistrationKeepsFinalizerAndReAdds(t *t
 				Namespace:  "default",
 				UID:        types.UID("uid-a"),
 				Labels:     map[string]string{consts.PodLabelServiceEgressGateway: egress},
-				Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+				Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
 			},
 			Status: v1.PodStatus{HostIP: hostIP, HostIPs: []v1.HostIP{{IP: hostIP}, {IP: v6Node}}, PodIP: ips[0], PodIPs: podIPs, Phase: v1.PodRunning},
 		}
@@ -888,23 +781,21 @@ func TestReconcileEgressPodUpdate_LiveReRegistrationKeepsFinalizerAndReAdds(t *t
 
 	oldPod, newPod := pod(v4), pod(v4, v6)
 	kube := fake.NewSimpleClientset(newPod)
-	az := GetTestCloudWithContainerLoadBalancer(ctrl)
-	az.KubeClient = kube
-	az.diffTracker = seededProviderDiffTracker(t, az, kube, k8s, nrp)
+	dt, _ := newSeededDiffTracker(t, ctrl, kube, k8s, nrp)
 
-	az.reconcileEgressPodUpdate(oldPod, newPod)
-	az.diffTracker.CheckPendingPodDeletions(context.Background())
+	dt.reconcileEgressPodUpdate(oldPod, newPod)
+	dt.CheckPendingPodDeletions(context.Background())
 
 	got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-a", metav1.GetOptions{})
 	assert.NoError(t, err)
-	assert.Contains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+	assert.Contains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
 		"a live re-registration must leave the pod finalized")
-	assert.True(t, az.diffTracker.IsServiceTracked(egress), "the egress service must remain tracked")
+	assert.True(t, dt.IsServiceTracked(egress), "the egress service must remain tracked")
 
 	// Both IP families must be registered under their SAME-FAMILY node location: the dual-stack gain
 	// added v6 under the node's IPv6 IP and kept the shared v4 under the IPv4 node IP.
-	v4Pods := az.diffTracker.K8sResources.Nodes[hostIP].Pods
-	v6Pods := az.diffTracker.K8sResources.Nodes[v6Node].Pods
+	v4Pods := dt.K8sResources.Nodes[hostIP].Pods
+	v6Pods := dt.K8sResources.Nodes[v6Node].Pods
 	if assert.Contains(t, v4Pods, v4, "the primary family must remain registered under the IPv4 node location") {
 		assert.Equal(t, egress, v4Pods[v4].PublicOutboundIdentity)
 	}
@@ -1092,14 +983,12 @@ func TestPodInformerDeleteFunc(t *testing.T) {
 		name            string
 		obj             interface{}
 		expectDeletePod bool
-		expectedCalls   int
 		shouldError     bool
 	}{
 		{
 			name:            "Direct pod object",
 			obj:             newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
 			expectDeletePod: true,
-			expectedCalls:   1,
 		},
 		{
 			name: "Tombstone with valid pod",
@@ -1108,7 +997,6 @@ func TestPodInformerDeleteFunc(t *testing.T) {
 				Obj: newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
 			},
 			expectDeletePod: true,
-			expectedCalls:   1,
 		},
 		{
 			name: "Tombstone with invalid object type",
@@ -1117,26 +1005,19 @@ func TestPodInformerDeleteFunc(t *testing.T) {
 				Obj: "not-a-pod",
 			},
 			expectDeletePod: false,
-			expectedCalls:   0,
 			shouldError:     true,
 		},
 		{
 			name:            "Invalid object type (not pod or tombstone)",
 			obj:             "invalid-type",
 			expectDeletePod: false,
-			expectedCalls:   0,
 			shouldError:     true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mock := &mockDiffTracker{}
-			az := &testCloudWithMockDiffTracker{
-				mock: mock,
-			}
-
-			// Simulate DeleteFunc logic
+			// The informer DeleteFunc decodes the object (direct pod or tombstone) before acting.
 			var pod *v1.Pod
 			switch v := tt.obj.(type) {
 			case *v1.Pod:
@@ -1145,84 +1026,68 @@ func TestPodInformerDeleteFunc(t *testing.T) {
 				var ok bool
 				pod, ok = v.Obj.(*v1.Pod)
 				if !ok {
-					// This would log an error in real code
 					if !tt.shouldError {
 						t.Errorf("Expected valid pod in tombstone but conversion failed")
 					}
 					return
 				}
 			default:
-				// This would log an error in real code
 				if !tt.shouldError {
 					t.Errorf("Expected valid pod object but got %T", v)
 				}
 				return
 			}
 
-			if pod != nil {
-				az.podInformerRemovePod(pod)
-			}
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			// A decoded egress pod is routed to podInformerRemovePod; on an untracked (empty) engine
+			// that strips its cleanup finalizer directly (nothing to drain).
+			pod = pod.DeepCopy()
+			pod.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}
+			kube := fake.NewSimpleClientset(pod)
+			dt := newProviderDiffTracker(t, ctrl, kube)
 
-			if len(mock.deletePodCalls) != tt.expectedCalls {
-				t.Errorf("Expected %d DeletePod calls, got %d", tt.expectedCalls, len(mock.deletePodCalls))
+			dt.podInformerRemovePod(pod)
+
+			if tt.expectDeletePod {
+				got, err := kube.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+				assert.NoError(t, err)
+				assert.NotContains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
+					"a decoded egress pod must reach podInformerRemovePod, which strips the finalizer on an untracked pod")
 			}
 		})
 	}
 }
 
-// testCloudWithMockDiffTracker wraps Cloud methods but uses mock diffTracker
-type testCloudWithMockDiffTracker struct {
-	mock *mockDiffTracker
-}
+// TestPodInformerRemovePod_BufferedPodFinalizerRemovedByCaller verifies that a pod deleted while it
+// is still buffered for an in-flight (never-created) egress service does not strand its cleanup
+// finalizer. DeletePod returns early with Enqueued=false (nothing to drain from NRP), so
+// podInformerRemovePod's !result.IsLastPod && !result.Enqueued branch removes the finalizer directly.
+func TestPodInformerRemovePod_BufferedPodFinalizerRemovedByCaller(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
 
-// podInformerAddPod mimics the real implementation but uses our mock
-func (tc *testCloudWithMockDiffTracker) podInformerAddPod(pod *v1.Pod) {
-	// Validate pod has egress label
-	if pod.Labels == nil || pod.Labels[consts.PodLabelServiceEgressGateway] == "" {
-		return
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "egress-buffered",
+			Namespace:  "default",
+			Labels:     map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
+			Finalizers: []string{ServiceGatewayPodCleanupFinalizer},
+		},
+		Status: v1.PodStatus{HostIP: "10.0.0.1", PodIP: "10.244.0.7"},
 	}
+	kubeClient := fake.NewSimpleClientset(pod)
 
-	// Skip pods that are being deleted
-	if pod.DeletionTimestamp != nil {
-		return
-	}
+	dt := newProviderDiffTracker(t, ctrl, kubeClient)
 
-	// Only process pods in Running or Pending phase
-	if pod.Status.Phase != v1.PodRunning && pod.Status.Phase != v1.PodPending {
-		return
-	}
+	// Buffer the pod for an in-flight egress service (the harness runs no async workers, so the
+	// service stays in StateNotStarted with the pod buffered in pendingPods).
+	dt.AddPod("egress-svc", "default/egress-buffered", "10.0.0.1", "10.244.0.7")
 
-	// Validate pod has required IPs
-	if pod.Status.HostIP == "" || len(difftracker.PodEgressAddresses(pod)) == 0 {
-		return
-	}
+	dt.podInformerRemovePod(pod)
 
-	egressName := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
-	if !difftracker.IsValidEgressIdentity(egressName) {
-		return
-	}
-	podKey := pod.Namespace + "/" + pod.Name
-
-	// Call mock instead of real diffTracker, once per pod IP (mirrors the real dual-stack loop)
-	for _, podIP := range difftracker.PodEgressAddresses(pod) {
-		tc.mock.AddPod(egressName, podKey, pod.Status.HostIP, podIP)
-	}
-}
-
-// podInformerRemovePod mimics the real implementation but uses our mock
-func (tc *testCloudWithMockDiffTracker) podInformerRemovePod(pod *v1.Pod) {
-	// Validate pod has egress label
-	if pod.Labels == nil || pod.Labels[consts.PodLabelServiceEgressGateway] == "" {
-		return
-	}
-
-	// Need IPs to identify which location/address to remove
-	if pod.Status.HostIP == "" || len(difftracker.PodEgressAddresses(pod)) == 0 {
-		return
-	}
-
-	egressName := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
-
-	// Call mock instead of real diffTracker
-	tc.mock.DeletePod(egressName, pod.Status.HostIP, difftracker.PodEgressAddresses(pod), pod.Namespace, pod.Name, string(pod.UID))
+	got, err := kubeClient.CoreV1().Pods("default").Get(context.Background(), "egress-buffered", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.NotContains(t, got.Finalizers, ServiceGatewayPodCleanupFinalizer,
+		"a pod deleted while buffered must have its finalizer removed by the caller, not stranded in Terminating")
 }

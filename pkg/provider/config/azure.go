@@ -17,7 +17,6 @@ limitations under the License.
 package config
 
 import (
-	"net/netip"
 	"strings"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/configloader"
@@ -166,15 +165,6 @@ type Config struct {
 	ClusterServiceSharedLoadBalancerHealthProbePort int32 `json:"clusterServiceSharedLoadBalancerHealthProbePort,omitempty" yaml:"clusterServiceSharedLoadBalancerHealthProbePort,omitempty"`
 	// ClusterServiceSharedLoadBalancerHealthProbePath defines the target path of the shared health probe. Default to `/healthz`.
 	ClusterServiceSharedLoadBalancerHealthProbePath string `json:"clusterServiceSharedLoadBalancerHealthProbePath,omitempty" yaml:"clusterServiceSharedLoadBalancerHealthProbePath,omitempty"`
-
-	// PodCidrsIPv4 is a slice of IPv4 pod subnet prefixes for the cluster.
-	// PodCidrsIPv6 is a slice of IPv6 pod subnet prefixes for the cluster.
-	// The pod subnet prefix is used to configure the NSG for the pod subnet.
-	// Pod CIDR would be opened to internet by default
-	// TODO(enechitoaia): Discuss if we need NSG in ServiceGateway mode
-	// TODO(enechitoaia): improve security eventually
-	PodCidrsIPv4 []netip.Prefix `json:"podCidrIPv4" yaml:"podCidrIPv4"`
-	PodCidrsIPv6 []netip.Prefix `json:"podCidrIPv6" yaml:"podCidrIPv6"`
 
 	// ServiceGatewayEnabled indicates whether the service gateway is enabled for the cluster.
 	// When enabled, the ServiceGateway resource name is hardcoded to

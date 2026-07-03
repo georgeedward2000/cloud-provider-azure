@@ -1214,8 +1214,8 @@ func TestEngineDeletePod_ReplacementUIDNotGatedByStaleRecord(t *testing.T) {
 func TestEngineOnServiceCreationComplete_DriftDuringTerminalFailureReDispatches(t *testing.T) {
 	dt := newTestDiffTracker()
 	uid := "svc-create-drift"
-	inflight := NewInboundServiceConfig(uid, makeInboundConfig(80))    // stale spec that fails terminally
-	desired := NewInboundServiceConfig(uid, makeInboundConfig(8080))   // new spec that landed mid-flight
+	inflight := NewInboundServiceConfig(uid, makeInboundConfig(80))  // stale spec that fails terminally
+	desired := NewInboundServiceConfig(uid, makeInboundConfig(8080)) // new spec that landed mid-flight
 	dt.pendingServiceOps[uid] = &ServiceOperationState{
 		ServiceUID: uid, Config: desired, InFlightConfig: &inflight, State: StateCreationInProgress,
 	}

@@ -370,6 +370,71 @@ func ExtractInboundConfigFromService(service *v1.Service) *InboundConfig {
 	return config
 }
 
+// InboundConfigValidationError reports an inbound Service spec the PodIP backend pool cannot
+// support. Reason is the Kubernetes Event reason the caller surfaces on the Service.
+type InboundConfigValidationError struct {
+	Reason  string
+	Message string
+}
+
+func (e *InboundConfigValidationError) Error() string { return e.Message }
+
+// ValidateInboundConfig rejects inbound Service specs the PodIP backend pool cannot support,
+// returning an *InboundConfigValidationError whose Reason is the Event reason to surface. Without
+// this fast check the engine would terminal-park the create asynchronously with no visible cause.
+// A nil config (a port-less Service) is treated as valid; the caller handles that case separately.
+func ValidateInboundConfig(config *InboundConfig) error {
+	if config == nil {
+		return nil
+	}
+
+	// ipFamilies has at most two entries (two == dual-stack); PodIP backends are single-stack.
+	if len(config.IPFamilies) > 1 {
+		return &InboundConfigValidationError{
+			Reason:  "UnsupportedDualStack",
+			Message: fmt.Sprintf("dual-stack Services are not supported when ServiceGateway is enabled (ipFamilies=%v); use a single-stack Service", config.IPFamilies),
+		}
+	}
+
+	// A named targetPort cannot be resolved to a concrete PodIP backend port.
+	if len(config.NamedTargetPorts) > 0 {
+		return &InboundConfigValidationError{
+			Reason:  "UnsupportedNamedTargetPort",
+			Message: fmt.Sprintf("named targetPort(s) %v are not supported when ServiceGateway is enabled; use a numeric targetPort", config.NamedTargetPorts),
+		}
+	}
+
+	// The PodIP backend only programs TCP and UDP load-balancing rules.
+	for _, fp := range config.FrontendPorts {
+		if !strings.EqualFold(fp.Protocol, "TCP") && !strings.EqualFold(fp.Protocol, "UDP") {
+			return &InboundConfigValidationError{
+				Reason:  "UnsupportedProtocol",
+				Message: fmt.Sprintf("protocol %q is not supported when ServiceGateway is enabled (service port %d); use TCP or UDP", fp.Protocol, fp.Port),
+			}
+		}
+	}
+
+	// Two service ports mapping to the same (protocol, backend port) collide on the PodIP backend
+	// pool (Azure's RulesUseSameBackendPortProtocolAndPool with floating IP disabled).
+	seenBackend := make(map[string]int32, len(config.FrontendPorts))
+	for i, fp := range config.FrontendPorts {
+		backendPort := fp.Port
+		if i < len(config.BackendPorts) {
+			backendPort = config.BackendPorts[i].Port
+		}
+		key := fmt.Sprintf("%s/%d", strings.ToUpper(fp.Protocol), backendPort)
+		if prevPort, ok := seenBackend[key]; ok {
+			return &InboundConfigValidationError{
+				Reason:  "UnsupportedBackendPortCollision",
+				Message: fmt.Sprintf("service ports %d and %d both map to backend port %d over %s, which is not supported when ServiceGateway is enabled; distinct service ports must use distinct targetPorts", prevPort, fp.Port, backendPort, strings.ToUpper(fp.Protocol)),
+			}
+		}
+		seenBackend[key] = fp.Port
+	}
+
+	return nil
+}
+
 // buildInboundResourceNames returns the resource names for an inbound service
 func buildInboundResourceNames(serviceUID string) (lbName string, pipName string, backendPoolName string) {
 	return serviceUID, fmt.Sprintf("%s-pip", serviceUID), serviceUID

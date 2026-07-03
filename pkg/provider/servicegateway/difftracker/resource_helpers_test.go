@@ -18,6 +18,83 @@ func TestExtractInboundConfigFromService_NilService(t *testing.T) {
 	assert.Nil(t, config)
 }
 
+func TestValidateInboundConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		config     *InboundConfig
+		wantReason string
+	}{
+		{
+			name:   "nil config is valid",
+			config: nil,
+		},
+		{
+			name: "single-stack TCP and UDP is valid",
+			config: &InboundConfig{
+				FrontendPorts: []PortMapping{{Port: 80, Protocol: "TCP"}, {Port: 53, Protocol: "UDP"}},
+				BackendPorts:  []PortMapping{{Port: 8080, Protocol: "TCP"}, {Port: 5353, Protocol: "UDP"}},
+				IPFamilies:    []string{"IPv4"},
+			},
+		},
+		{
+			name: "dual-stack rejected",
+			config: &InboundConfig{
+				FrontendPorts: []PortMapping{{Port: 80, Protocol: "TCP"}},
+				BackendPorts:  []PortMapping{{Port: 80, Protocol: "TCP"}},
+				IPFamilies:    []string{"IPv4", "IPv6"},
+			},
+			wantReason: "UnsupportedDualStack",
+		},
+		{
+			name: "named target port rejected",
+			config: &InboundConfig{
+				FrontendPorts:    []PortMapping{{Port: 80, Protocol: "TCP"}},
+				BackendPorts:     []PortMapping{{Port: 80, Protocol: "TCP"}},
+				NamedTargetPorts: []string{"http"},
+			},
+			wantReason: "UnsupportedNamedTargetPort",
+		},
+		{
+			name: "non-TCP/UDP protocol rejected",
+			config: &InboundConfig{
+				FrontendPorts: []PortMapping{{Port: 132, Protocol: "SCTP"}},
+				BackendPorts:  []PortMapping{{Port: 132, Protocol: "SCTP"}},
+			},
+			wantReason: "UnsupportedProtocol",
+		},
+		{
+			name: "two service ports colliding on one backend port rejected",
+			config: &InboundConfig{
+				FrontendPorts: []PortMapping{{Port: 80, Protocol: "TCP"}, {Port: 81, Protocol: "TCP"}},
+				BackendPorts:  []PortMapping{{Port: 8080, Protocol: "TCP"}, {Port: 8080, Protocol: "TCP"}},
+			},
+			wantReason: "UnsupportedBackendPortCollision",
+		},
+		{
+			name: "same backend port different protocol allowed",
+			config: &InboundConfig{
+				FrontendPorts: []PortMapping{{Port: 80, Protocol: "TCP"}, {Port: 80, Protocol: "UDP"}},
+				BackendPorts:  []PortMapping{{Port: 8080, Protocol: "TCP"}, {Port: 8080, Protocol: "UDP"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateInboundConfig(tt.config)
+			if tt.wantReason == "" {
+				assert.NoError(t, err)
+				return
+			}
+			var ve *InboundConfigValidationError
+			if assert.ErrorAs(t, err, &ve) {
+				assert.Equal(t, tt.wantReason, ve.Reason)
+				assert.NotEmpty(t, ve.Message)
+			}
+		})
+	}
+}
+
 func TestExtractInboundConfigFromService_EmptyPorts(t *testing.T) {
 	service := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{

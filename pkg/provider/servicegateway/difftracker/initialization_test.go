@@ -560,7 +560,7 @@ func TestPIPNamesInAzureFromList_IncludesAddressLessPIP(t *testing.T) {
 	pips := []*armnetwork.PublicIPAddress{
 		{Name: ptr.To("alloc-pip"), Properties: &armnetwork.PublicIPAddressPropertiesFormat{IPAddress: ptr.To("1.2.3.4")}},
 		{Name: ptr.To("pending-pip"), Properties: &armnetwork.PublicIPAddressPropertiesFormat{}}, // address not allocated yet
-		{Name: ptr.To("nilprops-pip")}, // no Properties at all
+		{Name: ptr.To("nilprops-pip")},                              // no Properties at all
 		{Properties: &armnetwork.PublicIPAddressPropertiesFormat{}}, // no Name -> skipped
 	}
 

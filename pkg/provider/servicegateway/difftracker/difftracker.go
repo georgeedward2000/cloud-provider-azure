@@ -18,11 +18,13 @@ package difftracker
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 )
@@ -115,6 +117,22 @@ func (dt *DiffTracker) SetServiceLister(lister corelisters.ServiceLister) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 	dt.serviceLister = lister
+}
+
+// SetEventRecorder publishes the recorder used to emit Service Gateway pod events. Set post-init,
+// before the egress pod informer starts.
+func (dt *DiffTracker) SetEventRecorder(recorder record.EventRecorder) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.eventRecorder = recorder
+}
+
+// SetEndpointSlicesCache publishes the provider's shared EndpointSlice cache, replayed by
+// ReconcileNodeIPChange. Set post-init, before the node informer handlers run.
+func (dt *DiffTracker) SetEndpointSlicesCache(cache *sync.Map) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.endpointSlicesCache = cache
 }
 
 // lockWithLatency acquires dt.mu and returns a release function that unlocks it and,

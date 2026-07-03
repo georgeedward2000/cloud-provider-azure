@@ -46,10 +46,10 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 	azureconfig "sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/privatelinkservice"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/routetable"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/securitygroup"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/subnet"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/zone"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
@@ -534,24 +534,11 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 			difftracker.RegisterMetrics()
 			difftracker.RecordServiceGatewayEnabled()
 
-			sgwName := consts.DefaultServiceGatewayResourceName
-			exists, err := az.existsServiceGateway(ctx, sgwName)
-			if err != nil {
-				return fmt.Errorf("InitializeCloudFromConfig: failed to check if Service Gateway %s exists: %w", sgwName, err)
-			}
-			if !exists {
-				err = az.createServiceGateway(ctx, sgwName)
-				if err != nil {
-					return fmt.Errorf("InitializeCloudFromConfig: failed to create Service Gateway %s: %w", sgwName, err)
-				}
-			}
-
-			err = az.attachServiceGatewayToSubnet(ctx)
-			if err != nil {
-				return fmt.Errorf("InitializeCloudFromConfig: failed to attach Service Gateway %s to subnet %s: %w", sgwName, az.SubnetName, err)
-			}
+			// Service Gateway resources (the gateway, its subnet attachment, and the default outbound
+			// service) are provisioned by the AKS resource provider before CCM starts.
 
 			// Initialize difftracker from cluster state
+			sgwName := consts.DefaultServiceGatewayResourceName
 			dtConfig := difftracker.Config{
 				SubscriptionID:             az.SubscriptionID,
 				ResourceGroup:              az.ResourceGroup,
@@ -566,15 +553,16 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 				klog.Errorf("InitializeCloudFromConfig: failed to initialize difftracker: %s", err.Error())
 				return err
 			}
+
+			// The difftracker owns the egress pod informer and the node-IP reconciler; publish the
+			// deps they need (event recorder and the shared EndpointSlice cache).
+			az.diffTracker.SetEventRecorder(az.eventRecorder)
+			az.diffTracker.SetEndpointSlicesCache(&az.endpointSlicesCache)
+
 			// Cover the ordering where SetInformers has already run: hand the existing lister to
 			// the freshly built difftracker. When SetInformers runs later it publishes the lister.
 			if az.serviceLister != nil {
 				az.diffTracker.SetServiceLister(az.serviceLister)
-			}
-
-			err = az.ensureDefaultOutboundServiceExists(ctx)
-			if err != nil {
-				return fmt.Errorf("InitializeCloudFromConfig: failed to ensure default outbound service exists: %w", err)
 			}
 
 			// Note: ServiceUpdater and LocationsUpdater are already started by InitializeFromCluster
@@ -781,10 +769,10 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 			node := obj.(*v1.Node)
 			az.updateNodeCaches(nil, node)
 			az.updateNodeTaint(node)
-			if az.ServiceGatewayEnabled {
+			if az.ServiceGatewayEnabled && az.diffTracker != nil {
 				// A pod scheduled to a node not yet in the cache is dropped by the EndpointSlice
 				// handler; replay this node's slices now that its IPs are known.
-				az.reconcileServiceGatewayNodeIPChange(node.Name, nil, getNodePrivateIPAddresses(node))
+				az.diffTracker.ReconcileNodeIPChange(node.Name, nil, getNodePrivateIPAddresses(node))
 			}
 		},
 		UpdateFunc: func(prev, obj interface{}) {
@@ -792,14 +780,14 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 			newNode := obj.(*v1.Node)
 			az.updateNodeCaches(prevNode, newNode)
 			az.updateNodeTaint(newNode)
-			if az.ServiceGatewayEnabled {
+			if az.ServiceGatewayEnabled && az.diffTracker != nil {
 				// A node InternalIP change does not alter its EndpointSlices (they carry nodeName,
 				// not the node IP), so no slice event fires; move the resident pods off the old IP.
 				oldIPs := getNodePrivateIPAddresses(prevNode)
 				newIPs := getNodePrivateIPAddresses(newNode)
 				oldSet, newSet := utilsets.NewString(oldIPs...), utilsets.NewString(newIPs...)
 				if oldSet.Difference(newSet).Len() != 0 || newSet.Difference(oldSet).Len() != 0 {
-					az.reconcileServiceGatewayNodeIPChange(newNode.Name, oldIPs, newIPs)
+					az.diffTracker.ReconcileNodeIPChange(newNode.Name, oldIPs, newIPs)
 				}
 			}
 		},
@@ -824,11 +812,11 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 			klog.V(4).Infof("Removing node %s from VMSet cache.", node.Name)
 			_ = az.VMSet.DeleteCacheForNode(context.Background(), node.Name)
 
-			if az.ServiceGatewayEnabled {
+			if az.ServiceGatewayEnabled && az.diffTracker != nil {
 				// The node is gone from the cache before its endpoint-removal slice events arrive,
 				// so those events would resolve an empty old location and drain nothing; drain the
 				// resident pods here using the deleted node's own IPs.
-				az.reconcileServiceGatewayNodeIPChange(node.Name, getNodePrivateIPAddresses(node), nil)
+				az.diffTracker.ReconcileNodeIPChange(node.Name, getNodePrivateIPAddresses(node), nil)
 			}
 		},
 	})
@@ -846,8 +834,8 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 
 	az.setUpEndpointSlicesInformer(informerFactory)
 
-	if az.ServiceGatewayEnabled {
-		az.setUpPodInformerForEgress()
+	if az.ServiceGatewayEnabled && az.diffTracker != nil {
+		az.diffTracker.SetUpPodInformer()
 	}
 }
 

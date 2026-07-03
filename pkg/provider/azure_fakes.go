@@ -17,8 +17,6 @@ limitations under the License.
 package provider
 
 import (
-	"net/netip"
-
 	"go.uber.org/mock/gomock"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
@@ -47,10 +45,10 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/privatelinkservice"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/routetable"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/securitygroup"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/subnet"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/zone"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
@@ -230,18 +228,6 @@ func GetTestCloudWithContainerLoadBalancer(ctrl *gomock.Controller) (az *Cloud) 
 	)
 	if err != nil {
 		panic("GetTestCloudWithContainerLoadBalancer: failed to initialize diffTracker: " + err.Error())
-	}
-	return az
-}
-
-func GetTestCloudWithContainerLoadBalancerAndPrefixCidr(ctrl *gomock.Controller, isIPv6 bool) (az *Cloud) {
-	az = GetTestCloudWithContainerLoadBalancer(ctrl)
-	if !isIPv6 {
-		prefix, _ := netip.ParsePrefix("10.0.0.1/32")
-		az.PodCidrsIPv4 = []netip.Prefix{prefix}
-	} else {
-		prefix, _ := netip.ParsePrefix("2001:db8::/64")
-		az.PodCidrsIPv6 = []netip.Prefix{prefix}
 	}
 	return az
 }

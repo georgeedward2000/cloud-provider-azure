@@ -47,8 +47,8 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/loadbalancer"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/trace"
 	"sigs.k8s.io/cloud-provider-azure/pkg/trace/attributes"
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/errutils"
@@ -423,46 +423,14 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 			return service.Status.LoadBalancer.DeepCopy(), nil
 		}
 
-		// Fail fast on specs the PodIP backend cannot support and surface the reason on the Service.
-		// Otherwise the difftracker terminal-parks the create asynchronously and the Service sits
-		// pending with no visible cause. ipFamilies has at most two entries (two == dual-stack), and a
-		// string targetPort names a container port that cannot be resolved to a PodIP backend port.
-		if len(inboundConfig.IPFamilies) > 1 {
-			err = fmt.Errorf("dual-stack Services are not supported when ServiceGateway is enabled (ipFamilies=%v); use a single-stack Service", service.Spec.IPFamilies)
-			az.Event(service, v1.EventTypeWarning, "UnsupportedDualStack", err.Error())
-			return nil, err
-		}
-		if len(inboundConfig.NamedTargetPorts) > 0 {
-			err = fmt.Errorf("named targetPort(s) %v are not supported when ServiceGateway is enabled; use a numeric targetPort", inboundConfig.NamedTargetPorts)
-			az.Event(service, v1.EventTypeWarning, "UnsupportedNamedTargetPort", err.Error())
-			return nil, err
-		}
-		// The PodIP backend only programs TCP and UDP load-balancing rules; any other protocol
-		// (e.g. SCTP) would otherwise terminal-park the create asynchronously with no visible cause.
-		for _, fp := range inboundConfig.FrontendPorts {
-			if !strings.EqualFold(fp.Protocol, "TCP") && !strings.EqualFold(fp.Protocol, "UDP") {
-				err = fmt.Errorf("protocol %q is not supported when ServiceGateway is enabled (service port %d); use TCP or UDP", fp.Protocol, fp.Port)
-				az.Event(service, v1.EventTypeWarning, "UnsupportedProtocol", err.Error())
-				return nil, err
+		// Fail fast on specs the PodIP backend cannot support and surface the reason on the Service;
+		// otherwise the difftracker terminal-parks the create asynchronously with no visible cause.
+		if verr := difftracker.ValidateInboundConfig(inboundConfig); verr != nil {
+			var ve *difftracker.InboundConfigValidationError
+			if errors.As(verr, &ve) {
+				az.Event(service, v1.EventTypeWarning, ve.Reason, ve.Message)
 			}
-		}
-		// Two service ports mapping to the same (protocol, backend/targetPort) collide on the PodIP
-		// backend pool (Azure's RulesUseSameBackendPortProtocolAndPool with floating IP disabled).
-		// buildInboundServiceResources rejects this terminally, so pre-check it here to surface the
-		// cause on the Service instead of leaving it parked Pending with no event.
-		seenBackend := make(map[string]int32, len(inboundConfig.FrontendPorts))
-		for i, fp := range inboundConfig.FrontendPorts {
-			backendPort := fp.Port
-			if i < len(inboundConfig.BackendPorts) {
-				backendPort = inboundConfig.BackendPorts[i].Port
-			}
-			key := fmt.Sprintf("%s/%d", strings.ToUpper(fp.Protocol), backendPort)
-			if prevPort, ok := seenBackend[key]; ok {
-				err = fmt.Errorf("service ports %d and %d both map to backend port %d over %s, which is not supported when ServiceGateway is enabled; distinct service ports must use distinct targetPorts", prevPort, fp.Port, backendPort, strings.ToUpper(fp.Protocol))
-				az.Event(service, v1.EventTypeWarning, "UnsupportedBackendPortCollision", err.Error())
-				return nil, err
-			}
-			seenBackend[key] = fp.Port
+			return nil, verr
 		}
 
 		config := difftracker.NewInboundServiceConfig(serviceUID, inboundConfig)
@@ -3484,14 +3452,10 @@ func (az *Cloud) reconcileSecurityGroup(
 
 	lbIPAddresses, _ := iputil.ParseAddresses(lbIPs)
 	var (
-		dstIPv4Addresses, dstIPv6Addresses         []netip.Addr
-		dstIpv4AddressPrefix, dstIpv6AddressPrefix []netip.Prefix
+		dstIPv4Addresses, dstIPv6Addresses []netip.Addr
 	)
 
-	if az.ServiceGatewayEnabled {
-		dstIpv4AddressPrefix = az.PodCidrsIPv4
-		dstIpv6AddressPrefix = az.PodCidrsIPv6
-	} else {
+	{
 		var (
 			disableFloatingIP                                = consts.IsK8sServiceDisableLoadBalancerFloatingIP(service)
 			lbIPv4Addresses, lbIPv6Addresses                 = iputil.GroupAddressesByFamily(lbIPAddresses)
@@ -3540,7 +3504,7 @@ func (az *Cloud) reconcileSecurityGroup(
 	}
 
 	if wantLb {
-		err := accessControl.PatchSecurityGroup(dstIPv4Addresses, dstIPv6Addresses, dstIpv4AddressPrefix, dstIpv6AddressPrefix)
+		err := accessControl.PatchSecurityGroup(dstIPv4Addresses, dstIPv6Addresses)
 		if err != nil {
 			logger.Error(err, "Failed to patch security group")
 			return nil, err

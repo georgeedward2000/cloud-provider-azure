@@ -24,6 +24,7 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
@@ -428,6 +429,11 @@ type DiffTracker struct {
 	// SetServiceLister once SetInformers has run. It is nil until then (and in tests), in which
 	// case getServiceByUID falls back to a direct apiserver read. Guarded by mu.
 	serviceLister corelisters.ServiceLister
+
+	// eventRecorder emits Service Gateway pod events; set post-init before the egress informer starts.
+	eventRecorder record.EventRecorder
+	// endpointSlicesCache is the provider's shared EndpointSlice cache, replayed by ReconcileNodeIPChange.
+	endpointSlicesCache *sync.Map
 
 	// Engine state management
 	pendingServiceOps       map[string]*ServiceOperationState
