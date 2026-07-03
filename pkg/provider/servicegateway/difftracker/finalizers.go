@@ -367,6 +367,21 @@ type pendingPodToProcess struct {
 	UID       string
 }
 
+// HasPendingPodDeletion reports whether a drain-gated deletion is still pending for the pod, i.e.
+// an earlier delete event recorded addresses that have not yet drained from NRP. The UID check
+// (an empty uid matches any) prevents a stale record left by a same-name replacement from matching.
+// Callers use it to avoid stripping the pod-cleanup finalizer inline while a drain is in flight -
+// notably when the kubelet has cleared the terminating pod's IPs, so the delete event carries none.
+func (dt *DiffTracker) HasPendingPodDeletion(namespace, name, uid string) bool {
+	if namespace == "" || name == "" {
+		return false
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	existing, ok := dt.pendingPodDeletions[fmt.Sprintf("%s/%s", namespace, name)]
+	return ok && (uid == "" || existing.UID == uid)
+}
+
 // CheckPendingPodDeletions checks pending pod deletions and removes finalizers for non-last pods
 // whose addresses have been synced to NRP.
 // For non-last pods (isLastPod=false): remove finalizer immediately after location sync

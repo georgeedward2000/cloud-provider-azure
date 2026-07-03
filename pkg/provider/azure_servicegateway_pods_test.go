@@ -739,6 +739,102 @@ func TestPodInformerDrainForReplace_SoleDualStackGainKeepsSharedAddress(t *testi
 	assert.True(t, res.Enqueued)
 }
 
+// TestPodInformerRemovePod_NoIPDeleteKeepsFinalizerWhileDrainPending checks that a terminating egress
+// pod whose IPs the kubelet already cleared keeps its cleanup finalizer while an earlier drain is
+// pending: stripping it inline would reclaim the pod (and its IP) while the NAT Gateway still maps the
+// address, misrouting egress. CheckPendingPodDeletions strips it once NRP confirms the drain.
+func TestPodInformerRemovePod_NoIPDeleteKeepsFinalizerWhileDrainPending(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const (
+		egress = "egress-svc"
+		hostIP = "10.0.0.1"
+		v4     = "10.244.0.1"
+	)
+
+	k8s := difftracker.K8sState{
+		Services: utilsets.NewString(),
+		Egresses: utilsets.NewString(egress),
+		Nodes: map[string]difftracker.Node{
+			hostIP: {Pods: map[string]difftracker.Pod{
+				v4: {InboundIdentities: utilsets.NewString(), PublicOutboundIdentity: egress},
+			}},
+		},
+	}
+	nrp := difftracker.NRPState{
+		LoadBalancers: utilsets.NewString(),
+		NATGateways:   utilsets.NewString(egress),
+		Locations:     make(map[string]difftracker.NRPLocation),
+	}
+
+	newPod := func(withIPs bool) *v1.Pod {
+		status := v1.PodStatus{Phase: v1.PodRunning}
+		if withIPs {
+			status.HostIP = hostIP
+			status.PodIP = v4
+			status.PodIPs = []v1.PodIP{{IP: v4}}
+		}
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "pod-a", Namespace: "default", UID: types.UID("uid-a"),
+				Labels:     map[string]string{consts.PodLabelServiceEgressGateway: egress},
+				Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+			},
+			Status: status,
+		}
+	}
+
+	kube := fake.NewSimpleClientset(newPod(true))
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = seededProviderDiffTracker(t, az, kube, k8s, nrp)
+
+	// First termination event still carries the IPs: it drain-gates the address (Enqueued) and keeps
+	// the finalizer for the drain-gate.
+	az.podInformerRemovePod(newPod(true))
+	assert.True(t, az.diffTracker.HasPendingPodDeletion("default", "pod-a", "uid-a"),
+		"the with-IP delete must record a pending drain")
+
+	// Second event arrives after the kubelet cleared the IPs. The finalizer must NOT be stripped.
+	az.podInformerRemovePod(newPod(false))
+
+	got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-a", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Contains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+		"a no-IP delete must not strip the finalizer while a drain is still pending")
+	assert.True(t, az.diffTracker.HasPendingPodDeletion("default", "pod-a", "uid-a"),
+		"the pending drain must remain until NRP confirms the address is gone")
+}
+
+// TestPodInformerRemovePod_NoIPDeleteStripsUntrackedPod checks the complementary case: a no-IP egress
+// pod the engine never registered (no pending drain) still has its finalizer removed directly.
+func TestPodInformerRemovePod_NoIPDeleteStripsUntrackedPod(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-b", Namespace: "default", UID: types.UID("uid-b"),
+			Labels:     map[string]string{consts.PodLabelServiceEgressGateway: "egress-svc"},
+			Finalizers: []string{difftracker.ServiceGatewayPodCleanupFinalizer},
+		},
+		Status: v1.PodStatus{Phase: v1.PodFailed},
+	}
+	kube := fake.NewSimpleClientset(pod)
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	az.KubeClient = kube
+	az.diffTracker = newProviderDiffTracker(t, az, kube)
+
+	az.podInformerRemovePod(pod)
+
+	got, err := kube.CoreV1().Pods("default").Get(context.Background(), "pod-b", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.NotContains(t, got.Finalizers, difftracker.ServiceGatewayPodCleanupFinalizer,
+		"an untracked no-IP pod with no pending drain must have its finalizer removed to avoid stranding")
+}
+
+
 // TestReconcileEgressPodUpdate_LiveReRegistrationKeepsFinalizerAndReAdds drives the real update
 // executor end-to-end on a live engine: a dual-stack pod that gains a secondary family
 // ([v4] -> [v4,v6]) is a live re-registration. The executor must drain the old set without a
@@ -933,9 +1029,22 @@ func TestEgressPodUpdateActions(t *testing.T) {
 			wantRemove: true,
 		},
 		{
-			name:   "Pod transitions from Failed to Running (was not previously tracked)",
-			oldPod: newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil),
-			newPod: newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			name:    "Pod recovers to Running from an invalid phase with unchanged IPs",
+			oldPod:  newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil),
+			newPod:  newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			wantAdd: true,
+		},
+		{
+			name:       "Egress pod goes Unknown while keeping its IPs",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodUnknown, nil),
+			wantRemove: true,
+		},
+		{
+			name:    "Egress pod recovers from Unknown to Running with the same IPs",
+			oldPod:  newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodUnknown, nil),
+			newPod:  newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			wantAdd: true,
 		},
 	}
 

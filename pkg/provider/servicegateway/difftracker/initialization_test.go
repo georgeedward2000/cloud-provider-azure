@@ -670,6 +670,25 @@ func TestCheckInitializationComplete_ParkedOpDoesNotBlockCompletion(t *testing.T
 	assert.NoError(t, dt.WaitForInitialSync(ctx), "WaitForInitialSync must complete despite the parked op")
 }
 
+// TestShouldTriggerInitialLocationSync checks that an already-tracked NRP service forces the initial
+// location sync even when additions are present and may all terminal-park (so their
+// OnServiceCreationComplete callbacks never fire).
+func TestShouldTriggerInitialLocationSync(t *testing.T) {
+	// Additions present (onlyExisting=false), no deletions or recovered items, but a service already
+	// tracked in NRP must still force the sync.
+	assert.True(t, shouldTriggerInitialLocationSync(false, false, false, true),
+		"an existing NRP service must trigger the initial sync even when every addition may park")
+
+	// No signal at all: nothing to sync.
+	assert.False(t, shouldTriggerInitialLocationSync(false, false, false, false),
+		"no deletions, additions, recovered items, or existing NRP services means no initial sync")
+
+	// The pre-existing sufficient conditions each still trigger on their own.
+	assert.True(t, shouldTriggerInitialLocationSync(true, false, false, false), "deletions must trigger")
+	assert.True(t, shouldTriggerInitialLocationSync(false, true, false, false), "no additions (only existing services) must trigger")
+	assert.True(t, shouldTriggerInitialLocationSync(false, false, true, false), "recovered finalizer items must trigger")
+}
+
 // TestCheckInitializationComplete_InProgressOpBlocksCompletion verifies the other direction: an op that is
 // genuinely still in flight (not parked, not created) keeps initial sync open.
 func TestCheckInitializationComplete_InProgressOpBlocksCompletion(t *testing.T) {

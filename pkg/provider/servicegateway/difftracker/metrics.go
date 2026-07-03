@@ -191,6 +191,18 @@ var (
 		},
 	)
 
+	// locationSyncTerminalErrorsTotal counts NRP location syncs abandoned because NRP returned a
+	// deterministic client error (e.g. HTTP 400) that retrying cannot fix. NRP address state then
+	// diverges from desired until the offending change is corrected; a non-zero value must be alerted on.
+	locationSyncTerminalErrorsTotal = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Subsystem:      diffTrackerSubsystem,
+			Name:           "location_sync_terminal_errors_total",
+			Help:           "Total count of NRP location syncs abandoned due to a deterministic (non-retryable) error",
+			StabilityLevel: metrics.ALPHA,
+		},
+	)
+
 	// ========================================================================
 	// Stuck detection metric (addresses David's review comment)
 	// ========================================================================
@@ -227,6 +239,7 @@ func RegisterMetrics() {
 		legacyregistry.MustRegister(orphanedResourcesCleanedTotal)
 		legacyregistry.MustRegister(finalizersRecoveredTotal)
 		legacyregistry.MustRegister(podFinalizerAddFailedTotal)
+		legacyregistry.MustRegister(locationSyncTerminalErrorsTotal)
 		legacyregistry.MustRegister(initializationDurationSeconds)
 		legacyregistry.MustRegister(pendingOperationOldestAgeSeconds)
 	})
@@ -353,6 +366,12 @@ func recordOrphanedResourceCleaned() {
 // recordFinalizerRecovered increments the counter for each recovered finalizer
 func recordFinalizerRecovered() {
 	finalizersRecoveredTotal.Inc()
+}
+
+// recordLocationSyncTerminalError increments the counter of NRP location syncs abandoned due to a
+// deterministic, non-retryable error.
+func recordLocationSyncTerminalError() {
+	locationSyncTerminalErrorsTotal.Inc()
 }
 
 // RecordPodFinalizerAddFailed increments the counter for an egress pod that was registered without

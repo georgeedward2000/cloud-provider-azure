@@ -446,6 +446,24 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 				return nil, err
 			}
 		}
+		// Two service ports mapping to the same (protocol, backend/targetPort) collide on the PodIP
+		// backend pool (Azure's RulesUseSameBackendPortProtocolAndPool with floating IP disabled).
+		// buildInboundServiceResources rejects this terminally, so pre-check it here to surface the
+		// cause on the Service instead of leaving it parked Pending with no event.
+		seenBackend := make(map[string]int32, len(inboundConfig.FrontendPorts))
+		for i, fp := range inboundConfig.FrontendPorts {
+			backendPort := fp.Port
+			if i < len(inboundConfig.BackendPorts) {
+				backendPort = inboundConfig.BackendPorts[i].Port
+			}
+			key := fmt.Sprintf("%s/%d", strings.ToUpper(fp.Protocol), backendPort)
+			if prevPort, ok := seenBackend[key]; ok {
+				err = fmt.Errorf("service ports %d and %d both map to backend port %d over %s, which is not supported when ServiceGateway is enabled; distinct service ports must use distinct targetPorts", prevPort, fp.Port, backendPort, strings.ToUpper(fp.Protocol))
+				az.Event(service, v1.EventTypeWarning, "UnsupportedBackendPortCollision", err.Error())
+				return nil, err
+			}
+			seenBackend[key] = fp.Port
+		}
 
 		config := difftracker.NewInboundServiceConfig(serviceUID, inboundConfig)
 		config.Namespace = service.Namespace

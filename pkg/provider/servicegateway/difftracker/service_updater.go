@@ -371,7 +371,7 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 
 	// Bound the operation so a hung/slow Azure call fails into retry instead of holding the
 	// ServiceUpdater semaphore slot forever (see nrpOperationTimeout).
-	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
 	defer cancel()
 
 	// Step 0: Add finalizer to K8s service to prevent deletion until Azure resources are cleaned up
@@ -510,7 +510,7 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 func (s *ServiceUpdater) updateInboundService(serviceUID string, config *InboundConfig, correlationID string) {
 	s.logger.V(5).Info("Started updating inbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
 	defer cancel()
 
 	// Rebuild the LB ARM model from the new config. We discard the PIP and DTO portions
@@ -547,7 +547,7 @@ func (s *ServiceUpdater) updateInboundService(serviceUID string, config *Inbound
 func (s *ServiceUpdater) createOutboundService(serviceUID string, config *OutboundConfig, correlationID string, triggeringPodNS string, triggeringPodName string) {
 	s.logger.V(5).Info("Started creating outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "pod", triggeringPodNS+"/"+triggeringPodName)
 
-	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
 	defer cancel()
 
 	// Step 1: Build resources using shared helper
@@ -598,7 +598,7 @@ func (s *ServiceUpdater) createOutboundService(serviceUID string, config *Outbou
 func (s *ServiceUpdater) deleteInboundService(serviceUID string, correlationID string) {
 	s.logger.V(5).Info("Started deleting inbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
 	defer cancel()
 	var lastErr error
 
@@ -706,7 +706,7 @@ func (s *ServiceUpdater) deleteInboundService(serviceUID string, correlationID s
 func (s *ServiceUpdater) deleteOutboundService(serviceUID string, correlationID string) {
 	s.logger.V(5).Info("Started deleting outbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	ctx, cancel := context.WithTimeout(s.ctx, nrpOperationTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
 	defer cancel()
 	var lastErr error
 

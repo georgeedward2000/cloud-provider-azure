@@ -3,6 +3,7 @@ package difftracker
 import (
 	"context"
 	"math/rand"
+	"net/http"
 	"sync/atomic"
 	"time"
 
@@ -17,13 +18,21 @@ const (
 	locationsRetryMaxDelay  = 30 * time.Second
 )
 
-// nrpOperationTimeout bounds a single NRP/Azure operation attempt (a location sync in the
+// defaultNRPOperationTimeout bounds a single NRP/Azure operation attempt (a location sync in the
 // LocationsUpdater, or a service create/update/delete in the ServiceUpdater). Normal operations
 // complete in seconds; the timeout exists only so a hung or pathologically slow ARM call fails into
 // the existing bounded-retry/park logic instead of pinning the single LocationsUpdater worker or
 // permanently holding a ServiceUpdater semaphore slot. It is generous to avoid aborting a legitimate
-// long-running LRO. A var (not const) so tests can shorten it.
-var nrpOperationTimeout = 5 * time.Minute
+// long-running LRO.
+const defaultNRPOperationTimeout = 5 * time.Minute
+
+// nrpOperationTimeout holds the operation timeout in nanoseconds. Stored atomically so it can be
+// overridden without racing the updater goroutines that read it via getNRPOperationTimeout.
+var nrpOperationTimeout atomic.Int64
+
+func init() { nrpOperationTimeout.Store(int64(defaultNRPOperationTimeout)) }
+
+func getNRPOperationTimeout() time.Duration { return time.Duration(nrpOperationTimeout.Load()) }
 
 // LocationsUpdater syncs location and address changes to NRP Service Gateway
 type LocationsUpdater struct {
@@ -69,7 +78,7 @@ func (lu *LocationsUpdater) Run() {
 			lu.logger.V(4).Info("Triggered LocationsUpdater")
 			// Bound each attempt so a hung/slow NRP call cannot pin the single worker and starve all
 			// other services' location/finalizer syncs; a timeout fails into the deferred backoffAndRetry.
-			attemptCtx, cancel := context.WithTimeout(lu.ctx, nrpOperationTimeout)
+			attemptCtx, cancel := context.WithTimeout(lu.ctx, getNRPOperationTimeout())
 			lu.process(attemptCtx)
 			cancel()
 		}
@@ -88,6 +97,9 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	mc := metrics.NewMetricContext("locations", "LocationsUpdater.process",
 		lu.diffTracker.config.ResourceGroup, lu.diffTracker.config.SubscriptionID, "sync")
 	isOperationSucceeded := false
+	// terminalSyncErr is set when NRP rejects the batch with a deterministic error that retrying the
+	// identical payload cannot fix; it suppresses the self-rescheduling backoff below.
+	terminalSyncErr := false
 	var numLocations, numAddresses int
 
 	defer func() {
@@ -100,9 +112,15 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 		// runs BEFORE the in-flight trigger counter is decremented below, so initialization
 		// stays blocked (WaitForInitialSync) until a sync actually succeeds. On success,
 		// reset the backoff. The retry wait is cancellable via the updater context.
-		if isOperationSucceeded {
+		//
+		// A terminal (deterministic) failure is the exception (see the terminalSyncErr branch in
+		// process): do not self-reschedule. Init accounting still proceeds so it cannot block init.
+		switch {
+		case isOperationSucceeded:
 			lu.failureCount = 0
-		} else {
+		case terminalSyncErr:
+			lu.failureCount = 0
+		default:
 			lu.backoffAndRetry()
 		}
 
@@ -161,6 +179,17 @@ func (lu *LocationsUpdater) process(ctx context.Context) {
 	// Call NRP Service Gateway API to update locations/addresses
 	err := lu.diffTracker.updateNRPSGWAddressLocations(ctx, lu.diffTracker.config.ServiceGatewayResourceName, locationsDTO)
 	if err != nil {
+		if httpStatus, errCode := extractAzureErrorInfo(err); isTerminalLocationSyncStatus(httpStatus) {
+			// Deterministic NRP rejection (e.g. 400): the identical batch can never be accepted, so
+			// retrying would spin the single worker forever and starve every other service's
+			// location/finalizer sync. Abandon this batch; the next real change recomputes the diff
+			// and re-attempts. Surfaced via metric + error log so operators see NRP state diverging.
+			terminalSyncErr = true
+			recordLocationSyncTerminalError()
+			lu.logger.Error(err, "Terminal error syncing locations to NRP; not retrying until the next change",
+				"httpStatus", httpStatus, "errorCode", errCode)
+			return
+		}
 		lu.logger.V(4).Info("Could not sync locations to NRP", "err", err, "attempt", lu.failureCount+1)
 		// Leave isOperationSucceeded=false so the deferred backoffAndRetry re-triggers a
 		// sync; the diff is recomputed fresh on the next pass, so no state is lost.
@@ -224,20 +253,37 @@ func computeRetryBackoff(attempt int) time.Duration {
 	return delay
 }
 
+// isTerminalLocationSyncStatus reports whether an NRP location-sync HTTP status is a deterministic
+// client error that retrying the identical payload cannot fix (a malformed or unprocessable batch).
+// Throttling (429), conflict (409), not-found (404) and 5xx are transient and remain retryable.
+func isTerminalLocationSyncStatus(httpStatus int) bool {
+	return httpStatus == http.StatusBadRequest || httpStatus == http.StatusUnprocessableEntity
+}
+
 // backoffAndRetry waits a bounded, jittered delay and then re-triggers the LocationsUpdater
 // so a failed NRP/ARM sync is retried instead of stalling until an unrelated future trigger.
 // It must be called from process() BEFORE the in-flight trigger counter is decremented, so
-// initialization stays blocked until a sync actually succeeds. The wait is cancellable via
-// the updater context (shutdown), and a concurrently buffered trigger simply shortcuts it.
+// initialization stays blocked until a sync actually succeeds. The wait is cancellable via the
+// updater context (shutdown), and post-initialization a buffered trigger shortcuts it.
 func (lu *LocationsUpdater) backoffAndRetry() {
 	lu.failureCount++
 	delay := computeRetryBackoff(lu.failureCount)
 
 	lu.logger.V(4).Info("Scheduled NRP location sync retry", "delay", delay, "attempt", lu.failureCount)
 
+	// Post-initialization, a trigger buffered by a fresh cluster change shortcuts the wait so it is
+	// not delayed up to locationsRetryMaxDelay behind this retry; the re-trigger below coalesces with
+	// the consumed token into a single process pass. During initialization wake stays nil so the wait
+	// runs in full: consuming the token there would unbalance the in-flight trigger accounting that
+	// WaitForInitialSync depends on.
+	var wake <-chan bool
+	if atomic.LoadInt32(&lu.diffTracker.isInitializing) == 0 {
+		wake = lu.diffTracker.locationsUpdaterTrigger
+	}
 	select {
 	case <-lu.ctx.Done():
 		return
+	case <-wake:
 	case <-time.After(delay):
 	}
 	lu.diffTracker.triggerLocationsUpdater()

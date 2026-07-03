@@ -781,12 +781,27 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 			node := obj.(*v1.Node)
 			az.updateNodeCaches(nil, node)
 			az.updateNodeTaint(node)
+			if az.ServiceGatewayEnabled {
+				// A pod scheduled to a node not yet in the cache is dropped by the EndpointSlice
+				// handler; replay this node's slices now that its IPs are known.
+				az.reconcileServiceGatewayNodeIPChange(node.Name, nil, getNodePrivateIPAddresses(node))
+			}
 		},
 		UpdateFunc: func(prev, obj interface{}) {
 			prevNode := prev.(*v1.Node)
 			newNode := obj.(*v1.Node)
 			az.updateNodeCaches(prevNode, newNode)
 			az.updateNodeTaint(newNode)
+			if az.ServiceGatewayEnabled {
+				// A node InternalIP change does not alter its EndpointSlices (they carry nodeName,
+				// not the node IP), so no slice event fires; move the resident pods off the old IP.
+				oldIPs := getNodePrivateIPAddresses(prevNode)
+				newIPs := getNodePrivateIPAddresses(newNode)
+				oldSet, newSet := utilsets.NewString(oldIPs...), utilsets.NewString(newIPs...)
+				if oldSet.Difference(newSet).Len() != 0 || newSet.Difference(oldSet).Len() != 0 {
+					az.reconcileServiceGatewayNodeIPChange(newNode.Name, oldIPs, newIPs)
+				}
+			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			node, isNode := obj.(*v1.Node)
@@ -808,6 +823,13 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 
 			klog.V(4).Infof("Removing node %s from VMSet cache.", node.Name)
 			_ = az.VMSet.DeleteCacheForNode(context.Background(), node.Name)
+
+			if az.ServiceGatewayEnabled {
+				// The node is gone from the cache before its endpoint-removal slice events arrive,
+				// so those events would resolve an empty old location and drain nothing; drain the
+				// resident pods here using the deleted node's own IPs.
+				az.reconcileServiceGatewayNodeIPChange(node.Name, getNodePrivateIPAddresses(node), nil)
+			}
 		},
 	})
 	az.nodeInformerSynced = nodeInformer.HasSynced

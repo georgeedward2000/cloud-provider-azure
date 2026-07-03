@@ -1178,15 +1178,16 @@ type deletePodAddressOutcome struct {
 // after every address has been processed, so CheckPendingPodDeletions can never observe a partial
 // address set and strip the pod's single finalizer while another address is still registered in NRP.
 // Must be called with dt.mu held.
-func (dt *DiffTracker) deletePodAddressLocked(serviceUID, location, address string) deletePodAddressOutcome {
+func (dt *DiffTracker) deletePodAddressLocked(serviceUID, location, address, podKey string) deletePodAddressOutcome {
 	// Resolve the location the address is actually registered under: the caller's hint is the pod's
 	// primary node IP, which is wrong for a secondary-family address (see
 	// resolveOutboundAddressLocationLocked). Without this the removal would no-op as stale and leak.
 	location = dt.resolveOutboundAddressLocationLocked(serviceUID, location, address)
 
 	// If the pod is still buffered for an in-flight service creation, it never reached live state or
-	// the ref-counter. Cancel the buffered add so it is not resurrected on promotion.
-	if dt.cancelBufferedPodLocked(serviceUID, location, address) {
+	// the ref-counter. Cancel the buffered add so it is not resurrected on promotion. Match on podKey
+	// (when known) so a same-IP replacement buffered under a different pod is not cancelled too.
+	if dt.cancelBufferedPodLocked(serviceUID, location, address, podKey) {
 		dt.logger.V(5).Info("Cancelled buffered pod before service creation", "service", serviceUID, "location", location, "address", address)
 		// If that was the service's only pod, tear down the pod-less NAT Gateway so it is not leaked.
 		dt.handleEmptyOutboundServiceLocked(serviceUID)
@@ -1285,11 +1286,18 @@ func (dt *DiffTracker) DeletePod(serviceUID, location string, addresses []string
 
 	var drainGated []string
 	triggerSync := false
+	// Identity of the pod being deleted, when the caller supplied it. Used to cancel only THIS pod's
+	// buffered add (not a same-IP replacement). Empty for identity-less callers (the live
+	// re-registration drain and init reconciliation), which fall back to address-only matching.
+	var identityPodKey string
+	if namespace != "" && name != "" {
+		identityPodKey = fmt.Sprintf("%s/%s", namespace, name)
+	}
 	for _, address := range addresses {
 		if address == "" {
 			continue
 		}
-		outcome := dt.deletePodAddressLocked(serviceUID, location, address)
+		outcome := dt.deletePodAddressLocked(serviceUID, location, address, identityPodKey)
 		if outcome.triggerSync {
 			triggerSync = true
 		}
@@ -1410,13 +1418,16 @@ func (dt *DiffTracker) handleEmptyOutboundServiceLocked(serviceUID string) {
 	}
 }
 
-// cancelBufferedPodLocked removes any buffered (not-yet-promoted) pod entries for a
-// service that match the given location/address. It returns true if at least one
-// entry was removed. Pods buffered during StateNotStarted/StateCreationInProgress are
-// not yet in live state or the ref-counter, so a deletion in that window must cancel
-// the buffered add; otherwise promotePendingPodsLocked would resurrect the deleted pod.
-// Must be called with dt.mu held.
-func (dt *DiffTracker) cancelBufferedPodLocked(serviceUID, location, address string) bool {
+// cancelBufferedPodLocked removes buffered (not-yet-promoted) pod entries for a service that match
+// the given location/address. When podKey is non-empty it additionally requires the entry's PodKey
+// to match, so a delayed delete for one pod cannot cancel a DIFFERENT pod that reused the same IP
+// while buffered during in-flight service creation (which would strand the live replacement without
+// egress). An empty podKey preserves address-only matching for identity-less callers (the live
+// re-registration drain and init reconciliation). It returns true if at least one entry was removed.
+// Pods buffered during StateNotStarted/StateCreationInProgress are not yet in live state or the
+// ref-counter, so a deletion in that window must cancel the buffered add; otherwise
+// promotePendingPodsLocked would resurrect the deleted pod. Must be called with dt.mu held.
+func (dt *DiffTracker) cancelBufferedPodLocked(serviceUID, location, address, podKey string) bool {
 	buffered, exists := dt.pendingPods[serviceUID]
 	if !exists || len(buffered) == 0 {
 		return false
@@ -1424,7 +1435,7 @@ func (dt *DiffTracker) cancelBufferedPodLocked(serviceUID, location, address str
 	kept := buffered[:0]
 	removed := false
 	for _, pod := range buffered {
-		if pod.Location == location && pod.Address == address {
+		if pod.Location == location && pod.Address == address && (podKey == "" || pod.PodKey == podKey) {
 			removed = true
 			continue
 		}

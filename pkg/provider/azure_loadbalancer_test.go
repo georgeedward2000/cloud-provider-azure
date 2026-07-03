@@ -41,6 +41,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -9650,6 +9651,34 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 			assert.Contains(t, ev, "UnsupportedProtocol")
 		case <-time.After(time.Second):
 			t.Fatal("expected UnsupportedProtocol warning event")
+		}
+	})
+
+	t.Run("backend-port collision service is rejected with a warning event", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		// Two distinct service ports (80 and 443) both target container port 8080 over TCP, so both
+		// map to the same (protocol, backend port) on the PodIP pool - Azure's
+		// RulesUseSameBackendPortProtocolAndPool. This is legal Kubernetes but unsupported here, and
+		// must be surfaced synchronously rather than silently parked with no ingress IP or event.
+		svc := getTestService("sgw-port-collision", v1.ProtocolTCP, nil, false, 80, 443)
+		for i := range svc.Spec.Ports {
+			svc.Spec.Ports[i].TargetPort = intstr.FromInt(8080)
+		}
+		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+
+		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		assert.Error(t, err)
+		assert.Nil(t, status)
+		assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+			"a rejected backend-port-collision service must not be tracked")
+
+		select {
+		case ev := <-rec.Events:
+			assert.Contains(t, ev, "UnsupportedBackendPortCollision")
+		case <-time.After(time.Second):
+			t.Fatal("expected UnsupportedBackendPortCollision warning event")
 		}
 	})
 

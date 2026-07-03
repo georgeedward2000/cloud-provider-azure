@@ -150,13 +150,18 @@ func InitializeFromCluster(
 	// so we don't need an explicit trigger here. When Additions == 0, no such callback exists.
 	hasOnlyExistingServices := syncOperations.LoadBalancerUpdates.Additions.Len() == 0 && syncOperations.NATGatewayUpdates.Additions.Len() == 0
 
-	// Check if we have pending items from recoverStuckFinalizers
+	// Check if we have pending items from recoverStuckFinalizers, and whether NRP already tracks a
+	// service. An existing NRP service may carry endpoint/location drift from cluster changes during
+	// downtime; its sync must not hinge on a new addition's OnServiceCreationComplete callback, which
+	// never fires when every addition terminal-parks (leaving the drift unsynced until an unrelated
+	// future event). So trigger the initial sync whenever any service is already tracked in NRP.
 	diffTracker.mu.Lock()
 	hasRecoveredItems := len(diffTracker.pendingPodDeletions) > 0
+	hasExistingNRPServices := diffTracker.NRPResources.LoadBalancers.Len() > 0 || diffTracker.NRPResources.NATGateways.Len() > 0
 	diffTracker.mu.Unlock()
 
-	if hasDeletions || hasOnlyExistingServices || hasRecoveredItems {
-		logger.V(2).Info("Triggered initial location sync", "deletions", hasDeletions, "onlyExisting", hasOnlyExistingServices, "recoveredItems", hasRecoveredItems)
+	if shouldTriggerInitialLocationSync(hasDeletions, hasOnlyExistingServices, hasRecoveredItems, hasExistingNRPServices) {
+		logger.V(2).Info("Triggered initial location sync", "deletions", hasDeletions, "onlyExisting", hasOnlyExistingServices, "recoveredItems", hasRecoveredItems, "existingNRPServices", hasExistingNRPServices)
 		diffTracker.triggerLocationsUpdater()
 	}
 
@@ -177,8 +182,11 @@ func InitializeFromCluster(
 	recoverServiceExternalIPs(ctx, diffTracker, serviceUIDToService, pipNameToIP)
 
 	// Cleanup any remaining orphaned PIPs (PIPs without an associated LB/NAT).
-	// This catches PIPs where the LB deletion succeeded but PIP deletion failed.
-	cleanupOrphanedPIPs(ctx, diffTracker, nil) // nil triggers fresh PIP list fetch
+	// This catches PIPs where the LB deletion succeeded but PIP deletion failed. Reuse the PIP list
+	// already fetched by buildNRPState rather than re-listing: a transient failure on a second List
+	// is swallowed (cleanupOrphanedPIPs is non-fatal) and would leak orphan PIPs that were already
+	// visible in the fetched list.
+	cleanupOrphanedPIPs(ctx, diffTracker, azurePIPs)
 
 	// Mark initialization complete
 	diffTracker.InitialSyncDone = true
@@ -192,6 +200,14 @@ func InitializeFromCluster(
 // ================================================================================================
 // Initialization helper functions - broken down from InitializeFromCluster
 // ================================================================================================
+
+// shouldTriggerInitialLocationSync reports whether initialization must fire an explicit location
+// sync. A new addition normally triggers the sync via its OnServiceCreationComplete callback, but
+// that callback never fires when every addition terminal-parks, so an existing NRP service's
+// endpoint/location drift (hasExistingNRPServices) must force the sync independently of additions.
+func shouldTriggerInitialLocationSync(hasDeletions, hasOnlyExistingServices, hasRecoveredItems, hasExistingNRPServices bool) bool {
+	return hasDeletions || hasOnlyExistingServices || hasRecoveredItems || hasExistingNRPServices
+}
 
 // validateInitializationInputs validates required inputs for initialization
 func validateInitializationInputs(kubeClient kubernetes.Interface, networkClientFactory azclient.ClientFactory) error {

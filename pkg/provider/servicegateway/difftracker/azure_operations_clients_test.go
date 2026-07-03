@@ -21,11 +21,13 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/loadbalancerclient/mock_loadbalancerclient"
@@ -430,4 +432,50 @@ func TestBuildNRPState_FailsOnPublicIPListError(t *testing.T) {
 
 	_, _, _, _, _, err := buildNRPState(context.Background(), testConfig(), mockFactory)
 	assert.Error(t, err, "a Public IP List failure must fail init so recovery is retried, not silently skipped")
+}
+
+// TestInitializeFromCluster_ReusesFetchedPIPListForOrphanCleanup verifies init hands the PIP slice
+// already fetched by buildNRPState to orphan cleanup instead of issuing a second List. That second
+// List is non-fatal, so its transient failure would be swallowed and leak an orphan already visible
+// in the first slice; List is asserted to run exactly once.
+func TestInitializeFromCluster_ReusesFetchedPIPListForOrphanCleanup(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockFactory := mock_azclient.NewMockClientFactory(ctrl)
+	mockSGW := mock_servicegatewayclient.NewMockInterface(ctrl)
+	mockLB := mock_loadbalancerclient.NewMockInterface(ctrl)
+	mockNAT := mock_natgatewayclient.NewMockInterface(ctrl)
+	mockPIP := mock_publicipaddressclient.NewMockInterface(ctrl)
+
+	mockFactory.EXPECT().GetServiceGatewayClient().Return(mockSGW).AnyTimes()
+	mockFactory.EXPECT().GetLoadBalancerClient().Return(mockLB).AnyTimes()
+	mockFactory.EXPECT().GetNatGatewayClient().Return(mockNAT).AnyTimes()
+	mockFactory.EXPECT().GetPublicIPAddressClient().Return(mockPIP).AnyTimes()
+
+	// Empty cluster and empty NRP: no ServiceGateway services/locations, no Azure LBs/NATs.
+	mockSGW.EXPECT().GetServices(gomock.Any(), "rg", "sgw").Return(nil, nil).AnyTimes()
+	mockSGW.EXPECT().GetAddressLocations(gomock.Any(), "rg", "sgw").Return(nil, nil).AnyTimes()
+	mockSGW.EXPECT().UpdateAddressLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockSGW.EXPECT().UpdateServices(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockLB.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
+	mockNAT.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
+
+	// A single detached orphan PIP (no IPConfiguration) with a non-UUID name, so ONLY
+	// cleanupOrphanedPublicIPs acts on it (scheduleOrphanedResourceDeletions skips non-UUID "-pip"
+	// names). List returns a NON-NIL slice: init must reuse it and never call List again.
+	const orphanPIP = "leftover-pip"
+	pips := []*armnetwork.PublicIPAddress{{
+		Name:       ptr.To(orphanPIP),
+		Properties: &armnetwork.PublicIPAddressPropertiesFormat{},
+	}}
+	mockPIP.EXPECT().List(gomock.Any(), "rg").Return(pips, nil).Times(1)
+	mockPIP.EXPECT().Delete(gomock.Any(), "rg", orphanPIP).Return(nil).Times(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dt, err := InitializeFromCluster(ctx, testConfig(), mockFactory, fake.NewSimpleClientset())
+	assert.NoError(t, err)
+	assert.NotNil(t, dt)
 }

@@ -291,6 +291,63 @@ func TestEngineAddPod_ServiceCreating(t *testing.T) {
 	}
 }
 
+// TestDeletePod_BufferedStaleDeleteKeepsSameIPReplacement checks that a delayed delete for one
+// buffered pod does not cancel a different pod that reused the same IP while both are buffered for an
+// in-flight egress service, which would strand the live replacement without egress.
+func TestDeletePod_BufferedStaleDeleteKeepsSameIPReplacement(t *testing.T) {
+	dt := newTestDiffTracker()
+	const (
+		egressUID = "egress-reuse"
+		location  = "10.0.0.1"
+		address   = "10.244.0.11"
+	)
+
+	// Service is mid-creation, so pods buffer rather than reaching live state.
+	dt.pendingServiceOps[egressUID] = &ServiceOperationState{
+		ServiceUID: egressUID,
+		Config:     NewOutboundServiceConfig(egressUID, nil),
+		State:      StateCreationInProgress,
+	}
+
+	// Old pod buffers the address; its IP is then reused by a new pod that also buffers it.
+	dt.AddPod(egressUID, "ns1/old-pod", location, address)
+	dt.AddPod(egressUID, "ns1/new-pod", location, address)
+	assert.Len(t, dt.pendingPods[egressUID], 2, "both pods must be buffered")
+
+	// A delayed delete for the OLD pod arrives.
+	dt.DeletePod(egressUID, location, []string{address}, "ns1", "old-pod", "uid-old")
+
+	buffered := dt.pendingPods[egressUID]
+	if assert.Len(t, buffered, 1, "only the old pod's buffered entry must be cancelled, not the same-IP replacement") {
+		assert.Equal(t, "ns1/new-pod", buffered[0].PodKey,
+			"the same-IP replacement pod must remain buffered so it still gets egress on creation")
+	}
+}
+
+// TestDeletePod_BufferedDeleteWithoutIdentityCancelsByAddress checks the identity-less fallback: a
+// caller with no namespace/name cancels buffered entries by (location,address).
+func TestDeletePod_BufferedDeleteWithoutIdentityCancelsByAddress(t *testing.T) {
+	dt := newTestDiffTracker()
+	const (
+		egressUID = "egress-noident"
+		location  = "10.0.0.1"
+		address   = "10.244.0.12"
+	)
+
+	dt.pendingServiceOps[egressUID] = &ServiceOperationState{
+		ServiceUID: egressUID,
+		Config:     NewOutboundServiceConfig(egressUID, nil),
+		State:      StateCreationInProgress,
+	}
+	dt.AddPod(egressUID, "ns1/pod", location, address)
+	assert.Len(t, dt.pendingPods[egressUID], 1)
+
+	// Empty namespace/name -> address-only cancellation.
+	dt.DeletePod(egressUID, location, []string{address}, "", "", "")
+
+	assert.Empty(t, dt.pendingPods[egressUID], "an identity-less delete must still cancel the buffered entry by address")
+}
+
 // makeInboundConfig builds an InboundConfig with the given TCP frontend ports
 // and matching backend ports, for tests.
 func makeInboundConfig(frontendPorts ...int32) *InboundConfig {

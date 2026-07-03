@@ -1061,6 +1061,117 @@ func TestSeedInboundEndpointsFromCache(t *testing.T) {
 	})
 }
 
+// TestReconcileServiceGatewayNodeIPChange checks that a node InternalIP change, addition, or deletion
+// re-homes the affected inbound endpoints, since the EndpointSlice informer emits no event for a
+// node-only change (a slice carries the endpoint's nodeName, not the node IP).
+func TestReconcileServiceGatewayNodeIPChange(t *testing.T) {
+	const (
+		svcUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+		podIP  = "1.1.1.1"
+		oldLoc = "10.0.0.1"
+		newLoc = "10.0.0.2"
+	)
+
+	// newCloud builds a Cloud whose diffTracker already tracks svcUID as an NRP load balancer, so
+	// UpdateEndpoints applies the addresses to K8sResources synchronously (rather than buffering),
+	// letting the tests assert the resulting desired state directly.
+	newCloud := func(t *testing.T) *Cloud {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		cloud := GetTestCloudWithContainerLoadBalancer(ctrl)
+		var err error
+		cloud.diffTracker, err = difftracker.New(log.Noop(), difftracker.K8sState{
+			Services: utilsets.NewString(svcUID),
+			Egresses: utilsets.NewString(),
+			Nodes:    make(map[string]difftracker.Node),
+		}, difftracker.NRPState{
+			LoadBalancers: utilsets.NewString(svcUID),
+			NATGateways:   utilsets.NewString(),
+			Locations:     make(map[string]difftracker.NRPLocation),
+		}, difftracker.Config{
+			SubscriptionID:             cloud.SubscriptionID,
+			ResourceGroup:              cloud.ResourceGroup,
+			Location:                   cloud.Location,
+			VNetName:                   cloud.VnetName,
+			ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
+			ServiceGatewayID:           cloud.GetServiceGatewayID(),
+		}, cloud.NetworkClientFactory, fake.NewSimpleClientset())
+		if err != nil {
+			t.Fatalf("failed to initialize diffTracker: %v", err)
+		}
+		return cloud
+	}
+
+	singleEndpointSlice := func() *discovery_v1.EndpointSlice {
+		es := getTestEndpointSliceWithAddressesAndServiceOwnerReference(
+			"eps1", "test", "svc1", types.UID(svcUID), []string{podIP}, "node1")
+		es.AddressType = discovery_v1.AddressTypeIPv4
+		return es
+	}
+
+	t.Run("node InternalIP change moves the pod off the stale location", func(t *testing.T) {
+		cloud := newCloud(t)
+		cloud.endpointSlicesCache.Store("test/eps1", singleEndpointSlice())
+		cloud.diffTracker.UpdateEndpoints(svcUID, nil, map[string]string{podIP: oldLoc})
+
+		cloud.reconcileServiceGatewayNodeIPChange("node1", []string{oldLoc}, []string{newLoc})
+
+		nodes := cloud.diffTracker.K8sResources.Nodes
+		assert.Contains(t, nodes, newLoc, "pod must move to the new node IP")
+		assert.Contains(t, nodes[newLoc].Pods, podIP)
+		if stale, ok := nodes[oldLoc]; ok {
+			assert.NotContains(t, stale.Pods, podIP, "pod must be removed from the old node IP")
+		}
+	})
+
+	t.Run("node addition registers a pod dropped while its node was uncached", func(t *testing.T) {
+		cloud := newCloud(t)
+		cloud.endpointSlicesCache.Store("test/eps1", singleEndpointSlice())
+
+		cloud.reconcileServiceGatewayNodeIPChange("node1", nil, []string{oldLoc})
+
+		nodes := cloud.diffTracker.K8sResources.Nodes
+		assert.Contains(t, nodes, oldLoc, "pod must be registered once its node appears")
+		assert.Contains(t, nodes[oldLoc].Pods, podIP)
+	})
+
+	t.Run("node deletion drains the pod", func(t *testing.T) {
+		cloud := newCloud(t)
+		cloud.endpointSlicesCache.Store("test/eps1", singleEndpointSlice())
+		cloud.diffTracker.UpdateEndpoints(svcUID, nil, map[string]string{podIP: oldLoc})
+
+		cloud.reconcileServiceGatewayNodeIPChange("node1", []string{oldLoc}, nil)
+
+		if stale, ok := cloud.diffTracker.K8sResources.Nodes[oldLoc]; ok {
+			assert.NotContains(t, stale.Pods, podIP, "pod must drain when its node is deleted")
+		}
+	})
+
+	t.Run("is a no-op when ServiceGateway is disabled", func(t *testing.T) {
+		cloud := newCloud(t)
+		cloud.ServiceGatewayEnabled = false
+		cloud.endpointSlicesCache.Store("test/eps1", singleEndpointSlice())
+		cloud.diffTracker.UpdateEndpoints(svcUID, nil, map[string]string{podIP: oldLoc})
+
+		cloud.reconcileServiceGatewayNodeIPChange("node1", []string{oldLoc}, []string{newLoc})
+
+		assert.NotContains(t, cloud.diffTracker.K8sResources.Nodes, newLoc, "disabled SGW must not touch difftracker state")
+	})
+
+	// A node event can fire before InitializeCloudFromConfig assigns az.diffTracker (see the
+	// ordering note in SetInformers), so the reconcile must be nil-safe.
+	t.Run("does not panic when the difftracker is not yet initialized", func(t *testing.T) {
+		cloud := newCloud(t)
+		cloud.diffTracker = nil
+		cloud.endpointSlicesCache.Store("test/eps1", singleEndpointSlice())
+
+		assert.NotPanics(t, func() {
+			cloud.reconcileServiceGatewayNodeIPChange("node1", []string{oldLoc}, []string{newLoc})
+		})
+	})
+}
+
 func TestGetBackendPoolNamesAndIDsForService(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

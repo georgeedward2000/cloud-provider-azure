@@ -170,6 +170,11 @@ func egressPodUpdateActions(oldPod, newPod *v1.Pod) (needsRemove, needsAdd bool,
 	case oldHadIPs && !newHasIPs:
 		needsRemove = true
 		reason = "lost IPs"
+	case !oldWasValid && newIsValid && oldHadIPs && newHasIPs && !ipsChanged:
+		// Pod regained validity (e.g. recovered from a transient node-NotReady Unknown phase) with the
+		// same addresses; it was removed when it went invalid, so re-add the current set.
+		needsAdd = true
+		reason = "pod regained validity"
 	case oldHadIPs && newHasIPs && ipsChanged && newIsValid:
 		// Pod moved, or gained/lost/swapped an IP family - re-register the full address set.
 		needsRemove = true
@@ -309,9 +314,17 @@ func (az *Cloud) podInformerRemovePod(pod *v1.Pod) {
 	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 	podIPs := difftracker.PodEgressAddresses(pod)
 
-	// No IPs: nothing to drain, so remove the finalizer directly to avoid stranding the pod.
+	// No new IPs to drain. But if an earlier event already drain-gated this pod (the kubelet can
+	// clear a terminating pod's PodIPs after we registered its address, so the delete event carries
+	// none), the finalizer must stay until CheckPendingPodDeletions strips it once NRP confirms the
+	// drain. Only strip inline when the engine has no pending drain - a genuinely untracked or
+	// never-registered pod - to avoid stranding it.
 	if pod.Status.HostIP == "" || len(podIPs) == 0 {
-		klog.V(2).Infof("podInformerRemovePod: Pod %s has egress label but no IPs; removing finalizer directly (nothing to drain)", podKey)
+		if az.diffTracker.HasPendingPodDeletion(pod.Namespace, pod.Name, string(pod.UID)) {
+			klog.V(2).Infof("podInformerRemovePod: Pod %s has no IPs but a drain is pending; leaving finalizer for the drain-gate", podKey)
+			return
+		}
+		klog.V(2).Infof("podInformerRemovePod: Pod %s has egress label but no IPs and no pending drain; removing finalizer directly", podKey)
 		if err := az.diffTracker.RemovePodFinalizerByPod(context.Background(), pod); err != nil {
 			klog.Warningf("podInformerRemovePod: Failed to remove finalizer from no-IP pod %s: %v", podKey, err)
 		}

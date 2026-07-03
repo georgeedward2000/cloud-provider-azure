@@ -597,4 +597,110 @@ var _ = Describe("Container Load Balancer Multi-Node Tests", Label(slbTestLabel,
 		utils.Logf("  - After drain: %d", finalAddresses)
 		utils.Logf("  - Addresses correctly updated when pods removed from node")
 	})
+
+	// Test 4: Node object deletion - a deleted node's addresses must drain.
+	//
+	// A node's InternalIP is not carried in its EndpointSlices (they reference the node by name), so a
+	// node-only lifecycle change fires no slice event; the difftracker is driven from the node informer.
+	// When the Node is deleted, its pods' addresses must be removed from its Service Gateway location
+	// rather than stranded under a node underlay IP that no longer exists. The kubelet re-registers the
+	// Node on its next heartbeat, so the assertion polls quickly. The node-InternalIP-change variant
+	// cannot be reproduced on a live cluster (the kubelet owns the InternalIP) and is unit-tested.
+	It("should drain a deleted node's addresses from the Service Gateway", func() {
+		const (
+			serviceName   = "node-delete-svc"
+			servicePort   = int32(80)
+			targetPort    = 8080
+			appLabel      = "node-delete-app"
+			provisionTime = 90 * time.Second
+		)
+		ctx := context.Background()
+
+		By("Selecting a victim node and a survivor node")
+		nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(nodes.Items)).To(BeNumerically(">=", 2), "Need at least 2 nodes")
+		victimNode, survivorNode := nodes.Items[0].Name, nodes.Items[1].Name
+		utils.Logf("victim node: %s, survivor node: %s", victimNode, survivorNode)
+
+		labels := map[string]string{"app": appLabel}
+		makePod := func(name, nodeName string) *v1.Pod {
+			return &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns.Name, Labels: labels},
+				Spec: v1.PodSpec{
+					NodeName: nodeName,
+					Containers: []v1.Container{{
+						Name:            "app",
+						Image:           utils.AgnhostImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Args:            []string{"netexec", fmt.Sprintf("--http-port=%d", targetPort)},
+					}},
+				},
+			}
+		}
+
+		By("Creating a LoadBalancer service with one pod on each node")
+		svc := &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ns.Name},
+			Spec: v1.ServiceSpec{
+				Type:     v1.ServiceTypeLoadBalancer,
+				Selector: labels,
+				Ports:    []v1.ServicePort{{Port: servicePort, TargetPort: intstr.FromInt(targetPort), Protocol: v1.ProtocolTCP}},
+			},
+		}
+		createdSvc, err := cs.CoreV1().Services(ns.Name).Create(ctx, svc, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		serviceUID := string(createdSvc.UID)
+
+		_, err = cs.CoreV1().Pods(ns.Name).Create(ctx, makePod("victim-pod", victimNode), metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = cs.CoreV1().Pods(ns.Name).Create(ctx, makePod("survivor-pod", survivorNode), metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
+
+		victimPod, err := cs.CoreV1().Pods(ns.Name).Get(ctx, "victim-pod", metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		survivorPod, err := cs.CoreV1().Pods(ns.Name).Get(ctx, "survivor-pod", metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		victimPodIP, victimNodeIP := victimPod.Status.PodIP, victimPod.Status.HostIP
+		survivorPodIP := survivorPod.Status.PodIP
+
+		By("Waiting for provisioning and verifying the victim pod registers under its node's location")
+		Eventually(func() error {
+			return serviceReconciledErr(serviceUID, 2)
+		}, provisionTime, 10*time.Second).Should(Succeed())
+
+		registeredUnder := func(podIP string) (string, bool) {
+			resp, qerr := queryServiceGatewayAddressLocations()
+			Expect(qerr).NotTo(HaveOccurred())
+			for _, loc := range resp.Value {
+				for _, a := range loc.Addresses {
+					if ipEqual(a.Address, podIP) {
+						return loc.AddressLocation, true
+					}
+				}
+			}
+			return "", false
+		}
+		Eventually(func() bool {
+			loc, ok := registeredUnder(victimPodIP)
+			return ok && ipEqual(loc, victimNodeIP)
+		}, 60*time.Second, 5*time.Second).Should(BeTrue(),
+			"victim pod must register under its own node InternalIP")
+
+		By(fmt.Sprintf("Deleting the Node object %s", victimNode))
+		Expect(cs.CoreV1().Nodes().Delete(ctx, victimNode, metav1.DeleteOptions{})).To(Succeed())
+
+		By("Verifying the victim node's address drains while the survivor's remains")
+		Eventually(func() error {
+			if _, ok := registeredUnder(victimPodIP); ok {
+				return fmt.Errorf("victim pod IP %s still registered after its node was deleted", victimPodIP)
+			}
+			if _, ok := registeredUnder(survivorPodIP); !ok {
+				return fmt.Errorf("survivor pod IP %s must remain registered", survivorPodIP)
+			}
+			return nil
+		}, 30*time.Second, 1*time.Second).Should(Succeed(),
+			"a deleted node's addresses must drain from the Service Gateway, leaving the survivor's intact")
+	})
 })
