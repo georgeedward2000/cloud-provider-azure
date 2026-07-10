@@ -27,6 +27,13 @@ limitations under the License.
 // errors immediately. Retry logic is the responsibility of the callers (ServiceUpdater,
 // LocationsUpdater) which implement appropriate retry strategies based on their use cases.
 //
+// Concurrency invariant:
+// ARM primitives in this file never acquire the DiffTracker mutex (dt.mu); the lock is
+// released before any I/O. Lock-guarded state lives in the in-memory files and its helpers
+// carry the "Locked" suffix, while the public snapshot methods (GetSync*) take the lock,
+// compute the diff, and return it by value so callers act on it lock-free. Enforced by
+// TestARMPrimitivesDoNotHoldStateLock.
+//
 // Error Handling:
 // Transient errors (throttling, timeouts) should be retried by callers.
 // Permanent errors (authentication, resource not found) should not be retried.
@@ -43,6 +50,7 @@ import (
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/util/retry"
@@ -316,9 +324,13 @@ func (dt *DiffTracker) getServiceByNamespaceName(ctx context.Context, lister cor
 }
 
 // getServiceByUIDViaList scans all Services for a UID match. Used only when a Service's
-// namespace/name are not known to the engine.
+// namespace/name are not known to the engine. The spec.type field selector narrows the
+// server-side result to LoadBalancer Services only, which is the sole type the difftracker
+// manages.
 func (dt *DiffTracker) getServiceByUIDViaList(ctx context.Context, uid string) (*v1.Service, error) {
-	svcList, err := dt.kubeClient.CoreV1().Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	svcList, err := dt.kubeClient.CoreV1().Services(v1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.type", string(v1.ServiceTypeLoadBalancer)).String(),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("getServiceByUID: list failed: %w", err)
 	}

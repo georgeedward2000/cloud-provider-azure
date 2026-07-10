@@ -4,6 +4,15 @@
 
 **Author:** enechitoaia
 
+> **⚠️ LATEST UPDATE — delivery model changed to directory ownership (supersedes the CP1–CP8
+> upstream slicing below).** We now own the complete `pkg/provider/servicegateway/**` directory,
+> so the engine no longer ships as sequential upstream review-PRs. Delivery is re-cut into **two
+> tracks**: a single **common-ground PR** (shared-file hooks + a stub `difftracker`, for the
+> shared-code owners) and an **owned-directory track** (the whole engine, reviewed internally).
+> See the new **[Delivery model: ownership + common-ground split](#delivery-model-ownership--common-ground-split)**
+> section immediately below — it is now the plan of record. The CP1–CP8 tables are retained as the
+> **dependency-ordered decomposition** still used to split the owned engine internally (CP1–CP5).
+
 > **Currency note (updated on move to the v9 umbrella):** This document now lives in and
 > describes the **`eddie/dev/clb-umbrella-v9`** worktree (`/home/enechitoaia/cpa-umbrella-v9`).
 > All engine code lives under **`pkg/provider/servicegateway/difftracker/`**. Two large
@@ -12,6 +21,99 @@
 > resolved in v9**; each carries an inline **STATUS (v9)** banner. The PR-sequence tables (CP1–CP8)
 > and per-component reference are still the plan of record; live PR/merge statuses may have moved
 > since this doc was last synced.
+
+
+# Delivery model: ownership + common-ground split
+
+> **Status of record (supersedes the CP1–CP8 upstream slicing for delivery).** This section
+> reflects the pivot to **directory-level code ownership**. The CP tables further below are kept
+> for their **dependency ordering**, which still governs the internal engine split.
+
+## What changed
+
+Originally the whole feature (engine + provider integration) was to land as a sequence of ~11
+review-PRs (F0–F1, CP1–CP8) against the shared repo, each independently reviewed by the
+shared-code owners. We now **own the complete `pkg/provider/servicegateway/**` directory**, which
+re-cuts delivery into two independent tracks:
+
+| Track | What | Reviewer | Where it lands |
+| --- | --- | --- | --- |
+| **Common-ground PR** | The SGW integration hooks in **shared** provider files + a **stub** `difftracker` package | Shared-code owners (external) | On top of `upstream/master` |
+| **Owned-directory track** | The **entire** engine + the folded provider SGW logic | Us (internal) | `pkg/provider/servicegateway/**` |
+
+The CP1–CP8 *upstream* slicing is therefore **superseded**: everything inside the owned directory
+lands wholesale (or in internal chunks we choose), and only the shared-file hooks need an external
+PR.
+
+## Track 1 — Common-ground PR (raised)
+
+- **Branch:** `eddie/dev/clb-common-ground` off `upstream/master` (pushed to the `origin` fork,
+  `georgeedward2000/cloud-provider-azure`). Commit `d853f09a9`.
+- **Size:** ~**+649 / −27** across **9 shared product files + 1 stub package** (no engine).
+- **Files:** `pkg/consts/consts.go`, `pkg/provider/azure.go`, `azure_loadbalancer.go`,
+  `azure_loadbalancer_backendpool.go`, `azure_loadbalancer_healthprobe.go`,
+  `azure_loadbalancer_repo.go`, `azure_local_services.go`, `azure_standard.go`,
+  `pkg/util/sets/string.go`, and the **stub** `pkg/provider/servicegateway/difftracker/difftracker.go`.
+- **Stub package:** declares only the product-facing API surface the shared hooks compile against
+  (`DiffTracker`, `Config`, `InboundConfig`, `ServiceConfig`, `InboundConfigValidationError`,
+  `InitializeFromCluster`, the `Set*`/`ReconcileNodeIPChange`/`SetUpPodInformer` methods,
+  `AddService`/`UpdateService`/`DeleteService`/`UpdateEndpoints`, `RegisterMetrics`,
+  `RecordServiceGatewayEnabled`, `ExtractInboundConfigFromService`, `ValidateInboundConfig`,
+  `NewInboundServiceConfig`, `SelectSameFamilyNodeIP`). Every method is a **no-op**; all behavior
+  is gated on `ServiceGatewayEnabled` (default false). The real engine (owned track) replaces the
+  stub.
+- **This PR absorbs the integration content of the old CP6 (`azure.go` wiring) + CP7 (all LB
+  integration) + CP8's common EndpointSlice informer.**
+
+## Track 2 — Owned directory (`pkg/provider/servicegateway/difftracker/`)
+
+Everything SGW-specific lives here and is reviewed by us. 17 product files post-fold:
+`types.go`, `config.go`, `util.go`, `difftracker.go`, `k8s_state_updates.go`, `nrp_state_updates.go`,
+`sync_operations.go` (CP1) · `azure_operations.go`, `resource_helpers.go` (CP2) · `finalizers.go`,
+`metrics.go` (CP3) · `engine.go`, `service_updater.go`, `locations_updater.go` (CP4) ·
+`initialization.go` (CP5) · **`pods.go`, `endpoints.go`** (the folded provider SGW logic — see below).
+
+**Engine fold (done in the owned dir):**
+- The provider-package `Cloud`-method SGW files were folded **into** the `difftracker` package:
+  `azure_servicegateway_pods.go` → **`pods.go`** (egress pod informer as `*DiffTracker` methods),
+  and `reconcileServiceGatewayNodeIPChange` → **`endpoints.go`** (`ReconcileNodeIPChange`). The old
+  `Manager` indirection was removed; the diff tracker owns the informer + node reconciler directly.
+- **Removed as dead / externally-provisioned** (not in either track): the bootstrap
+  (`azure_servicegateway_init.go` — the ServiceGateway, subnet attachment, and default outbound
+  service are provisioned externally before CCM starts), `azure_natgateway_repo.go`,
+  `CreateOrUpdatePIPOutbound`, and the NSG/`PodCidr` path (reverted to upstream in
+  `securitygroup`/`loadbalancer/accesscontrol`, `config`, `azure_loadbalancer.go`, fakes).
+
+## CP → new-track mapping
+
+| Old CP (upstream slice) | New home |
+| --- | --- |
+| **CP1–CP5** (engine) | **Owned dir** — still split internally in this order (dependency-ordered; see CP tables) |
+| **CP6** Provider Integration | Split: `azure.go` wiring → **common-ground PR**; `azure_servicegateway*` → **folded** into owned `pods.go`/`endpoints.go`; `azure_natgateway_repo` + bootstrap → **removed** |
+| **CP7** LoadBalancer Integration | **Common-ground PR** (entirely) |
+| **CP8** Informers | Split: EndpointSlice informer (`azure_local_services.go`) → **common-ground PR**; pod-egress informer → **folded** into owned `pods.go` |
+
+## CP1 (#10068) — the one live edge case
+
+`CP1 = 2nd PR = #10068` is an **already-approved (not merged)** upstream PR carrying the DiffTracker
+core into the shared repo. Under ownership its content belongs in the owned dir. Two clean options:
+1. **Let #10068 merge** as the reviewed seed of the owned dir, then build the rest of the engine on
+   top; the common-ground **stub** is reconciled with / replaced by the merged real core.
+2. **Supersede #10068** and drop the whole engine into the owned dir in one internal review.
+
+**Dependency:** this whole model assumes the **directory-ownership handover is confirmed**. Until it
+is, the CP-slice model remains the fallback and CP1/CP2 stay in scope as upstream PRs.
+
+## Internal engine split (if we split the owned work for ourselves)
+
+The CP1–CP5 boundaries remain valid **internal** chunks — their content and dependency ordering are
+unchanged (CP1 core → CP2 azure-ops → CP3 finalizers+metrics → CP4 engine+workers → CP5 init). What
+changes: the **target** is the owned branch/dir (not upstream) and the **reviewer** is us. We are
+also freed from the upstream-compile gymnastics — e.g. CP1's *"trimmed struct that grows later"*
+existed only so each upstream PR compiled standalone; landing internally we can ship the full struct
+once. `pods.go`/`endpoints.go` (folded provider logic) are additional owned chunks with no upstream
+analogue.
+
 
 ## Introduction
 
@@ -51,6 +153,14 @@ _(Dependency diagram in the source PDF; each PR depends on the previous one as n
 
 # Compressed PR Plan (~11 PRs, dependency-verified)
 
+> **⚠️ SUPERSEDED FOR DELIVERY by [Delivery model: ownership + common-ground
+> split](#delivery-model-ownership--common-ground-split).** This table is retained for its
+> **dependency ordering**, which still governs the **internal** split of the owned engine
+> (**CP1–CP5**). The integration rows (**CP6–CP8**) were consolidated: their shared-file content is
+> now the single **common-ground PR**, and their SGW-specific content is **folded into the owned
+> `difftracker` package** or **removed** (bootstrap / NAT-GW repo). See the CP→new-track mapping in
+> that section.
+
 > **Why:** the original plan below lists 16 PRs. Small, tightly-coupled layers can be
 > merged without hurting reviewability, while large components set a practical floor.
 > This collapses **16 → 11 PRs** (2 merged, 1 in review, 8 to go).
@@ -74,14 +184,14 @@ _(Dependency diagram in the source PDF; each PR depends on the previous one as n
 | --- | --- | --- | --- | --- | --- | --- |
 | **F0** Foundation: NAT GW client | Foundation | PR 0 | azclient ServiceGatewayClient | — | — | ✅ merged (#10066) |
 | **F1** Foundation: First CLB batch | 1st PR | PR 1 | config, constants, clients | — | F0 | ✅ merged (#9775) |
-| **CP1** DiffTracker Core *(trimmed struct; grows later)* | 2nd PR | PR 2 + 3 + 4 + sync | `types`, `config`, `util`, `difftracker`, `k8s_state_updates`, `nrp_state_updates`, `sync_operations` | ~1,700 | F1 | 🔄 in review (#10068) |
-| **CP2** Azure Operations Layer | 3rd PR | PR 5 + resource_helpers | `azure_operations`, `resource_helpers` | ~760 | CP1 | unit (mocked clients) |
-| **CP3** Finalizers + Metrics *(leaves — moved EARLIER)* | 4th PR | PR 9 + 10 | `finalizers`, `metrics` | ~900 | CP1 | unit |
-| **CP4** Async Engine + Workers *(MERGED — mutually dependent)* | 5th PR | PR 6 + 7 + 8 | `engine`, `service_updater`, `locations_updater` | ~1,900 | CP2, CP3 | unit |
-| **CP5** Initialization | 6th PR | PR 11 | `initialization` | ~1,665 | CP4 | unit *(may split: init-from-cluster vs sync/recovery)* |
-| **CP6** Provider Integration + ServiceGateway | 7th PR | PR 12 | `azure.go` wiring, `azure_servicegateway*`, `azure_natgateway_repo`, `azure_publicip_repo` | ~700 | CP5 | **★ first e2e — SGW create/attach + cleanup** |
-| **CP7** LoadBalancer Integration | 8th PR | PR 13 | `azure_loadbalancer`, `azure_loadbalancer_backendpool`, `azure_standard`, healthprobe | ~1,200 | CP6 | **e2e — `type=LoadBalancer` → Azure LB + IP** |
-| **CP8** Informers (EndpointSlice + Pod egress) | 9th PR | PR 14 + 15 | EndpointSlice informer, `azure_servicegateway_pods` | ~450 | CP7 | **e2e — reachability + egress / NAT GW** |
+| **CP1** DiffTracker Core *(trimmed struct; grows later)* | 2nd PR | PR 2 + 3 + 4 + sync | `types`, `config`, `util`, `difftracker`, `k8s_state_updates`, `nrp_state_updates`, `sync_operations` | ~1,700 | F1 | ✅ **approved, not merged** (#10068) — now **owned dir** |
+| **CP2** Azure Operations Layer | 3rd PR | PR 5 + resource_helpers | `azure_operations`, `resource_helpers` | ~760 | CP1 | unit — now **owned dir** |
+| **CP3** Finalizers + Metrics *(leaves — moved EARLIER)* | 4th PR | PR 9 + 10 | `finalizers`, `metrics` | ~900 | CP1 | unit — now **owned dir** |
+| **CP4** Async Engine + Workers *(MERGED — mutually dependent)* | 5th PR | PR 6 + 7 + 8 | `engine`, `service_updater`, `locations_updater` | ~1,900 | CP2, CP3 | unit — now **owned dir** |
+| **CP5** Initialization | 6th PR | PR 11 | `initialization` | ~1,665 | CP4 | unit — now **owned dir** |
+| **CP6** Provider Integration + ServiceGateway | 7th PR | PR 12 | `azure.go` wiring, `azure_servicegateway*`, `azure_natgateway_repo`, `azure_publicip_repo` | ~700 | CP5 | → **split**: `azure.go`→common-ground PR; `azure_servicegateway*`→folded to owned `pods.go`/`endpoints.go`; natgw repo + bootstrap→**removed** |
+| **CP7** LoadBalancer Integration | 8th PR | PR 13 | `azure_loadbalancer`, `azure_loadbalancer_backendpool`, `azure_standard`, healthprobe | ~1,200 | CP6 | → **common-ground PR** (raised, `eddie/dev/clb-common-ground`) |
+| **CP8** Informers (EndpointSlice + Pod egress) | 9th PR | PR 14 + 15 | EndpointSlice informer, `azure_servicegateway_pods` | ~450 | CP7 | → **split**: EndpointSlice informer→common-ground PR; pod-egress→folded to owned `pods.go` |
 
 ## Dependency facts (verified in umbrella — these drive the ordering)
 
@@ -344,19 +454,23 @@ Pod informer for egress label detection.
 
 # Summary
 
-**Compressed plan (16 → 11 PRs, dependency-verified):**
+> **⚠️ Delivery is now the two-track ownership model** — see [Delivery model: ownership +
+> common-ground split](#delivery-model-ownership--common-ground-split). The table below is the
+> historical CP plan; the **Now** column shows where each row lands post-pivot.
 
-| New PR | External name | Description | Status / e2e |
-| --- | --- | --- | --- |
-| F0–F1 | Foundation / 1st PR | Foundation: NAT GW client, config, constants, clients | ✅ merged (#10066, #9775) |
-| CP1 | 2nd PR | DiffTracker core: types, state updates, struct, sync/diff | 🔄 in review (#10068) |
-| CP2 | 3rd PR | Azure operations layer (+ resource helpers) | unit |
-| CP3 | 4th PR | Finalizers + metrics *(leaves — before the engine)* | unit |
-| CP4 | 5th PR | Async Engine + Workers (engine + ServiceUpdater + LocationsUpdater) *(merged)* | unit |
-| CP5 | 6th PR | Initialization (from cluster + NRP; recovery) | unit *(may split)* |
-| CP6 | 7th PR | Provider integration + ServiceGateway | ★ first e2e |
-| CP7 | 8th PR | LoadBalancer integration | e2e (inbound LB) |
-| CP8 | 9th PR | Informers: EndpointSlice + Pod egress | e2e (reachability + egress) |
+**Compressed plan (16 → 11 PRs, dependency-verified) — with post-pivot placement:**
+
+| New PR | External name | Description | Status / e2e | Now (post-pivot) |
+| --- | --- | --- | --- | --- |
+| F0–F1 | Foundation / 1st PR | Foundation: NAT GW client, config, constants, clients | ✅ merged (#10066, #9775) | upstream (done) |
+| CP1 | 2nd PR | DiffTracker core: types, state updates, struct, sync/diff | ✅ approved, not merged (#10068) | **owned dir** (seed or supersede) |
+| CP2 | 3rd PR | Azure operations layer (+ resource helpers) | unit | **owned dir** |
+| CP3 | 4th PR | Finalizers + metrics *(leaves — before the engine)* | unit | **owned dir** |
+| CP4 | 5th PR | Async Engine + Workers (engine + ServiceUpdater + LocationsUpdater) *(merged)* | unit | **owned dir** |
+| CP5 | 6th PR | Initialization (from cluster + NRP; recovery) | unit *(may split)* | **owned dir** |
+| CP6 | 7th PR | Provider integration + ServiceGateway | ★ first e2e | **split** → common-ground PR + folded owned / removed |
+| CP7 | 8th PR | LoadBalancer integration | e2e (inbound LB) | **common-ground PR** (raised) |
+| CP8 | 9th PR | Informers: EndpointSlice + Pod egress | e2e (reachability + egress) | **split** → common-ground PR + folded owned |
 
 **Original phases (reference for the per-component sections above):**
 
