@@ -343,29 +343,22 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 		return err
 	}
 
-	// Use a single flag to determine if the service gateway is enabled.
-	// All 3 conditions must be true:
-	// 1. ServiceGatewayEnabled is true
-	// 2. lb sku is service
-	// 3. backendPoolType is PodIP
-	if config.ServiceGatewayEnabled && config.IsLBBackendPoolTypePodIPAndUseServiceLoadBalancer() {
-		klog.V(2).Info("InitializeCloudFromConfig: Service Gateway is enabled, using PodIP backend pool type with Service Load Balancer")
-	} else {
-		config.ServiceGatewayEnabled = false
+	serviceGatewayConfigured := config.ServiceGatewayEnabled ||
+		config.IsLBBackendPoolTypePodIP() ||
+		config.UseServiceLoadBalancer()
+	serviceGatewayEnabled := config.ServiceGatewayEnabled &&
+		config.IsLBBackendPoolTypePodIPAndUseServiceLoadBalancer()
+	if serviceGatewayConfigured && !serviceGatewayEnabled {
+		return fmt.Errorf("InitializeCloudFromConfig: ServiceGateway requires serviceGatewayEnabled=true, loadBalancerBackendPoolConfigurationType=podIP, and loadBalancerSku=service to be configured together")
 	}
-
-	// PodIP backend pools are only supported together with ServiceGateway, which is what programs
-	// pod IPs into the load balancer. If ServiceGateway is not active (wrong SKU or disabled) there
-	// is no mechanism to populate a PodIP backend pool, so reject the configuration explicitly
-	// instead of starting with a load balancer path that would silently misroute traffic.
-	if config.IsLBBackendPoolTypePodIP() && !config.ServiceGatewayEnabled {
-		return fmt.Errorf("InitializeCloudFromConfig: PodIP backend pool type requires ServiceGateway (loadBalancerBackendPoolConfigurationType=podIP needs ServiceGatewayEnabled=true and loadBalancerSku=service)")
+	if serviceGatewayEnabled {
+		klog.V(2).Info("InitializeCloudFromConfig: Service Gateway is enabled, using PodIP backend pool type with Service Load Balancer")
 	}
 
 	// ServiceGateway (ContainerLB) and Multi-SLB are mutually exclusive.
 	// ContainerLB uses PodIP-based backend pools via ServiceGateway, while
 	// Multi-SLB requires NodeIP/NIC-based backend pools.
-	if config.ServiceGatewayEnabled && config.UseMultipleStandardLoadBalancers() {
+	if config.ServiceGatewayEnabled && len(config.MultipleStandardLoadBalancerConfigurations) > 0 {
 		return fmt.Errorf("InitializeCloudFromConfig: ServiceGatewayEnabled and MultipleStandardLoadBalancerConfigurations are mutually exclusive and cannot both be set")
 	}
 
