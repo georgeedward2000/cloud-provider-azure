@@ -2513,14 +2513,16 @@ func TestInitializeCloudFromConfig(t *testing.T) {
 
 		// PodIP backend pool with a non-Service SKU disables ServiceGateway, which leaves no mechanism
 		// to populate the pool; InitializeCloudFromConfig must reject this rather than start a broken
-		// load balancer path.
-		az.LoadBalancerBackendPoolConfigurationType = consts.LoadBalancerBackendPoolConfigurationTypePodIP
-		az.LoadBalancerSKU = "standardV2"
-
-		azureconfig := config.Config{}
+		// load balancer path. Configuration is supplied through the config argument, as production does.
+		azureconfig := config.Config{
+			LoadBalancerBackendPoolConfigurationType: consts.LoadBalancerBackendPoolConfigurationTypePodIP,
+			LoadBalancerSKU:                          "standardV2",
+		}
 		err := az.InitializeCloudFromConfig(context.Background(), &azureconfig, false, true)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "PodIP backend pool type requires ServiceGateway")
+		if err != nil {
+			assert.Contains(t, err.Error(), "PodIP backend pool type requires ServiceGateway")
+		}
 	})
 
 	t.Run("should setup network client factory with network subscription ID - same network sub in same tenant", func(t *testing.T) {
@@ -2687,13 +2689,40 @@ func TestInitializeCloudFromConfig(t *testing.T) {
 		zoneMock := az.zoneRepo.(*zone.MockRepository)
 		zoneMock.EXPECT().ListZones(gomock.Any()).Return(map[string][]string{"eastus": {"1", "2", "3"}}, nil).AnyTimes()
 
+		// A valid ServiceGateway configuration (serviceGatewayEnabled + service SKU + podIP) supplied
+		// through the config argument must be accepted, keep podIP, and leave ServiceGateway enabled.
+		// callFromCCM=false skips the CCM-only difftracker cluster init.
 		azureconfig := config.Config{
+			ServiceGatewayEnabled:                    true,
+			LoadBalancerSKU:                          consts.LoadBalancerSKUService,
 			LoadBalancerBackendPoolConfigurationType: consts.LoadBalancerBackendPoolConfigurationTypePodIP,
 		}
-		err := az.InitializeCloudFromConfig(context.Background(), &azureconfig, false, true)
+		err := az.InitializeCloudFromConfig(context.Background(), &azureconfig, false, false)
 		assert.NoError(t, err)
-		assert.Equal(t, az.Config.LoadBalancerBackendPoolConfigurationType, consts.LoadBalancerBackendPoolConfigurationTypePodIP)
+		assert.Equal(t, consts.LoadBalancerBackendPoolConfigurationTypePodIP, az.Config.LoadBalancerBackendPoolConfigurationType)
+		assert.True(t, az.ServiceGatewayEnabled)
 
+	})
+	t.Run("ServiceGatewayEnabled is refined off when config is not podIP and service", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		az := GetTestCloudWithContainerLoadBalancer(ctrl)
+		zoneMock := az.zoneRepo.(*zone.MockRepository)
+		zoneMock.EXPECT().ListZones(gomock.Any()).Return(map[string][]string{"eastus": {"1", "2", "3"}}, nil).AnyTimes()
+
+		// serviceGatewayEnabled is only effective with a service SKU and podIP backend pool. Even though
+		// the cloud was built for ContainerLB, a config specifying a standard SKU / NodeIPConfiguration
+		// pool must refine the flag to false from the incoming config, not leave it enabled by stale az
+		// state. callFromCCM=false keeps the assertion on the config-derived flag rather than the
+		// CCM-only init path.
+		azureconfig := config.Config{
+			ServiceGatewayEnabled:                    true,
+			LoadBalancerSKU:                          consts.LoadBalancerSKUStandard,
+			LoadBalancerBackendPoolConfigurationType: consts.LoadBalancerBackendPoolConfigurationTypeNodeIPConfiguration,
+		}
+		err := az.InitializeCloudFromConfig(context.Background(), &azureconfig, false, false)
+		assert.NoError(t, err)
+		assert.False(t, az.ServiceGatewayEnabled)
 	})
 }
 
