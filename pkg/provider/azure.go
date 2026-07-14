@@ -985,19 +985,6 @@ func (az *Cloud) GetActiveZones() (*utilsets.IgnoreCaseSet, error) {
 	return zones, nil
 }
 
-// nodePrivateIPsForNode returns a snapshot of the private IPs cached for nodeName, read under
-// nodeCachesLock so callers on the EndpointSlice path do not race the node informer's cache writes.
-// nodeName is matched case-insensitively; the returned slice is a copy and safe to use after the
-// lock is released.
-func (az *Cloud) nodePrivateIPsForNode(nodeName string) []string {
-	az.nodeCachesLock.RLock()
-	defer az.nodeCachesLock.RUnlock()
-	if set := az.nodePrivateIPs[strings.ToLower(nodeName)]; set != nil {
-		return set.UnsortedList()
-	}
-	return nil
-}
-
 // GetLocation returns the location in which k8s cluster is currently running.
 func (az *Cloud) GetLocation() string {
 	return az.Location

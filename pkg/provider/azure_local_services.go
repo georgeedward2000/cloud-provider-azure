@@ -339,6 +339,15 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 				previousES := oldObj.(*discovery_v1.EndpointSlice)
 				newES := newObj.(*discovery_v1.EndpointSlice)
 
+				var svcName string
+				if !az.ServiceGatewayEnabled {
+					svcName = getServiceNameOfEndpointSlice(newES)
+					if svcName == "" {
+						klog.V(4).Infof("EndpointSlice %s/%s does not have service name label, skip updating load balancer backend pool", newES.Namespace, newES.Name)
+						return
+					}
+				}
+
 				klog.V(4).Infof("Detecting EndpointSlice %s/%s update", newES.Namespace, newES.Name)
 				az.endpointSlicesCache.Store(strings.ToLower(fmt.Sprintf("%s/%s", newES.Namespace, newES.Name)), newES)
 
@@ -369,18 +378,13 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 					return
 				}
 
-				svcName := getServiceNameOfEndpointSlice(newES)
-				if svcName == "" {
-					klog.V(4).Infof("EndpointSlice %s/%s does not have service name label, skip updating load balancer backend pool", newES.Namespace, newES.Name)
-					return
-				}
-
 				key := strings.ToLower(fmt.Sprintf("%s/%s", newES.Namespace, svcName))
 				si, found := az.getLocalServiceInfo(key)
 				if !found {
 					klog.V(4).Infof("EndpointSlice %s/%s belongs to service %s, but the service is not a local service, or has not finished the initial reconciliation loop. Skip updating load balancer backend pool", newES.Namespace, newES.Name, key)
 					return
 				}
+				lbName, ipFamily := si.lbName, si.ipFamily
 
 				var previousIPs, currentIPs, previousNodeNames, currentNodeNames []string
 				if previousES != nil {
@@ -394,14 +398,15 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 					}
 				}
 				for _, previousNodeName := range previousNodeNames {
-					previousIPs = append(previousIPs, az.nodePrivateIPsForNode(previousNodeName)...)
+					nodeIPsSet := az.nodePrivateIPs[strings.ToLower(previousNodeName)]
+					previousIPs = append(previousIPs, nodeIPsSet.UnsortedList()...)
 				}
 				for _, currentNodeName := range currentNodeNames {
-					currentIPs = append(currentIPs, az.nodePrivateIPsForNode(currentNodeName)...)
+					nodeIPsSet := az.nodePrivateIPs[strings.ToLower(currentNodeName)]
+					currentIPs = append(currentIPs, nodeIPsSet.UnsortedList()...)
 				}
 
 				if az.backendPoolUpdater != nil {
-					lbName, ipFamily := si.lbName, si.ipFamily
 					var bpNames []string
 					bpNameIPv4 := getLocalServiceBackendPoolName(key, false)
 					bpNameIPv6 := getLocalServiceBackendPoolName(key, true)
@@ -750,7 +755,8 @@ func (az *Cloud) checkAndApplyLocalServiceBackendPoolUpdates(lb armnetwork.LoadB
 
 	var expectedIPs []string
 	for _, nodeName := range endpointsNodeNames.UnsortedList() {
-		expectedIPs = append(expectedIPs, az.nodePrivateIPsForNode(nodeName)...)
+		ips := az.nodePrivateIPs[strings.ToLower(nodeName)]
+		expectedIPs = append(expectedIPs, ips.UnsortedList()...)
 	}
 	currentIPsInBackendPools := make(map[string][]string)
 	for _, bp := range lb.Properties.BackendAddressPools {

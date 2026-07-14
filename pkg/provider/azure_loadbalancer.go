@@ -109,7 +109,7 @@ func (az *Cloud) GetLoadBalancer(ctx context.Context, clusterName string, servic
 		return status, existsLb || az.existsPip(ctx, clusterName, service), err
 	}
 
-	// check flipped service also unless Service Gateway is enabled (it uses a single per-service LB)
+	// ServiceGateway uses a single per-service LB, so skip the flipped-service check.
 	if !az.ServiceGatewayEnabled {
 		flippedService := flipServiceInternalAnnotation(service)
 		_, _, status, _, existsLb, _, err = az.getServiceLoadBalancer(ctx, flippedService, clusterName, nil, false, existingLBs)
@@ -309,7 +309,7 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 		}
 
 		// Extract port configuration from service
-		inboundConfig := az.extractInboundConfigFromService(service)
+		inboundConfig := difftracker.ExtractInboundConfigFromService(service)
 		if inboundConfig == nil {
 			// A type=LoadBalancer Service always has >=1 port (API-enforced), so this is defensive:
 			// a port-less Service has no PodIP backend to program. Return the current status unchanged

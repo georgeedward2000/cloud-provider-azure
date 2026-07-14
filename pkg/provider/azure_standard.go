@@ -43,7 +43,6 @@ import (
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	vmutil "sigs.k8s.io/cloud-provider-azure/pkg/util/vm"
 )
 
@@ -326,34 +325,18 @@ func getServiceName(service *v1.Service) string {
 	return fmt.Sprintf("%s/%s", service.Namespace, service.Name)
 }
 
-// This returns a unique identifier for the Service used to tag some resources.
-func getServiceUID(service *v1.Service) string {
-	return strings.ToLower(string(service.UID))
-}
-
-// extractInboundConfigFromService creates InboundConfig from a Kubernetes Service
-// Delegates to the shared implementation in difftracker.ExtractInboundConfigFromService
-func (az *Cloud) extractInboundConfigFromService(service *v1.Service) *difftracker.InboundConfig {
-	return difftracker.ExtractInboundConfigFromService(service)
-}
-
 // This returns a prefix for loadbalancer/security rules.
 func (az *Cloud) getRulePrefix(service *v1.Service) string {
 	return az.GetLoadBalancerName(context.TODO(), "", service)
 }
 
 func (az *Cloud) getPublicIPName(clusterName string, service *v1.Service, isIPv6 bool) (string, error) {
-	isDualStack := isServiceDualStack(service)
-
-	var pipName string
 	if az.ServiceGatewayEnabled {
-		// New scheme: decouple from clusterName — per-service deterministic naming.
-		// Base name: <serviceUID>-pip
-		pipName = fmt.Sprintf("%s-pip", getServiceUID(service))
-	} else {
-		// Legacy scheme: tied to clusterName — per-cluster naming.
-		pipName = fmt.Sprintf("%s-%s", clusterName, az.GetLoadBalancerName(context.TODO(), clusterName, service))
+		return fmt.Sprintf("%s-pip", getServiceUID(service)), nil
 	}
+
+	isDualStack := isServiceDualStack(service)
+	pipName := fmt.Sprintf("%s-%s", clusterName, az.GetLoadBalancerName(context.TODO(), clusterName, service))
 	if id := getServicePIPPrefixID(service, isIPv6); id != "" {
 		id, err := getLastSegment(id, "/")
 		if err == nil {
