@@ -2744,6 +2744,7 @@ func TestInitializeCloudFromConfig(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, consts.LoadBalancerBackendPoolConfigurationTypePodIP, az.Config.LoadBalancerBackendPoolConfigurationType)
 		assert.True(t, az.ServiceGatewayEnabled)
+		assert.Nil(t, az.LoadBalancerBackendPool)
 
 	})
 

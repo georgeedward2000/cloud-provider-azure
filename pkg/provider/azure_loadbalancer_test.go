@@ -54,8 +54,8 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/privatelinkservice"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/subnet"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/zone"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
@@ -1046,6 +1046,27 @@ func TestEnsureLoadBalancerLock(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "update lease failed")
 	assert.Contains(t, err.Error(), "list lb failed")
+}
+
+func TestEnsureLoadBalancerServiceGatewaySkipsAzureResourceLock(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	az := GetTestCloudWithContainerLoadBalancer(ctrl)
+	kubeClient := fake.NewSimpleClientset()
+	kubeClient.PrependReactor(
+		"get", "leases",
+		func(_ k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+			return true, nil, errors.New("get lease should not be called")
+		})
+	az.KubeClient = kubeClient
+	az.azureResourceLocker = NewAzureResourceLocker(
+		az, "holder", "aks-managed-resource-locker", "kube-system", 900,
+	)
+
+	svc := getTestService("service", v1.ProtocolTCP, nil, false, 80)
+	_, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	assert.NoError(t, err)
 }
 
 func TestEnsureLoadBalancerDeletedLock(t *testing.T) {
@@ -3325,41 +3346,9 @@ func TestReconcileLoadBalancerRuleCommon(t *testing.T) {
 		expectedRules:   rules1DualStack,
 	})
 
-	testCases = append(testCases, []struct {
-		desc            string
-		service         v1.Service
-		loadBalancerSKU string
-		probeProtocol   string
-		probePath       string
-		expectedProbes  map[bool][]*armnetwork.Probe
-		expectedRules   map[bool][]*armnetwork.LoadBalancingRule
-		expectedErr     bool
-	}{
-		{
-			desc:            "LB backend pool of type PodIP - getExpectedLBRules should return error when the service is dual-stack",
-			service:         getTestServiceDualStack("test", v1.ProtocolTCP, nil, 80),
-			loadBalancerSKU: "standardV2",
-			expectedErr:     true,
-		},
-		{
-			desc:            "LB backend pool of type PodIP - getExpectedLBRules should return error when the service port is named",
-			service:         getTestServiceWithNamedTargetPorts("test", v1.ProtocolTCP, nil, false, 8080, "http-web-svc"),
-			loadBalancerSKU: "standardV2",
-			expectedErr:     true,
-		},
-		{
-			desc:            "LB backend pool of type PodIP - getExpectedLBRules rejects PodIP without ServiceGateway",
-			service:         getTestServiceWithIntTargetPorts("test1", v1.ProtocolTCP, nil, false, 8080, 1234),
-			loadBalancerSKU: "standardV2",
-			expectedErr:     true,
-		},
-	}...)
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
 			az := GetTestCloud(ctrl)
-			if test.loadBalancerSKU == "standardV2" {
-				az.LoadBalancerBackendPoolConfigurationType = consts.LoadBalancerBackendPoolConfigurationTypePodIP
-			}
 			az.Config.LoadBalancerSKU = test.loadBalancerSKU
 			service := test.service
 			firstPort := service.Spec.Ports[0]
@@ -9459,48 +9448,6 @@ func fakeEnsureHostsInPool() func(context.Context, *v1.Service, []*v1.Node, stri
 	}
 }
 
-func TestPodIPWithoutServiceGateway_RejectsDualStack(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	az := GetTestCloud(ctrl)
-	az.LoadBalancerBackendPoolConfigurationType = consts.LoadBalancerBackendPoolConfigurationTypePodIP
-	az.LoadBalancerSKU = "standardV2"
-	az.ServiceGatewayEnabled = false
-
-	svc := getTestServiceDualStack("podip-dualstack", v1.ProtocolTCP, nil, 80)
-	_, _, err := az.getExpectedLBRules(&svc, "frontend-v4", "backend-v4", "lb", consts.IPVersionIPv4)
-	assert.Error(t, err, "PodIP backend pool without ServiceGateway must be rejected")
-}
-
-func TestPodIPWithoutServiceGateway_RejectsNamedTargetPort(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	az := GetTestCloud(ctrl)
-	az.LoadBalancerBackendPoolConfigurationType = consts.LoadBalancerBackendPoolConfigurationTypePodIP
-	az.LoadBalancerSKU = "standardV2"
-	az.ServiceGatewayEnabled = false
-
-	svc := getTestServiceWithNamedTargetPorts("podip-named-target-port", v1.ProtocolTCP, nil, false, 8080, "http")
-	_, _, err := az.getExpectedLBRules(&svc, "frontend-v4", "backend-v4", "lb", consts.IPVersionIPv4)
-	assert.Error(t, err, "PodIP backend pool without ServiceGateway must be rejected")
-}
-
-func TestPodIPWithoutServiceGateway_RejectsIntTargetPort(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	az := GetTestCloud(ctrl)
-	az.LoadBalancerBackendPoolConfigurationType = consts.LoadBalancerBackendPoolConfigurationTypePodIP
-	az.LoadBalancerSKU = "standardV2"
-	az.ServiceGatewayEnabled = false
-
-	svc := getTestServiceWithIntTargetPorts("podip-udp-target-port", v1.ProtocolUDP, nil, true, 8080, 1234)
-	_, _, err := az.getExpectedLBRules(&svc, "frontend-ipv6", "backend-ipv6", "lb", consts.IPVersionIPv6)
-	assert.Error(t, err, "PodIP backend pool without ServiceGateway must be rejected")
-}
-
 func TestServiceGatewayInternalAnnotation_IsRejected(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -9552,42 +9499,6 @@ func TestServiceGatewayEnsureLoadBalancerDeleted_ReturnsNil(t *testing.T) {
 	}
 	err = az.EnsureLoadBalancerDeleted(context.Background(), testClusterName, &svc)
 	assert.NoError(t, err)
-}
-
-func TestPodIPWithoutServiceGateway_EnsureLoadBalancerRejects(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	az := GetTestCloud(ctrl)
-	az.LoadBalancerBackendPoolConfigurationType = consts.LoadBalancerBackendPoolConfigurationTypePodIP
-	az.LoadBalancerSKU = "standardV2"
-	az.ServiceGatewayEnabled = false
-
-	mockLBBackendPool := az.LoadBalancerBackendPool.(*MockBackendPool)
-	mockLBBackendPool.EXPECT().ReconcileBackendPools(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, _ string, _ *v1.Service, lb *armnetwork.LoadBalancer) (bool, bool, *armnetwork.LoadBalancer, error) {
-		return false, false, lb, nil
-	}).AnyTimes()
-	mockLBBackendPool.EXPECT().EnsureHostsInPool(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-	mockLBBackendPool.EXPECT().GetBackendPrivateIPs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
-
-	clusterResources, expectedInterfaces, expectedVirtualMachines := getClusterResources(az, 8, 4)
-	setMockEnv(az, expectedInterfaces, expectedVirtualMachines, 5)
-
-	svc := getTestServiceWithIntTargetPorts("service1", v1.ProtocolTCP, nil, false, 8080, 1234)
-	expectedLBs := make([]*armnetwork.LoadBalancer, 0)
-	setMockLBs(az, &expectedLBs, "service", 1, 1, false)
-
-	mockPLSRepo := privatelinkservice.NewMockRepository(ctrl)
-	mockPLSRepo.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armnetwork.PrivateLinkService{ID: ptr.To(consts.PrivateLinkServiceNotExistID)}, nil).AnyTimes()
-	az.plsRepo = mockPLSRepo
-
-	// PodIP backend pools are only supported with ServiceGateway; without it EnsureLoadBalancer must
-	// reject the service rather than program a load balancer that misroutes traffic to an empty pool.
-	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, clusterResources.nodes)
-	assert.Error(t, err, "PodIP backend pool without ServiceGateway must be rejected")
-	assert.Nil(t, status)
-	assert.True(t, az.IsLBBackendPoolTypePodIP())
-	assert.False(t, az.ServiceGatewayEnabled)
 }
 
 func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {

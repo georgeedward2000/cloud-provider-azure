@@ -339,18 +339,45 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 				previousES := oldObj.(*discovery_v1.EndpointSlice)
 				newES := newObj.(*discovery_v1.EndpointSlice)
 
+				klog.V(4).Infof("Detecting EndpointSlice %s/%s update", newES.Namespace, newES.Name)
+				az.endpointSlicesCache.Store(strings.ToLower(fmt.Sprintf("%s/%s", newES.Namespace, newES.Name)), newES)
+
+				if az.ServiceGatewayEnabled {
+					serviceUID, loaded := getServiceUIDOfEndpointSlice(newES)
+					if !loaded {
+						klog.V(4).Infof("EndpointSlice %s/%s does not have service UID, skip updating", newES.Namespace, newES.Name)
+						return
+					}
+
+					// A slice entering deletion clears its addresses from K8s state.
+					if newES.DeletionTimestamp != nil {
+						if previousES.DeletionTimestamp == nil {
+							ipv6 := newES.AddressType == discovery_v1.AddressTypeIPv6
+							oldAddresses := az.getPodIPToNodeIPMapFromEndpointSlice(previousES, ipv6)
+							az.diffTracker.UpdateEndpoints(serviceUID, oldAddresses, nil)
+						}
+						return
+					}
+
+					ipv6 := newES.AddressType == discovery_v1.AddressTypeIPv6
+					oldAddresses := az.getPodIPToNodeIPMapFromEndpointSlice(previousES, ipv6)
+					newAddresses := az.getPodIPToNodeIPMapFromEndpointSlice(newES, ipv6)
+					if len(oldAddresses) == 0 && len(newAddresses) == 0 {
+						return
+					}
+					az.diffTracker.UpdateEndpoints(serviceUID, oldAddresses, newAddresses)
+					return
+				}
+
 				svcName := getServiceNameOfEndpointSlice(newES)
 				if svcName == "" {
 					klog.V(4).Infof("EndpointSlice %s/%s does not have service name label, skip updating load balancer backend pool", newES.Namespace, newES.Name)
 					return
 				}
 
-				klog.V(4).Infof("Detecting EndpointSlice %s/%s update", newES.Namespace, newES.Name)
-				az.endpointSlicesCache.Store(strings.ToLower(fmt.Sprintf("%s/%s", newES.Namespace, newES.Name)), newES)
-
 				key := strings.ToLower(fmt.Sprintf("%s/%s", newES.Namespace, svcName))
 				si, found := az.getLocalServiceInfo(key)
-				if !found && !az.ServiceGatewayEnabled {
+				if !found {
 					klog.V(4).Infof("EndpointSlice %s/%s belongs to service %s, but the service is not a local service, or has not finished the initial reconciliation loop. Skip updating load balancer backend pool", newES.Namespace, newES.Name, key)
 					return
 				}
@@ -373,7 +400,7 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 					currentIPs = append(currentIPs, az.nodePrivateIPsForNode(currentNodeName)...)
 				}
 
-				if !az.ServiceGatewayEnabled && az.backendPoolUpdater != nil {
+				if az.backendPoolUpdater != nil {
 					lbName, ipFamily := si.lbName, si.ipFamily
 					var bpNames []string
 					bpNameIPv4 := getLocalServiceBackendPoolName(key, false)
@@ -391,41 +418,6 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 						currentIPsInBackendPools[bpName] = previousIPs
 					}
 					az.applyIPChangesAmongLocalServiceBackendPoolsByIPFamily(lbName, key, currentIPsInBackendPools, currentIPs)
-				}
-
-				if az.ServiceGatewayEnabled {
-					serviceUID, loaded := getServiceUIDOfEndpointSlice(newES)
-					if !loaded {
-						klog.V(4).Infof("EndpointSlice %s/%s does not have service UID, skip updating", newES.Namespace, newES.Name)
-						return
-					}
-
-					// Skip EndpointSlices that are being deleted
-					if newES.DeletionTimestamp != nil {
-						// Handle deletion: remove addresses from K8s state
-						if previousES.DeletionTimestamp == nil {
-							klog.V(2).Infof("EndpointSlice %s/%s started deletion, removing addresses from K8s state",
-								newES.Namespace, newES.Name)
-							ipv6 := newES.AddressType == discovery_v1.AddressTypeIPv6
-							oldAddresses := az.getPodIPToNodeIPMapFromEndpointSlice(previousES, ipv6)
-							az.diffTracker.UpdateEndpoints(serviceUID, oldAddresses, nil)
-						}
-						return
-					}
-
-					// Use Engine to handle endpoint updates (buffering, state checking, etc.)
-					// Determine IP family from EndpointSlice AddressType
-					ipv6 := newES.AddressType == discovery_v1.AddressTypeIPv6
-					oldAddresses := az.getPodIPToNodeIPMapFromEndpointSlice(previousES, ipv6)
-					newAddresses := az.getPodIPToNodeIPMapFromEndpointSlice(newES, ipv6)
-
-					// Skip if both old and new have no ready endpoints
-					if len(oldAddresses) == 0 && len(newAddresses) == 0 {
-						klog.V(4).Infof("EndpointSlice %s/%s has no ready endpoints in old or new state, skipping UpdateEndpoints", newES.Namespace, newES.Name)
-						return
-					}
-
-					az.diffTracker.UpdateEndpoints(serviceUID, oldAddresses, newAddresses)
 				}
 			},
 			DeleteFunc: func(obj interface{}) {
@@ -629,7 +621,7 @@ func getLocalServiceBackendPoolName(serviceName string, ipv6 bool) string {
 // getBackendPoolNameForService determine the expected backend pool name
 // by checking the external traffic policy of the service.
 func (az *Cloud) getBackendPoolNameForService(service *v1.Service, clusterName string, ipv6 bool) string {
-	if (!isLocalService(service) && !az.ServiceGatewayEnabled) || !az.UseMultipleStandardLoadBalancers() {
+	if !isLocalService(service) || !az.UseMultipleStandardLoadBalancers() {
 		return getBackendPoolName(clusterName, ipv6)
 	}
 	return getLocalServiceBackendPoolName(getServiceName(service), ipv6)
@@ -638,7 +630,7 @@ func (az *Cloud) getBackendPoolNameForService(service *v1.Service, clusterName s
 // getBackendPoolNamesForService determine the expected backend pool names
 // by checking the external traffic policy of the service.
 func (az *Cloud) getBackendPoolNamesForService(service *v1.Service, clusterName string) map[bool]string {
-	if (!isLocalService(service) && !az.ServiceGatewayEnabled) || !az.UseMultipleStandardLoadBalancers() {
+	if !isLocalService(service) || !az.UseMultipleStandardLoadBalancers() {
 		return getBackendPoolNames(clusterName)
 	}
 	return map[bool]string{
@@ -650,25 +642,6 @@ func (az *Cloud) getBackendPoolNamesForService(service *v1.Service, clusterName 
 // getBackendPoolIDsForService determine the expected backend pool IDs
 // by checking the external traffic policy of the service.
 func (az *Cloud) getBackendPoolIDsForService(service *v1.Service, clusterName, lbName string) map[bool]string {
-	if az.ServiceGatewayEnabled {
-		// Dual-stack is not supported for PodIP backend pools
-		// Decide pool by the single IP family on the Service
-		if len(service.Spec.IPFamilies) == 0 {
-			// Defensive default: fall back to IPv4 naming if IPFamilies is empty
-			name := string(service.GetUID())
-			return map[bool]string{consts.IPVersionIPv4: az.getBackendPoolID(lbName, name)}
-		}
-		switch service.Spec.IPFamilies[0] {
-		case v1.IPv4Protocol:
-			name := string(service.GetUID())
-			return map[bool]string{consts.IPVersionIPv4: az.getBackendPoolID(lbName, name)}
-		case v1.IPv6Protocol:
-			name := fmt.Sprintf("%s-%s", service.GetUID(), consts.IPVersionIPv6StringLower)
-			return map[bool]string{consts.IPVersionIPv6: az.getBackendPoolID(lbName, name)}
-		default:
-			// Fallback to cluster-scoped implementation (shouldn't happen)
-		}
-	}
 	if !isLocalService(service) || !az.UseMultipleStandardLoadBalancers() {
 		return az.getBackendPoolIDs(clusterName, lbName)
 	}
@@ -842,27 +815,5 @@ func (az *Cloud) reconcileIPsInLocalServiceBackendPoolsAsync(
 		if len(expectedIPs) > 0 {
 			az.backendPoolUpdater.addOperation(getAddIPsToBackendPoolOperation(serviceName, lbName, bpName, expectedIPs))
 		}
-	}
-}
-
-func isDualStackService(service *v1.Service) bool {
-	return len(service.Spec.IPFamilies) == 2
-}
-
-func (az *Cloud) getBackendPoolNameForSLBService(service *v1.Service) (string, error) {
-	if isDualStackService(service) {
-		return "", fmt.Errorf("dual-stack services are not supported when LB backend pool type is PodIP")
-	}
-	if len(service.Spec.IPFamilies) == 0 {
-		return "", fmt.Errorf("service %s has no IP family; cannot determine backend pool name", service.GetUID())
-	}
-
-	switch service.Spec.IPFamilies[0] {
-	case v1.IPv4Protocol:
-		return string(service.GetUID()), nil
-	case v1.IPv6Protocol:
-		return fmt.Sprintf("%s-%s", service.GetUID(), consts.IPVersionIPv6StringLower), nil
-	default:
-		return "", fmt.Errorf("unknown IP family %s", service.Spec.IPFamilies[0])
 	}
 }
