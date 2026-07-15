@@ -870,7 +870,6 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 				Location:                   az.Location,
 				VNetName:                   az.VnetName,
 				ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
-				ServiceGatewayID:           az.GetServiceGatewayID(),
 			}, az.NetworkClientFactory, fake.NewSimpleClientset())
 			if err != nil {
 				t.Fatalf("failed to initialize diffTracker: %v", err)
@@ -965,7 +964,6 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 				Location:                   az.Location,
 				VNetName:                   az.VnetName,
 				ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
-				ServiceGatewayID:           az.GetServiceGatewayID(),
 			}, az.NetworkClientFactory, fake.NewSimpleClientset())
 			if err != nil {
 				t.Fatalf("failed to initialize diffTracker: %v", err)

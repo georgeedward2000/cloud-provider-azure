@@ -57,7 +57,6 @@ func TestCompleteServiceCreationWorkflow(t *testing.T) {
 		ResourceGroup:              "production-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "my-service-gateway",
-		ServiceGatewayID:           "/subscriptions/test-subscription-123/resourceGroups/production-rg/providers/Microsoft.Network/serviceGateways/my-service-gateway",
 	}
 
 	serviceUID := string(service.UID)
@@ -146,7 +145,6 @@ func TestWorkflowWithUDPService(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "westus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	_, lb, _, err := buildInboundServiceResources(string(service.UID), config, dtConfig)
@@ -245,7 +243,6 @@ func TestResourceIDsAreConsistent(t *testing.T) {
 		ResourceGroup:              "rg-xyz",
 		Location:                   "centralus",
 		ServiceGatewayResourceName: "sgw-test",
-		ServiceGatewayID:           "/subscriptions/sub-abc/resourceGroups/rg-xyz/providers/Microsoft.Network/serviceGateways/sgw-test",
 	}
 
 	config := &InboundConfig{
@@ -281,7 +278,6 @@ func TestOutboundWorkflow(t *testing.T) {
 		ResourceGroup:              "rg-456",
 		Location:                   "westus2",
 		ServiceGatewayResourceName: "sgw-789",
-		ServiceGatewayID:           "/subscriptions/sub-123/resourceGroups/rg-456/providers/Microsoft.Network/serviceGateways/sgw-789",
 	}
 
 	pip, natGw, servicesDTO := buildOutboundServiceResources(egressUID, nil, dtConfig)
@@ -296,7 +292,7 @@ func TestOutboundWorkflow(t *testing.T) {
 
 	// Verify NAT Gateway references ServiceGateway
 	assert.NotNil(t, natGw.Properties.ServiceGateway)
-	assert.Equal(t, dtConfig.ServiceGatewayID, *natGw.Properties.ServiceGateway.ID)
+	assert.Equal(t, dtConfig.ServiceGatewayResourceID(), *natGw.Properties.ServiceGateway.ID)
 
 	// Verify NAT Gateway references PIP
 	assert.Len(t, natGw.Properties.PublicIPAddresses, 1)
@@ -315,7 +311,6 @@ func TestMultipleServicesIndependence(t *testing.T) {
 		ResourceGroup:              "rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "sgw",
-		ServiceGatewayID:           "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/serviceGateways/sgw",
 	}
 
 	// Create resources for service 1
@@ -363,7 +358,6 @@ func TestConfigValidationInWorkflow(t *testing.T) {
 				Location:                   "eastus",
 				VNetName:                   "test-vnet",
 				ServiceGatewayResourceName: "sgw",
-				ServiceGatewayID:           "/sub/rg/sgw",
 			},
 			shouldError: false,
 		},
@@ -373,7 +367,6 @@ func TestConfigValidationInWorkflow(t *testing.T) {
 				ResourceGroup:              "rg",
 				Location:                   "eastus",
 				ServiceGatewayResourceName: "sgw",
-				ServiceGatewayID:           "/sub/rg/sgw",
 			},
 			shouldError: true,
 		},
@@ -384,7 +377,6 @@ func TestConfigValidationInWorkflow(t *testing.T) {
 				ResourceGroup:              "rg",
 				Location:                   "",
 				ServiceGatewayResourceName: "sgw",
-				ServiceGatewayID:           "/sub/rg/sgw",
 			},
 			shouldError: true,
 		},
@@ -424,7 +416,6 @@ func TestLBRuleNaming(t *testing.T) {
 		ResourceGroup:              "rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "sgw",
-		ServiceGatewayID:           "/sub/rg/sgw",
 	}
 
 	_, lb, _, err := buildInboundServiceResources("test-svc", config, dtConfig)
@@ -451,7 +442,6 @@ func TestBackendPoolPopulation(t *testing.T) {
 		ResourceGroup:              "rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "sgw",
-		ServiceGatewayID:           "/sub/rg/sgw",
 	}
 
 	serviceUID := "my-service-uid"
@@ -502,7 +492,6 @@ func TestRoundTripServiceToResourcesAndBack(t *testing.T) {
 		ResourceGroup:              "prod-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "prod-sgw",
-		ServiceGatewayID:           "/subscriptions/prod-sub/resourceGroups/prod-rg/providers/Microsoft.Network/serviceGateways/prod-sgw",
 	}
 
 	pip, lb, servicesDTO, err := buildInboundServiceResources(string(originalService.UID), config, dtConfig)

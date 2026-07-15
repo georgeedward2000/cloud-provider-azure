@@ -18,7 +18,6 @@ package difftracker
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -50,7 +49,7 @@ func New(logger logr.Logger, k8s K8sState, nrp NRPState, config Config, networkC
 		"resourceGroup", config.ResourceGroup,
 		"location", config.Location,
 		"serviceGatewayResourceName", config.ServiceGatewayResourceName,
-		"serviceGatewayID", config.ServiceGatewayID,
+		"serviceGatewayID", config.ServiceGatewayResourceID(),
 		"vnetName", config.VNetName)
 
 	// The caller is expected to pass fully initialized state structs. A nil
@@ -119,20 +118,19 @@ func (dt *DiffTracker) SetServiceLister(lister corelisters.ServiceLister) {
 	dt.serviceLister = lister
 }
 
+// SetNodeLister publishes the provider's shared-informer-backed Node lister to the engine.
+func (dt *DiffTracker) SetNodeLister(lister corelisters.NodeLister) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.nodeLister = lister
+}
+
 // SetEventRecorder publishes the recorder used to emit Service Gateway pod events. Set post-init,
 // before the egress pod informer starts.
 func (dt *DiffTracker) SetEventRecorder(recorder record.EventRecorder) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
 	dt.eventRecorder = recorder
-}
-
-// SetEndpointSlicesCache publishes the provider's shared EndpointSlice cache, replayed by
-// ReconcileNodeIPChange. Set post-init, before the node informer handlers run.
-func (dt *DiffTracker) SetEndpointSlicesCache(cache *sync.Map) {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
-	dt.endpointSlicesCache = cache
 }
 
 // lockWithLatency acquires dt.mu and returns a release function that unlocks it and,

@@ -17,6 +17,11 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
+	discovery_v1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -368,14 +373,32 @@ func TestUpdateService_RecreateAfterDeletionReplays(t *testing.T) {
 }
 
 // TestUpdateService_RecreateAfterDeletionPreservesEndpoints verifies that a
-// LoadBalancer->ClusterIP->LoadBalancer toggle caught mid-deletion keeps its backend endpoints. When
-// IsServiceRecreating is true the provider re-seeds endpoints via UpdateEndpoints; the engine buffers
-// them during the deletion window (RecreateAfterDeletion) and promotePendingEndpointsLocked replays
-// them when the recreate's create completes, instead of bringing the LB back with an empty pool.
+// LoadBalancer->ClusterIP->LoadBalancer toggle caught mid-deletion keeps its backend endpoints.
+// UpdateService replays the unchanged EndpointSlice itself and buffers it during the deletion window;
+// promotePendingEndpointsLocked then restores it when the recreate completes.
 func TestUpdateService_RecreateAfterDeletionPreservesEndpoints(t *testing.T) {
 	dt := newTestDiffTracker()
 	uid := "svc-recreate-endpoints"
 	const node, addr = "10.0.0.2", "10.244.0.2"
+	dt.ReconcileEndpointSlice(nil, &discovery_v1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "eps1",
+			Namespace:       "test",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "Service", UID: types.UID(uid)}},
+		},
+		AddressType: discovery_v1.AddressTypeIPv4,
+		Endpoints: []discovery_v1.Endpoint{{
+			Addresses:  []string{addr},
+			NodeName:   ptr.To("node1"),
+			Conditions: discovery_v1.EndpointConditions{Ready: ptr.To(true)},
+		}},
+	})
+	setTestNodeLister(t, dt, &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node1"},
+		Status: v1.NodeStatus{Addresses: []v1.NodeAddress{
+			{Type: v1.NodeInternalIP, Address: node},
+		}},
+	})
 
 	cfg := NewInboundServiceConfig(uid, makeInboundConfig(80))
 	applied := cfg
@@ -400,10 +423,8 @@ func TestUpdateService_RecreateAfterDeletionPreservesEndpoints(t *testing.T) {
 	dt.DeleteService(uid, true, false)
 	// Service -> LoadBalancer again while deleting: UpdateService queues the recreate.
 	dt.UpdateService(NewInboundServiceConfig(uid, makeInboundConfig(80)))
-	assert.True(t, dt.IsServiceRecreating(uid), "the recreate must be queued so the provider re-seeds endpoints")
-
-	// The provider re-seeds the current endpoints; the engine buffers them (RecreateAfterDeletion).
-	dt.UpdateEndpoints(uid, nil, map[string]string{addr: node})
+	assert.True(t, dt.pendingServiceOps[uid].RecreateAfterDeletion, "the recreate must be queued")
+	assert.Len(t, dt.pendingEndpoints[uid], 1, "the engine must replay and buffer unchanged endpoints")
 
 	// Locations drain; CheckPendingServiceDeletions promotes the op and the delete dispatches.
 	delete(dt.NRPResources.Locations, node)

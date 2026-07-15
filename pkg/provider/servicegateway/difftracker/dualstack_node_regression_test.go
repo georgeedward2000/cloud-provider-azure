@@ -17,7 +17,7 @@ limitations under the License.
 // Regression tests for single-stack (IPv4 OR IPv6) services and egress pods running on
 // DUAL-STACK nodes. The cold-start importer (processK8sEndpoints / processK8sEgresses) must key
 // each pod under the node InternalIP whose IP family matches the address, exactly as the runtime
-// EndpointSlice/pod informer path does (getPodIPToNodeIPMapFromEndpointSlice / AddPod uses
+// EndpointSlice/pod informer path does (endpointSliceAddresses / AddPod uses
 // pod.Status.HostIP). A family-blind key (e.g. the node's first InternalIP) would land an IPv6
 // pod under the node's IPv4 location at init while runtime keys it under the IPv6 location,
 // orphaning the IPv6 location across a CCM restart.

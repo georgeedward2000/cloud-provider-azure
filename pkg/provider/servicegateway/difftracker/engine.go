@@ -127,6 +127,9 @@ func (dt *DiffTracker) AddService(config ServiceConfig) {
 	// Release lock before triggering to avoid lock contention
 	dt.mu.Unlock()
 
+	if config.IsInbound {
+		dt.seedInboundEndpointsFromCache(serviceUID)
+	}
 	dt.triggerServiceUpdater()
 }
 
@@ -444,6 +447,7 @@ func (dt *DiffTracker) UpdateService(config ServiceConfig) {
 		opState.Config = config
 		opState.RecreateAfterDeletion = true
 		dt.mu.Unlock()
+		dt.seedInboundEndpointsFromCache(serviceUID)
 		dt.logger.V(5).Info("Buffered service recreate intent during deletion", "service", serviceUID)
 
 	default:
@@ -1672,15 +1676,4 @@ func (dt *DiffTracker) IsServiceTracked(serviceUID string) bool {
 		return true
 	}
 	return false
-}
-
-// IsServiceRecreating reports whether the service has a queued recreate-after-deletion: a
-// LoadBalancer->ClusterIP->LoadBalancer toggle caught while the delete was in flight. The provider
-// uses this to re-seed endpoints (DeleteService wiped them) so the recreated LoadBalancer does not
-// come up with an empty backend pool.
-func (dt *DiffTracker) IsServiceRecreating(serviceUID string) bool {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
-	op, ok := dt.pendingServiceOps[serviceUID]
-	return ok && op.RecreateAfterDeletion
 }

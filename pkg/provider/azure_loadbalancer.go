@@ -336,24 +336,8 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 		// AddService creates the LB/PIP/SGW registration.
 		if az.diffTracker.IsServiceTracked(serviceUID) {
 			az.diffTracker.UpdateService(config)
-			// If the Service toggled ClusterIP->LoadBalancer while a delete was in flight, the
-			// engine queues a recreate but DeleteService already wiped the endpoint state, and the
-			// EndpointSlice informer emits nothing (the slices are unchanged). Re-seed the current
-			// endpoints from the cache so the recreated LB has its backend pods: the engine buffers
-			// them (RecreateAfterDeletion) and promotePendingEndpointsLocked replays them once the
-			// recreate completes. UpdateEndpoints is idempotent, so this is safe.
-			if az.diffTracker.IsServiceRecreating(serviceUID) {
-				az.seedInboundEndpointsFromCache(serviceUID)
-			}
 		} else {
 			az.diffTracker.AddService(config)
-			// The EndpointSlice informer only emits events when a slice changes, so a service
-			// re-registered without any slice change (most notably a ClusterIP->LoadBalancer
-			// type flip, where the Service and its slices are unchanged) would otherwise come up
-			// with an empty backend pool. Seed the current endpoints now; UpdateEndpoints is
-			// idempotent, so this is harmless for genuinely new services whose slice event will
-			// also arrive.
-			az.seedInboundEndpointsFromCache(serviceUID)
 		}
 
 		// Return the existing LoadBalancer status to prevent the service controller from clearing it.

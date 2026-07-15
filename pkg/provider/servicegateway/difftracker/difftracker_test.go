@@ -157,7 +157,6 @@ func TestInitializeDiffTracker(t *testing.T) {
 		VNetName:       "test-vnet",
 
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-subscription/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	// For this test, we're only testing state tracking logic, not Azure API calls
@@ -233,7 +232,6 @@ func validTestConfig() Config {
 		Location:                   "eastus",
 		VNetName:                   "test-vnet",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-subscription/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 }
 

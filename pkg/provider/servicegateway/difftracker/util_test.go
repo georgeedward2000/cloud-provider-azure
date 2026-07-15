@@ -648,7 +648,6 @@ func TestConfigValidate(t *testing.T) {
 				Location:                   "eastus",
 				VNetName:                   "test-vnet",
 				ServiceGatewayResourceName: "sgw",
-				ServiceGatewayID:           "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/serviceGateways/sgw",
 			},
 			shouldError: false,
 		},
@@ -658,7 +657,6 @@ func TestConfigValidate(t *testing.T) {
 				ResourceGroup:              "rg1",
 				Location:                   "eastus",
 				ServiceGatewayResourceName: "sgw",
-				ServiceGatewayID:           "/id",
 			},
 			shouldError: true,
 			errorMsg:    "SubscriptionID is required",
@@ -669,7 +667,6 @@ func TestConfigValidate(t *testing.T) {
 				SubscriptionID:             "sub1",
 				Location:                   "eastus",
 				ServiceGatewayResourceName: "sgw",
-				ServiceGatewayID:           "/id",
 			},
 			shouldError: true,
 			errorMsg:    "ResourceGroup is required",
@@ -680,7 +677,6 @@ func TestConfigValidate(t *testing.T) {
 				SubscriptionID:             "sub1",
 				ResourceGroup:              "rg1",
 				ServiceGatewayResourceName: "sgw",
-				ServiceGatewayID:           "/id",
 			},
 			shouldError: true,
 			errorMsg:    "Location is required",
@@ -688,24 +684,12 @@ func TestConfigValidate(t *testing.T) {
 		{
 			name: "missing ServiceGatewayResourceName",
 			config: Config{
-				SubscriptionID:   "sub1",
-				ResourceGroup:    "rg1",
-				Location:         "eastus",
-				ServiceGatewayID: "/id",
+				SubscriptionID: "sub1",
+				ResourceGroup:  "rg1",
+				Location:       "eastus",
 			},
 			shouldError: true,
 			errorMsg:    "ServiceGatewayResourceName is required",
-		},
-		{
-			name: "missing ServiceGatewayID",
-			config: Config{
-				SubscriptionID:             "sub1",
-				ResourceGroup:              "rg1",
-				Location:                   "eastus",
-				ServiceGatewayResourceName: "sgw",
-			},
-			shouldError: true,
-			errorMsg:    "ServiceGatewayID is required",
 		},
 	}
 
@@ -720,6 +704,17 @@ func TestConfigValidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfigServiceGatewayResourceID(t *testing.T) {
+	config := Config{
+		SubscriptionID:             "sub1",
+		ResourceGroup:              "rg1",
+		ServiceGatewayResourceName: "sgw",
+	}
+	assert.Equal(t,
+		"/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/serviceGateways/sgw",
+		config.ServiceGatewayResourceID())
 }
 
 // TestJSONRoundTrip tests JSON marshaling/unmarshaling for various types

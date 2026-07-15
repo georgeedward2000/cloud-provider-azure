@@ -44,7 +44,6 @@ func testConfig() Config {
 		Location:                   "eastus",
 		VNetName:                   "vnet",
 		ServiceGatewayResourceName: "sgw",
-		ServiceGatewayID:           "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/serviceGateways/sgw",
 	}
 }
 

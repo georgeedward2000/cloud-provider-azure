@@ -287,7 +287,6 @@ func TestBuildInboundServiceResources_WithConfig(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	pip, lb, servicesDTO, err := buildInboundServiceResources("service-uid-123", config, dtConfig)
@@ -338,7 +337,6 @@ func TestBuildInboundServiceResources_NilConfig(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	pip, lb, servicesDTO, err := buildInboundServiceResources("service-uid-123", nil, dtConfig)
@@ -375,7 +373,6 @@ func TestBuildInboundServiceResources_UDPProtocol(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "westus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	_, lb, _, err := buildInboundServiceResources("service-uid-udp", config, dtConfig)
@@ -397,7 +394,6 @@ func TestBuildOutboundServiceResources_Basic(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "centralus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	pip, natGw, servicesDTO := buildOutboundServiceResources("egress-uid-456", nil, dtConfig)
@@ -416,7 +412,7 @@ func TestBuildOutboundServiceResources_Basic(t *testing.T) {
 
 	// Verify NAT Gateway has ServiceGateway reference
 	assert.NotNil(t, natGw.Properties.ServiceGateway)
-	assert.Equal(t, dtConfig.ServiceGatewayID, *natGw.Properties.ServiceGateway.ID)
+	assert.Equal(t, dtConfig.ServiceGatewayResourceID(), *natGw.Properties.ServiceGateway.ID)
 
 	// Verify NAT Gateway has PIP reference
 	assert.Len(t, natGw.Properties.PublicIPAddresses, 1)
@@ -439,7 +435,6 @@ func TestBuildInboundServiceResources_BackendPoolNaming(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	_, lb, _, err := buildInboundServiceResources("my-service-uid", config, dtConfig)
@@ -466,7 +461,6 @@ func TestBuildInboundServiceResources_NoProbesForPodIPBackend(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	_, lb, _, err := buildInboundServiceResources("service-uid", config, dtConfig)
@@ -491,7 +485,6 @@ func TestBuildInboundServiceResources_ResourceIDs(t *testing.T) {
 		ResourceGroup:              "rg-456",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "sgw-789",
-		ServiceGatewayID:           "/subscriptions/sub-123/resourceGroups/rg-456/providers/Microsoft.Network/serviceGateways/sgw-789",
 	}
 
 	pip, lb, _, err := buildInboundServiceResources("svc-abc", config, dtConfig)

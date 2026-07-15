@@ -95,6 +95,7 @@ func InitializeFromCluster(
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize DiffTracker: %w", err)
 	}
+	diffTracker.initializeEndpointSlicesCache(endpointSliceList)
 
 	// FIX FOR ORPHANED SERVICES: We intentionally do NOT enhance NRP state with orphaned Azure resources.
 	// Orphaned resources are LBs/NATs that exist in Azure but are NOT registered in ServiceGateway.
@@ -263,7 +264,7 @@ func buildK8sState(
 // buildNodeNameToIPsMap maps each node name to ALL of its NodeInternalIPs. On a dual-stack node
 // this includes both the IPv4 and IPv6 internal IP. Keeping every family (rather than only the
 // first one) lets init pick the IP-family-matched location key, mirroring the runtime EndpointSlice
-// path (getPodIPToNodeIPMapFromEndpointSlice) so init and runtime agree on the location key for the
+// path (endpointSliceAddresses) so init and runtime agree on the location key for the
 // same pod. A mismatch would orphan IPv6 (or IPv4) locations across a CCM restart.
 func buildNodeNameToIPsMap(ctx context.Context, kubeClient kubernetes.Interface) (map[string][]string, error) {
 	logger := log.FromContextOrBackground(ctx)
@@ -278,7 +279,7 @@ func buildNodeNameToIPsMap(ctx context.Context, kubeClient kubernetes.Interface)
 		n := &nodeList.Items[i]
 		for _, addr := range n.Status.Addresses {
 			if addr.Type == v1.NodeInternalIP {
-				// Canonicalize so location keys match runtime (getPodIPToNodeIPMapFromEndpointSlice)
+				// Canonicalize so location keys match runtime (endpointSliceAddresses)
 				// and NRP state; a non-canonical IPv6 InternalIP would otherwise orphan the location
 				// across a restart diff.
 				nodeNameToIPsMap[n.Name] = append(nodeNameToIPsMap[n.Name], canonicalIP(addr.Address))
@@ -314,7 +315,7 @@ func SelectSameFamilyNodeIP(nodeIPs []string, wantIPv6 bool) (string, bool) {
 }
 
 // nodeIPForEndpointSlice returns the node InternalIP whose IP family matches the EndpointSlice's
-// AddressType, mirroring the runtime getPodIPToNodeIPMapFromEndpointSlice selection. ok is false
+// AddressType, mirroring the runtime endpointSliceAddresses selection. ok is false
 // for an unsupported AddressType (e.g. FQDN — not a PodIP backend address) or when the node has no
 // internal IP of the required family. This keeps the init-time location key identical to the
 // runtime key so the restart diff is empty for an unchanged dual-stack cluster.
@@ -604,7 +605,7 @@ func processK8sEndpoints(
 
 		for _, endpoint := range endpointSlice.Endpoints {
 			// Skip endpoints that are not ready, matching the runtime EndpointSlice informer
-			// path (getPodIPToNodeIPMapFromEndpointSlice). Per the EndpointSlice API contract a
+			// path (endpointSliceAddresses). Per the EndpointSlice API contract a
 			// nil Ready condition is interpreted as "true", so only an explicit Ready=false
 			// endpoint is excluded. Without this, a CCM restart imports not-ready pod IPs as LB
 			// backends that the runtime diff can never remove (they were never in its snapshots),
@@ -617,7 +618,7 @@ func processK8sEndpoints(
 			}
 
 			// Use the node InternalIP whose family matches the EndpointSlice AddressType,
-			// matching the runtime path (getPodIPToNodeIPMapFromEndpointSlice). Without this an
+			// matching the runtime path (endpointSliceAddresses). Without this an
 			// IPv6 slice would be keyed under the node's IPv4 InternalIP at init while runtime
 			// keys it under the IPv6 InternalIP, orphaning the IPv6 location across a restart.
 			nodeIP, ok := nodeIPForEndpointSlice(nodeNameToIPsMap[*endpoint.NodeName], endpointSlice.AddressType)
@@ -629,7 +630,7 @@ func processK8sEndpoints(
 			ensureNodeExists(k8s, nodeIP)
 			for _, podIP := range endpoint.Addresses {
 				// Skip malformed addresses; a bad value would poison the AddressLocations payload and
-				// make NRP reject the whole batch (matches getPodIPToNodeIPMapFromEndpointSlice).
+				// make NRP reject the whole batch (matches endpointSliceAddresses).
 				// Canonicalize the address so the key matches the runtime path and NRP state.
 				addr, err := netip.ParseAddr(podIP)
 				if err != nil {

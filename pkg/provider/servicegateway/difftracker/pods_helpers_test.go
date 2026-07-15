@@ -46,7 +46,6 @@ func seedDiffTracker(t *testing.T, clientFactory *mock_azclient.MockClientFactor
 			Location:                   "eastus",
 			VNetName:                   "vnet",
 			ServiceGatewayResourceName: "sgw",
-			ServiceGatewayID:           "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/serviceGateways/sgw",
 		},
 		clientFactory,
 		kubeClient,

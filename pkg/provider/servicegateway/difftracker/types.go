@@ -429,11 +429,15 @@ type DiffTracker struct {
 	// SetServiceLister once SetInformers has run. It is nil until then (and in tests), in which
 	// case getServiceByUID falls back to a direct apiserver read. Guarded by mu.
 	serviceLister corelisters.ServiceLister
+	// nodeLister is the provider's shared-informer-backed Node lister used to resolve EndpointSlice
+	// node names to InternalIPs. Guarded by mu.
+	nodeLister corelisters.NodeLister
 
 	// eventRecorder emits Service Gateway pod events; set post-init before the egress informer starts.
 	eventRecorder record.EventRecorder
-	// endpointSlicesCache is the provider's shared EndpointSlice cache, replayed by ReconcileNodeIPChange.
-	endpointSlicesCache *sync.Map
+	// endpointSlicesCache is owned by difftracker and stores snapshots from forwarded informer
+	// events. It is replayed when a service is registered and by ReconcileNodeIPChange.
+	endpointSlicesCache sync.Map
 
 	// Engine state management
 	pendingServiceOps       map[string]*ServiceOperationState

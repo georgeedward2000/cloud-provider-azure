@@ -79,7 +79,6 @@ func TestBuildInboundServiceResources_MismatchedPortCounts(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	_, lb, _, err := buildInboundServiceResources("test-service", config, dtConfig)
@@ -111,7 +110,6 @@ func TestBuildInboundServiceResources_EmptyConfig(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	_, lb, _, err := buildInboundServiceResources("test-service", config, dtConfig)
@@ -136,7 +134,6 @@ func TestBuildInboundServiceResources_LongServiceUID(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	pip, lb, _, err := buildInboundServiceResources(longUID, config, dtConfig)
@@ -155,7 +152,6 @@ func TestBuildOutboundServiceResources_NilConfig(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "westus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	pip, natGw, servicesDTO := buildOutboundServiceResources("egress-123", nil, dtConfig)
@@ -185,7 +181,6 @@ func TestBuildInboundServiceResources_MultipleConfigs(t *testing.T) {
 		ResourceGroup:              "test-rg",
 		Location:                   "eastus",
 		ServiceGatewayResourceName: "test-sgw",
-		ServiceGatewayID:           "/subscriptions/test-sub/resourceGroups/test-rg/providers/Microsoft.Network/serviceGateways/test-sgw",
 	}
 
 	pip1, lb1, _, err := buildInboundServiceResources("service-1", config1, dtConfig)
@@ -216,7 +211,6 @@ func TestConfigValidation_AllFieldsRequired(t *testing.T) {
 				Location:                   "eastus",
 				VNetName:                   "test-vnet",
 				ServiceGatewayResourceName: "sgw-789",
-				ServiceGatewayID:           "/subscriptions/sub-123/resourceGroups/rg-456/providers/Microsoft.Network/serviceGateways/sgw-789",
 			},
 			expectError: false,
 		},
@@ -226,7 +220,6 @@ func TestConfigValidation_AllFieldsRequired(t *testing.T) {
 				ResourceGroup:              "rg-456",
 				Location:                   "eastus",
 				ServiceGatewayResourceName: "sgw-789",
-				ServiceGatewayID:           "/subscriptions/sub-123/resourceGroups/rg-456/providers/Microsoft.Network/serviceGateways/sgw-789",
 			},
 			expectError: true,
 		},
@@ -236,7 +229,6 @@ func TestConfigValidation_AllFieldsRequired(t *testing.T) {
 				SubscriptionID:             "sub-123",
 				Location:                   "eastus",
 				ServiceGatewayResourceName: "sgw-789",
-				ServiceGatewayID:           "/subscriptions/sub-123/resourceGroups/rg-456/providers/Microsoft.Network/serviceGateways/sgw-789",
 			},
 			expectError: true,
 		},
@@ -246,27 +238,15 @@ func TestConfigValidation_AllFieldsRequired(t *testing.T) {
 				SubscriptionID:             "sub-123",
 				ResourceGroup:              "rg-456",
 				ServiceGatewayResourceName: "sgw-789",
-				ServiceGatewayID:           "/subscriptions/sub-123/resourceGroups/rg-456/providers/Microsoft.Network/serviceGateways/sgw-789",
 			},
 			expectError: true,
 		},
 		{
 			name: "missing ServiceGatewayResourceName",
 			config: Config{
-				SubscriptionID:   "sub-123",
-				ResourceGroup:    "rg-456",
-				Location:         "eastus",
-				ServiceGatewayID: "/subscriptions/sub-123/resourceGroups/rg-456/providers/Microsoft.Network/serviceGateways/sgw-789",
-			},
-			expectError: true,
-		},
-		{
-			name: "missing ServiceGatewayID",
-			config: Config{
-				SubscriptionID:             "sub-123",
-				ResourceGroup:              "rg-456",
-				Location:                   "eastus",
-				ServiceGatewayResourceName: "sgw-789",
+				SubscriptionID: "sub-123",
+				ResourceGroup:  "rg-456",
+				Location:       "eastus",
 			},
 			expectError: true,
 		},
@@ -467,7 +447,6 @@ func TestInitOutboundRefCount_NotNegativeOnServiceUIDEgressLabelCollision(t *tes
 		ResourceGroup:              "rg",
 		Location:                   "loc",
 		ServiceGatewayResourceName: "sgw",
-		ServiceGatewayID:           "/sgw/id",
 		VNetName:                   "vnet",
 	}
 	dt, err := New(logr.Discard(), k8s, nrp, cfg, mock_azclient.NewMockClientFactory(ctrl), kube)

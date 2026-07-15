@@ -268,7 +268,7 @@ func buildOutboundServiceResources(serviceUID string, config *OutboundConfig, dt
 		Location: to.Ptr(dtConfig.Location),
 		Properties: &armnetwork.NatGatewayPropertiesFormat{
 			ServiceGateway: &armnetwork.SubResource{
-				ID: to.Ptr(dtConfig.ServiceGatewayID),
+				ID: to.Ptr(dtConfig.ServiceGatewayResourceID()),
 			},
 			PublicIPAddresses: []*armnetwork.SubResource{
 				{

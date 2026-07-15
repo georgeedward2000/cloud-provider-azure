@@ -49,7 +49,6 @@ func seededProviderDiffTracker(t *testing.T, az *Cloud, kubeClient kubernetes.In
 			VNetName:                   az.VnetName,
 			VNetResourceGroup:          az.VnetResourceGroup,
 			ServiceGatewayResourceName: consts.DefaultServiceGatewayResourceName,
-			ServiceGatewayID:           az.GetServiceGatewayID(),
 		},
 		az.NetworkClientFactory,
 		kubeClient,
