@@ -31,14 +31,17 @@ import (
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
-// egressIdentityRegex matches a valid (lowercased) Azure NAT Gateway resource name: it starts with
-// an alphanumeric, contains only alphanumerics, hyphens, underscores and periods, ends with an
-// alphanumeric or underscore, and is 1-76 characters long. The 76 cap (not Azure's 80) reserves room
-// for the 4-char "-pip" suffix so the derived Public IP name (identity+"-pip") stays within Azure's
-// 80-char publicIPAddresses limit.
-var egressIdentityRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]{0,74}[a-z0-9_])?$`)
+const (
+	publicIPNameSuffix    = "-pip"
+	publicIPNameMaxLength = 80
+)
 
-const publicIPNameSuffix = "-pip"
+// egressIdentityRegex matches a valid (lowercased) Azure NAT Gateway resource name and reserves
+// enough room for publicIPNameSuffix within Azure's Public IP resource-name limit.
+var egressIdentityRegex = regexp.MustCompile(fmt.Sprintf(
+	`^[a-z0-9]([a-z0-9._-]{0,%d}[a-z0-9_])?$`,
+	publicIPNameMaxLength-len(publicIPNameSuffix)-2,
+))
 
 // ServiceUID returns the canonical ServiceGateway identity for a Kubernetes Service.
 func ServiceUID(service *v1.Service) string {
