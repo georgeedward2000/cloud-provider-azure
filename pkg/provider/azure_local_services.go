@@ -317,13 +317,10 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 					return
 				}
 
-				var svcName string
-				if !az.ServiceGatewayEnabled {
-					svcName = getServiceNameOfEndpointSlice(newES)
-					if svcName == "" {
-						klog.V(4).Infof("EndpointSlice %s/%s does not have service name label, skip updating load balancer backend pool", newES.Namespace, newES.Name)
-						return
-					}
+				svcName := getServiceNameOfEndpointSlice(newES)
+				if svcName == "" {
+					klog.V(4).Infof("EndpointSlice %s/%s does not have service name label, skip updating load balancer backend pool", newES.Namespace, newES.Name)
+					return
 				}
 
 				klog.V(4).Infof("Detecting EndpointSlice %s/%s update", newES.Namespace, newES.Name)
