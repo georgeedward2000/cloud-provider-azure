@@ -431,7 +431,7 @@ func (s *ServiceUpdater) createInboundService(serviceUID string, config *Inbound
 		s.onComplete(serviceUID, false, fmt.Errorf("failed to create Public IP: %w", err))
 		return
 	}
-	pipName := fmt.Sprintf("%s-pip", serviceUID)
+	pipName := PublicIPName(serviceUID)
 	s.logger.V(5).Info("Created Public IP for inbound service", "serviceUID", serviceUID, "publicIP", pipName)
 
 	// Extract IP address from PIP response
@@ -560,7 +560,7 @@ func (s *ServiceUpdater) createOutboundService(serviceUID string, config *Outbou
 		s.onComplete(serviceUID, false, fmt.Errorf("failed to create Public IP: %w", err))
 		return
 	}
-	pipName := fmt.Sprintf("%s-pip", serviceUID)
+	pipName := PublicIPName(serviceUID)
 	s.logger.V(5).Info("Created Public IP for outbound service", "serviceUID", serviceUID, "publicIP", pipName)
 
 	// Step 3: Create NAT Gateway

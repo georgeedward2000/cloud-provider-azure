@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	v1 "k8s.io/api/core/v1"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 )
 
 // triggerLocationsUpdater sends a non-blocking trigger to the LocationsUpdater.
@@ -62,6 +65,64 @@ func (dt *DiffTracker) triggerServiceUpdater() {
 		}
 		dt.logger.V(4).Info("Dropped service updater trigger because channel is full")
 	}
+}
+
+// ReconcileInboundService validates and translates a Kubernetes LoadBalancer Service into the
+// desired configuration owned by the ServiceGateway engine.
+func (dt *DiffTracker) ReconcileInboundService(service *v1.Service) error {
+	if service == nil {
+		return fmt.Errorf("cannot reconcile a nil inbound Service")
+	}
+
+	serviceUID := ServiceUID(service)
+	if serviceUID == "" {
+		return fmt.Errorf("cannot reconcile inbound Service %s/%s without a UID", service.Namespace, service.Name)
+	}
+
+	dt.logger.V(2).Info("Reconciling inbound Service", "serviceUID", serviceUID)
+
+	if service.Annotations[consts.ServiceAnnotationLoadBalancerInternal] == consts.TrueAnnotationValue {
+		return &InboundConfigValidationError{
+			Reason:  "UnsupportedInternalLoadBalancer",
+			Message: fmt.Sprintf("internal load balancer is not supported when ServiceGateway is enabled; remove the %q annotation", consts.ServiceAnnotationLoadBalancerInternal),
+		}
+	}
+
+	inboundConfig := ExtractInboundConfigFromService(service)
+	if inboundConfig == nil {
+		return nil
+	}
+	if err := ValidateInboundConfig(inboundConfig); err != nil {
+		return err
+	}
+
+	config := NewInboundServiceConfig(serviceUID, inboundConfig)
+	config.Namespace = service.Namespace
+	config.Name = service.Name
+
+	if dt.IsServiceTracked(serviceUID) {
+		dt.UpdateService(config)
+	} else {
+		dt.AddService(config)
+	}
+	return nil
+}
+
+// DeleteInboundService translates a Kubernetes LoadBalancer Service deletion into the inbound
+// deletion request understood by the ServiceGateway engine.
+func (dt *DiffTracker) DeleteInboundService(service *v1.Service) error {
+	if service == nil {
+		return fmt.Errorf("cannot delete a nil inbound Service")
+	}
+
+	serviceUID := ServiceUID(service)
+	if serviceUID == "" {
+		return fmt.Errorf("cannot delete inbound Service %s/%s without a UID", service.Namespace, service.Name)
+	}
+
+	dt.logger.V(2).Info("Deleting inbound Service", "serviceUID", serviceUID)
+	dt.DeleteService(serviceUID, true, false)
+	return nil
 }
 
 // AddService handles service creation events for inbound (Load Balancer) services.

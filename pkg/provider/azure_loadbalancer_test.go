@@ -9483,7 +9483,7 @@ func TestServiceGatewayInternalAnnotation_IsRejected(t *testing.T) {
 	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 	assert.Error(t, err, "internal load balancer must be rejected when ServiceGateway is enabled")
 	assert.Nil(t, status, "rejected internal service must not receive an ingress status")
-	assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)), "rejected internal service must not be tracked")
+	assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)), "rejected internal service must not be tracked")
 }
 
 func TestServiceGatewayEnsureLoadBalancer_TracksService(t *testing.T) {
@@ -9501,7 +9501,7 @@ func TestServiceGatewayEnsureLoadBalancer_TracksService(t *testing.T) {
 	if !assert.NoError(t, err) || !assert.NotNil(t, status) {
 		t.FailNow()
 	}
-	assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+	assert.True(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
 }
 
 func TestServiceGatewayEnsureLoadBalancerDeleted_ReturnsNil(t *testing.T) {
@@ -9534,7 +9534,7 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
-		assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+		assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 			"a rejected dual-stack service must not be tracked")
 
 		select {
@@ -9555,7 +9555,7 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
-		assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+		assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 			"a rejected named-targetPort service must not be tracked")
 
 		select {
@@ -9576,7 +9576,7 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
-		assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+		assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 			"a rejected SCTP service must not be tracked")
 
 		select {
@@ -9604,7 +9604,7 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
-		assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+		assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 			"a rejected backend-port-collision service must not be tracked")
 
 		select {
@@ -9644,7 +9644,7 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, status)
-		assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+		assert.True(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
 		assertNoEvent(t, rec)
 	})
 }
@@ -9661,7 +9661,7 @@ func TestServiceGateway_EnsureAndDelete(t *testing.T) {
 		t.FailNow()
 	}
 	assert.NotNil(t, status)
-	assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+	assert.True(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
 
 	err = az.EnsureLoadBalancerDeleted(context.Background(), testClusterName, &svc)
 	assert.NoError(t, err)
@@ -9688,6 +9688,6 @@ func TestServiceGatewayEnsureLoadBalancer_ZeroPortServiceNoPanic(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, status)
 	})
-	assert.False(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)),
+	assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 		"a port-less service has no PodIP backend and must not be tracked")
 }

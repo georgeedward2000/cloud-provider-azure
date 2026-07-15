@@ -22,6 +22,11 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
@@ -46,6 +51,151 @@ func newTestDiffTracker() *DiffTracker {
 		serviceUpdaterTrigger:   make(chan bool, 1),
 		locationsUpdaterTrigger: make(chan bool, 1),
 	}
+}
+
+func TestReconcileInboundService(t *testing.T) {
+	newService := func(uid string, port int32) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test-namespace",
+				Name:      "test-service",
+				UID:       types.UID(uid),
+			},
+			Spec: v1.ServiceSpec{
+				Ports: []v1.ServicePort{{
+					Port:     port,
+					Protocol: v1.ProtocolTCP,
+				}},
+			},
+		}
+	}
+
+	t.Run("adds a new service with provider identity", func(t *testing.T) {
+		dt := newTestDiffTracker()
+		service := newService("SERVICE-UID", 80)
+
+		err := dt.ReconcileInboundService(service)
+
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+		opState, exists := dt.pendingServiceOps["service-uid"]
+		if !assert.True(t, exists) {
+			t.FailNow()
+		}
+		assert.Equal(t, service.Namespace, opState.Config.Namespace)
+		assert.Equal(t, service.Name, opState.Config.Name)
+		assert.Equal(t, int32(80), opState.Config.InboundConfig.FrontendPorts[0].Port)
+	})
+
+	t.Run("updates an already tracked service", func(t *testing.T) {
+		dt := newTestDiffTracker()
+		oldConfig := NewInboundServiceConfig("service-uid", &InboundConfig{
+			FrontendPorts: []PortMapping{{Port: 80, Protocol: string(v1.ProtocolTCP)}},
+			BackendPorts:  []PortMapping{{Port: 80, Protocol: string(v1.ProtocolTCP)}},
+		})
+		dt.pendingServiceOps["service-uid"] = &ServiceOperationState{
+			ServiceUID:        "service-uid",
+			Config:            oldConfig,
+			LastAppliedConfig: &oldConfig,
+			State:             StateCreated,
+		}
+		service := newService("service-uid", 443)
+
+		err := dt.ReconcileInboundService(service)
+
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+		opState := dt.pendingServiceOps["service-uid"]
+		assert.Equal(t, StateUpdateInProgress, opState.State)
+		assert.Equal(t, int32(443), opState.Config.InboundConfig.FrontendPorts[0].Port)
+		assert.Equal(t, service.Namespace, opState.Config.Namespace)
+		assert.Equal(t, service.Name, opState.Config.Name)
+	})
+
+	t.Run("rejects an internal load balancer with event metadata", func(t *testing.T) {
+		dt := newTestDiffTracker()
+		service := newService("service-uid", 80)
+		service.Annotations = map[string]string{
+			consts.ServiceAnnotationLoadBalancerInternal: consts.TrueAnnotationValue,
+		}
+
+		err := dt.ReconcileInboundService(service)
+
+		var warningErr WarningEventError
+		if assert.ErrorAs(t, err, &warningErr) {
+			reason, message := warningErr.WarningEvent()
+			assert.Equal(t, "UnsupportedInternalLoadBalancer", reason)
+			assert.Contains(t, message, consts.ServiceAnnotationLoadBalancerInternal)
+		}
+		assert.False(t, dt.IsServiceTracked("service-uid"))
+	})
+
+	t.Run("ignores a port-less service", func(t *testing.T) {
+		dt := newTestDiffTracker()
+		service := newService("service-uid", 80)
+		service.Spec.Ports = nil
+
+		err := dt.ReconcileInboundService(service)
+
+		assert.NoError(t, err)
+		assert.False(t, dt.IsServiceTracked("service-uid"))
+	})
+
+	t.Run("rejects a missing service identity", func(t *testing.T) {
+		dt := newTestDiffTracker()
+
+		err := dt.ReconcileInboundService(newService("", 80))
+
+		assert.Error(t, err)
+	})
+}
+
+func TestDeleteInboundService(t *testing.T) {
+	newService := func(uid string) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test-namespace",
+				Name:      "test-service",
+				UID:       types.UID(uid),
+			},
+		}
+	}
+
+	t.Run("deletes the lowercased inbound service identity", func(t *testing.T) {
+		dt := newTestDiffTracker()
+		dt.NRPResources.LoadBalancers.Insert("service-uid")
+
+		err := dt.DeleteInboundService(newService("SERVICE-UID"))
+
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+		opState, exists := dt.pendingServiceOps["service-uid"]
+		if !assert.True(t, exists) {
+			t.FailNow()
+		}
+		assert.True(t, opState.Config.IsInbound)
+		assert.Equal(t, StateDeletionInProgress, opState.State)
+	})
+
+	t.Run("ignores an inbound service absent from engine and NRP state", func(t *testing.T) {
+		dt := newTestDiffTracker()
+
+		err := dt.DeleteInboundService(newService("service-uid"))
+
+		assert.NoError(t, err)
+		assert.False(t, dt.IsServiceTracked("service-uid"))
+	})
+
+	t.Run("rejects a missing service identity", func(t *testing.T) {
+		dt := newTestDiffTracker()
+
+		err := dt.DeleteInboundService(newService(""))
+
+		assert.Error(t, err)
+	})
 }
 
 // TestEngineAddService_NewService tests adding a new service that doesn't exist in NRP

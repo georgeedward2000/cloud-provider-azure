@@ -871,7 +871,7 @@ func TestServiceGatewayEndpointSliceInformer_TracksService(t *testing.T) {
 	kubeClient := fake.NewSimpleClientset(&svc, existingEPS, node1, node2)
 	az.KubeClient = kubeClient
 	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
-	az.diffTracker.NRPResources.LoadBalancers.Insert(getServiceUID(&svc))
+	az.diffTracker.NRPResources.LoadBalancers.Insert(difftracker.ServiceUID(&svc))
 
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	az.serviceLister = informerFactory.Core().V1().Services().Lister()
@@ -904,5 +904,5 @@ func TestServiceGatewayEndpointSliceInformer_TracksService(t *testing.T) {
 	if !assert.True(t, ok, "updated pod address must reach difftracker through the provider informer") {
 		return
 	}
-	assert.True(t, address.ServiceRef.Has(getServiceUID(&svc)))
+	assert.True(t, address.ServiceRef.Has(difftracker.ServiceUID(&svc)))
 }

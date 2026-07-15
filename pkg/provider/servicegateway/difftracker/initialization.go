@@ -565,7 +565,7 @@ func processK8sServices(
 				logger.V(5).Info("Skipped deleting service", "namespace", service.Namespace, "service", service.Name)
 				continue
 			}
-			uid := strings.ToLower(string(service.UID))
+			uid := ServiceUID(&services.Items[i])
 			k8s.Services.Insert(uid)
 			serviceUIDToService[uid] = &services.Items[i]
 		}
@@ -1043,7 +1043,7 @@ func recoverServiceExternalIPs(ctx context.Context, diffTracker *DiffTracker, se
 		logger.V(2).Info("Found service missing External IP", "namespace", svc.Namespace, "service", svc.Name, "uid", serviceUID)
 
 		// Look up IP from pre-fetched PIP map (no API call needed)
-		pipName := fmt.Sprintf("%s-pip", serviceUID)
+		pipName := PublicIPName(serviceUID)
 		ipAddress, exists := pipNameToIP[strings.ToLower(pipName)]
 		if !exists || ipAddress == "" {
 			logger.V(4).Info("Could not recover service External IP", "publicIP", pipName, "serviceUID", serviceUID)

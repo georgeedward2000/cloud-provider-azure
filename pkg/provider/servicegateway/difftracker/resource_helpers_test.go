@@ -13,6 +13,14 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 )
 
+func TestServiceGatewayResourceNaming(t *testing.T) {
+	service := &v1.Service{ObjectMeta: metav1.ObjectMeta{UID: "SERVICE-UID"}}
+
+	assert.Equal(t, "service-uid", ServiceUID(service))
+	assert.Empty(t, ServiceUID(nil))
+	assert.Equal(t, "service-uid-pip", PublicIPName(ServiceUID(service)))
+}
+
 func TestExtractInboundConfigFromService_NilService(t *testing.T) {
 	config := ExtractInboundConfigFromService(nil)
 	assert.Nil(t, config)

@@ -24,6 +24,8 @@ import (
 	"go.uber.org/mock/gomock"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 )
 
 // TestServiceGatewayEnsureLoadBalancerTracksExternalService verifies that EnsureLoadBalancer
@@ -41,5 +43,5 @@ func TestServiceGatewayEnsureLoadBalancerTracksExternalService(t *testing.T) {
 	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, status)
-	assert.True(t, az.diffTracker.IsServiceTracked(getServiceUID(&svc)))
+	assert.True(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
 }

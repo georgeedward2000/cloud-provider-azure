@@ -38,6 +38,21 @@ import (
 // 80-char publicIPAddresses limit.
 var egressIdentityRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]{0,74}[a-z0-9_])?$`)
 
+const publicIPNameSuffix = "-pip"
+
+// ServiceUID returns the canonical ServiceGateway identity for a Kubernetes Service.
+func ServiceUID(service *v1.Service) string {
+	if service == nil {
+		return ""
+	}
+	return strings.ToLower(string(service.UID))
+}
+
+// PublicIPName returns the Public IP resource name associated with a ServiceGateway identity.
+func PublicIPName(identity string) string {
+	return identity + publicIPNameSuffix
+}
+
 // IsValidEgressIdentity reports whether name is a safe egress identity. The identity is derived from
 // a user-controllable pod label and is used verbatim as the NAT Gateway name and as the stem of the
 // Public IP name (identity+"-pip"), and is interpolated into their ARM resource IDs, so it must be
@@ -55,7 +70,7 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 	servicesDTO ServicesDataDTO,
 	err error,
 ) {
-	pipName := fmt.Sprintf("%s-pip", serviceUID)
+	pipName := PublicIPName(serviceUID)
 
 	// Resolve the Public IP version from the Service's IP families. Dual-stack is not
 	// supported for PodIP backend pools, so reject it here; the create path classifies this
@@ -241,7 +256,7 @@ func buildOutboundServiceResources(serviceUID string, config *OutboundConfig, dt
 	natGateway armnetwork.NatGateway,
 	servicesDTO ServicesDataDTO,
 ) {
-	pipName := fmt.Sprintf("%s-pip", serviceUID)
+	pipName := PublicIPName(serviceUID)
 
 	// Build Public IP
 	pip = armnetwork.PublicIPAddress{
@@ -379,6 +394,17 @@ type InboundConfigValidationError struct {
 
 func (e *InboundConfigValidationError) Error() string { return e.Message }
 
+// WarningEventError describes an error that the provider should surface as a Kubernetes warning Event.
+type WarningEventError interface {
+	error
+	WarningEvent() (reason, message string)
+}
+
+// WarningEvent returns the Kubernetes Event metadata for this validation error.
+func (e *InboundConfigValidationError) WarningEvent() (reason, message string) {
+	return e.Reason, e.Message
+}
+
 // ValidateInboundConfig rejects inbound Service specs the PodIP backend pool cannot support,
 // returning an *InboundConfigValidationError whose Reason is the Event reason to surface. Without
 // this fast check the engine would terminal-park the create asynchronously with no visible cause.
@@ -437,12 +463,12 @@ func ValidateInboundConfig(config *InboundConfig) error {
 
 // buildInboundResourceNames returns the resource names for an inbound service
 func buildInboundResourceNames(serviceUID string) (lbName string, pipName string, backendPoolName string) {
-	return serviceUID, fmt.Sprintf("%s-pip", serviceUID), serviceUID
+	return serviceUID, PublicIPName(serviceUID), serviceUID
 }
 
 // buildOutboundResourceNames returns the resource names for an outbound service
 func buildOutboundResourceNames(serviceUID string) (natGatewayName string, pipName string) {
-	return serviceUID, fmt.Sprintf("%s-pip", serviceUID)
+	return serviceUID, PublicIPName(serviceUID)
 }
 
 // buildServiceGatewayRemovalDTO creates a ServicesDTO for removing a service from ServiceGateway
