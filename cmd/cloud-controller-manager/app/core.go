@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/informers"
 	cloudprovider "k8s.io/cloud-provider"
 	nodecontroller "k8s.io/cloud-provider/controllers/node"
 	nodelifecyclecontroller "k8s.io/cloud-provider/controllers/nodelifecycle"
@@ -43,6 +44,11 @@ import (
 	nodeipamconfig "sigs.k8s.io/cloud-provider-azure/pkg/nodeipam/config"
 	"sigs.k8s.io/cloud-provider-azure/pkg/nodeipam/ipam"
 )
+
+type serviceGatewayControllerProvider interface {
+	IsServiceGatewayEnabled() bool
+	StartServiceGatewayController(context.Context, informers.SharedInformerFactory) error
+}
 
 func startCloudNodeController(ctx context.Context, controllerContext genericcontrollermanager.ControllerContext, completedConfig *cloudcontrollerconfig.CompletedConfig, cloud cloudprovider.Interface) (http.Handler, bool, error) {
 	// Start the CloudNodeController
@@ -86,6 +92,12 @@ func startCloudNodeLifecycleController(ctx context.Context, controllerContext ge
 
 func startServiceController(ctx context.Context, controllerContext genericcontrollermanager.ControllerContext, completedConfig *cloudcontrollerconfig.CompletedConfig, cloud cloudprovider.Interface) (http.Handler, bool, error) {
 	logger := log.FromContextOrBackground(ctx).WithName("startServiceController")
+	if serviceGatewayProvider, ok := cloud.(serviceGatewayControllerProvider); ok && serviceGatewayProvider.IsServiceGatewayEnabled() {
+		if err := serviceGatewayProvider.StartServiceGatewayController(ctx, completedConfig.SharedInformers); err != nil {
+			return nil, false, fmt.Errorf("failed to start ServiceGateway controller: %w", err)
+		}
+	}
+
 	// Start the service controller
 	serviceController, err := servicecontroller.New(
 		cloud,
