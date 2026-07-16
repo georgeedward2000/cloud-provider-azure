@@ -543,7 +543,6 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *azurecon
 				VNetName:                   az.VnetName,
 				VNetResourceGroup:          az.VnetResourceGroup,
 				ServiceGatewayResourceName: sgwName,
-				ServiceGatewayID:           difftracker.ServiceGatewayResourceID(az.SubscriptionID, az.ResourceGroup, sgwName),
 			}
 			az.diffTracker, err = difftracker.InitializeFromCluster(ctx, dtConfig, az.NetworkClientFactory, az.KubeClient)
 			if err != nil {
