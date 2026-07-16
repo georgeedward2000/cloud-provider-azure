@@ -59,17 +59,17 @@ func seededProviderDiffTracker(t *testing.T, az *Cloud, kubeClient kubernetes.In
 	return dt
 }
 
-func newSGWCloudWithServiceAndRecorder(t *testing.T, ctrl *gomock.Controller, svc v1.Service) (*Cloud, *record.FakeRecorder) {
+func newSGWCloudWithServiceAndRecorder(t *testing.T, ctrl *gomock.Controller, svc v1.Service) (*Cloud, *difftracker.DiffTracker, *record.FakeRecorder) {
 	t.Helper()
 
 	az := GetTestCloudWithContainerLoadBalancer(ctrl)
 	kubeClient := fake.NewSimpleClientset(&svc)
 	az.KubeClient = kubeClient
-	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+	tracker := newProviderDiffTracker(t, az, kubeClient)
 	rec := record.NewFakeRecorder(10)
 	az.eventRecorder = rec
 
-	return az, rec
+	return az, tracker, rec
 }
 
 func assertNoEvent(t *testing.T, rec *record.FakeRecorder) {

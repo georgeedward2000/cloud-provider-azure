@@ -2,6 +2,7 @@ package difftracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -69,7 +70,16 @@ func (dt *DiffTracker) triggerServiceUpdater() {
 
 // ReconcileInboundService validates and translates a Kubernetes LoadBalancer Service into the
 // desired configuration owned by the ServiceGateway engine.
-func (dt *DiffTracker) ReconcileInboundService(service *v1.Service) error {
+func (dt *DiffTracker) ReconcileInboundService(service *v1.Service) (err error) {
+	defer func() {
+		var warningErr WarningEventError
+		if err == nil || dt.eventRecorder == nil || !errors.As(err, &warningErr) {
+			return
+		}
+		reason, message := warningErr.WarningEvent()
+		dt.eventRecorder.Event(service, v1.EventTypeWarning, reason, message)
+	}()
+
 	if service == nil {
 		return fmt.Errorf("cannot reconcile a nil inbound Service")
 	}
