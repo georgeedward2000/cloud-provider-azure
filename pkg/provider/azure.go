@@ -159,7 +159,7 @@ type Cloud struct {
 
 	azureResourceLocker *AzureResourceLocker
 
-	diffTracker *difftracker.DiffTracker
+	serviceGatewayController *difftracker.Controller
 }
 
 // NewCloud returns a Cloud with initialized clients
@@ -175,13 +175,6 @@ func NewCloud(ctx context.Context, clientBuilder cloudprovider.ControllerClientB
 		nodePrivateIPToNodeNameMap: map[string]string{},
 	}
 
-	if config != nil && config.ServiceGatewayEnabled && callFromCCM {
-		if clientBuilder == nil {
-			return nil, fmt.Errorf("NewCloud: ServiceGateway requires a clientBuilder")
-		}
-		az.KubeClient = clientBuilder.ClientOrDie("azure-cloud-provider")
-	}
-
 	err := az.InitializeCloudFromConfig(ctx, config, false, callFromCCM)
 	if err != nil {
 		return nil, err
@@ -191,6 +184,9 @@ func NewCloud(ctx context.Context, clientBuilder cloudprovider.ControllerClientB
 
 	if az.KubeClient == nil && clientBuilder != nil {
 		az.KubeClient = clientBuilder.ClientOrDie("azure-cloud-provider")
+	}
+	if az.ServiceGatewayEnabled {
+		az.serviceGatewayController = difftracker.NewController(az.serviceGatewayConfig())
 	}
 	az.azureResourceLocker = NewAzureResourceLocker(
 		az,
@@ -527,44 +523,6 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *config.C
 			go az.backendPoolUpdater.run(ctx)
 		}
 
-		// start NRP location and service batch updater.
-		if az.ServiceGatewayEnabled {
-			// Register SLB metrics and mark ServiceGateway as enabled
-			difftracker.RegisterMetrics()
-			difftracker.RecordServiceGatewayEnabled()
-
-			// Service Gateway resources (the gateway, its subnet attachment, and the default outbound
-			// service) are provisioned by the AKS resource provider before CCM starts.
-
-			// Initialize difftracker from cluster state
-			sgwName := consts.DefaultServiceGatewayResourceName
-			dtConfig := difftracker.Config{
-				SubscriptionID:             az.SubscriptionID,
-				ResourceGroup:              az.ResourceGroup,
-				Location:                   az.Location,
-				VNetName:                   az.VnetName,
-				VNetResourceGroup:          az.VnetResourceGroup,
-				ServiceGatewayResourceName: sgwName,
-			}
-			az.diffTracker, err = difftracker.InitializeFromCluster(ctx, dtConfig, az.NetworkClientFactory, az.KubeClient)
-			if err != nil {
-				klog.Errorf("InitializeCloudFromConfig: failed to initialize difftracker: %s", err.Error())
-				return err
-			}
-
-			// Cover the ordering where SetInformers has already run: hand the existing listers to
-			// the freshly built difftracker. When SetInformers runs later it publishes the listers.
-			if az.serviceLister != nil {
-				az.diffTracker.SetServiceLister(az.serviceLister)
-			}
-			if az.nodeLister != nil {
-				az.diffTracker.SetNodeLister(az.nodeLister)
-			}
-
-			// Note: ServiceUpdater and LocationsUpdater are already started by InitializeFromCluster
-			// and continue running for normal operations
-			klog.Infof("InitializeCloudFromConfig: Engine updaters already running from initialization")
-		}
 		// Azure Stack does not support zone at the moment
 		// https://docs.microsoft.com/en-us/azure-stack/user/azure-stack-network-differences?view=azs-2102
 		if !az.IsStackCloud() {
@@ -706,13 +664,13 @@ func (az *Cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder,
 	az.eventBroadcaster = record.NewBroadcaster()
 	az.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: az.KubeClient.CoreV1().Events("")})
 	az.eventRecorder = az.eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "azure-cloud-provider"})
-	if az.ServiceGatewayEnabled {
-		az.diffTracker.SetEventRecorder(az.eventRecorder)
-	}
 }
 
 // LoadBalancer returns a balancer interface. Also returns true if the interface is supported, false otherwise.
 func (az *Cloud) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
+	if az.ServiceGatewayEnabled {
+		return az.serviceGatewayController, az.serviceGatewayController != nil
+	}
 	return az, true
 }
 
@@ -770,27 +728,12 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 			node := obj.(*v1.Node)
 			az.updateNodeCaches(nil, node)
 			az.updateNodeTaint(node)
-			if az.ServiceGatewayEnabled {
-				// A pod scheduled to a node not yet in the cache is dropped by the EndpointSlice
-				// handler; replay this node's slices now that its IPs are known.
-				az.diffTracker.ReconcileNodeIPChange(node.Name, nil, getNodePrivateIPAddresses(node))
-			}
 		},
 		UpdateFunc: func(prev, obj interface{}) {
 			prevNode := prev.(*v1.Node)
 			newNode := obj.(*v1.Node)
 			az.updateNodeCaches(prevNode, newNode)
 			az.updateNodeTaint(newNode)
-			if az.ServiceGatewayEnabled {
-				// A node InternalIP change does not alter its EndpointSlices (they carry nodeName,
-				// not the node IP), so no slice event fires; move the resident pods off the old IP.
-				oldIPs := getNodePrivateIPAddresses(prevNode)
-				newIPs := getNodePrivateIPAddresses(newNode)
-				oldSet, newSet := utilsets.NewString(oldIPs...), utilsets.NewString(newIPs...)
-				if !oldSet.Equals(newSet) {
-					az.diffTracker.ReconcileNodeIPChange(newNode.Name, oldIPs, newIPs)
-				}
-			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			node, isNode := obj.(*v1.Node)
@@ -812,13 +755,6 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 
 			klog.V(4).Infof("Removing node %s from VMSet cache.", node.Name)
 			_ = az.VMSet.DeleteCacheForNode(context.Background(), node.Name)
-
-			if az.ServiceGatewayEnabled {
-				// The node is gone from the cache before its endpoint-removal slice events arrive,
-				// so those events would resolve an empty old location and drain nothing; drain the
-				// resident pods here using the deleted node's own IPs.
-				az.diffTracker.ReconcileNodeIPChange(node.Name, getNodePrivateIPAddresses(node), nil)
-			}
 		},
 	})
 	az.nodeInformerSynced = nodeInformer.HasSynced
@@ -826,12 +762,8 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 	az.serviceLister = informerFactory.Core().V1().Services().Lister()
 	az.nodeLister = informerFactory.Core().V1().Nodes().Lister()
 
-	az.setUpEndpointSlicesInformer(informerFactory)
-
-	if az.ServiceGatewayEnabled {
-		az.diffTracker.SetServiceLister(az.serviceLister)
-		az.diffTracker.SetNodeLister(az.nodeLister)
-		az.diffTracker.SetUpPodInformer()
+	if !az.ServiceGatewayEnabled {
+		az.setUpEndpointSlicesInformer(informerFactory)
 	}
 }
 

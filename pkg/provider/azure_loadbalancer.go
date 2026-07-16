@@ -48,7 +48,6 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/loadbalancer"
-	"sigs.k8s.io/cloud-provider-azure/pkg/provider/servicegateway/difftracker"
 	"sigs.k8s.io/cloud-provider-azure/pkg/trace"
 	"sigs.k8s.io/cloud-provider-azure/pkg/trace/attributes"
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/errutils"
@@ -98,15 +97,6 @@ func (az *Cloud) GetLoadBalancer(ctx context.Context, clusterName string, servic
 
 	logger := log.FromContextOrBackground(ctx).WithName(Operation).WithValues("service", service.Name)
 	ctx = log.NewContext(ctx, logger)
-
-	if az.ServiceGatewayEnabled {
-		if !az.diffTracker.IsServiceTracked(difftracker.ServiceUID(service)) {
-			return nil, false, nil
-		}
-
-		logger.V(5).Info("ServiceGateway service is tracked; reporting it as existing so deletion is engine-driven")
-		return service.Status.LoadBalancer.DeepCopy(), true, nil
-	}
 
 	existingLBs, err := az.ListLB(ctx, service)
 	if err != nil {
@@ -240,7 +230,7 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 		isOperationSucceeded = false
 	)
 
-	if !az.ServiceGatewayEnabled && az.azureResourceLocker != nil {
+	if az.azureResourceLocker != nil {
 		err = az.azureResourceLocker.Lock(ctx)
 		if err != nil {
 			logger.Error(err, "failed to lock azure resources")
@@ -286,26 +276,6 @@ func (az *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, ser
 		}
 	}()
 
-	// ServiceGateway owns its asynchronous Service reconciliation in the diff tracker.
-	if az.ServiceGatewayEnabled {
-		if err = az.diffTracker.ReconcileInboundService(service); err != nil {
-			var warningErr difftracker.WarningEventError
-			if errors.As(err, &warningErr) {
-				reason, message := warningErr.WarningEvent()
-				az.Event(service, v1.EventTypeWarning, reason, message)
-			}
-			return nil, err
-		}
-
-		// Return the existing LoadBalancer status to prevent the service controller from clearing it.
-		// This is critical for crash recovery: after CCM restarts, it recovers IPs from Azure resources,
-		// but the service controller then re-syncs all services. If we return empty status here,
-		// patchStatus will clear the IPs we just recovered.
-		// For new services, the existing status will be empty anyway, so this is safe.
-		isOperationSucceeded = true
-		return service.Status.LoadBalancer.DeepCopy(), nil
-	}
-
 	lbStatus, err = az.reconcileService(ctx, clusterName, service, nodes)
 	if err != nil {
 		return nil, err
@@ -338,12 +308,6 @@ func (az *Cloud) getLatestService(serviceName string, deepcopy bool) (*v1.Servic
 // parameters as read-only and not modify them.
 // Parameter 'clusterName' is the name of the cluster as presented to kube-controller-manager
 func (az *Cloud) UpdateLoadBalancer(ctx context.Context, clusterName string, service *v1.Service, nodes []*v1.Node) error {
-	// Node additions and removals to VMSS (Virtual Machine Scale Sets) do not require reconcileLB operations.
-	// The changes will be propagated via Location Update API upon endpoint-slice events and backendpool will be updated by NRP.
-	if az.ServiceGatewayEnabled {
-		return nil
-	}
-
 	const Operation = "UpdateLoadBalancer"
 
 	var err error
@@ -462,15 +426,6 @@ func (az *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName stri
 		isOperationSucceeded = false
 	)
 	ctx = log.NewContext(ctx, logger)
-
-	// Use Engine for async service deletion when ServiceGatewayEnabled.
-	// This must be checked early to avoid expensive Azure API calls (ListLB, GetNSG)
-	// that are not needed for the async deletion path.
-	if az.ServiceGatewayEnabled {
-		err = az.diffTracker.DeleteInboundService(service)
-		mc.ObserveOperationWithResult(err == nil)
-		return err
-	}
 
 	if az.azureResourceLocker != nil {
 		err = az.azureResourceLocker.Lock(ctx)

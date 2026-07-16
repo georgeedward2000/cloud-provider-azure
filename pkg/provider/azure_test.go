@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1698,7 +1697,7 @@ func TestNewCloudInitializesKubeClientAtRequiredStage(t *testing.T) {
 		_, err := NewCloud(context.Background(), builder, config, true)
 
 		assert.ErrorContains(t, err, "mutually exclusive")
-		assert.Equal(t, 1, builder.calls)
+		assert.Zero(t, builder.calls)
 	})
 
 	t.Run("invalid non-ServiceGateway CCM", func(t *testing.T) {
@@ -1736,10 +1735,13 @@ func TestNewCloudInitializesKubeClientAtRequiredStage(t *testing.T) {
 		assert.Zero(t, builder.calls)
 	})
 
-	t.Run("ServiceGateway CCM requires builder", func(t *testing.T) {
-		_, err := NewCloud(context.Background(), nil, serviceGatewayConfig(), true)
+	t.Run("ServiceGateway CCM defers builder requirement", func(t *testing.T) {
+		config := serviceGatewayConfig()
+		config.MultipleStandardLoadBalancerConfigurations = []providerconfig.MultipleStandardLoadBalancerConfiguration{{}}
 
-		assert.EqualError(t, err, "NewCloud: ServiceGateway requires a clientBuilder")
+		_, err := NewCloud(context.Background(), nil, config, true)
+
+		assert.ErrorContains(t, err, "mutually exclusive")
 	})
 }
 
@@ -2486,20 +2488,22 @@ func TestGetActiveZones(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestInitializePublishesServiceGatewayDependencies(t *testing.T) {
+func TestInitializeDefersServiceGatewayDependencies(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	az := GetTestCloudWithContainerLoadBalancer(ctrl)
 	kubeClient := az.KubeClient
-	az.diffTracker.SetEventRecorder(nil)
 
 	az.Initialize(nil, nil)
 	t.Cleanup(az.eventBroadcaster.Shutdown)
 
-	assert.Same(t, kubeClient, az.KubeClient, "Initialize must preserve the client retained by the difftracker")
+	assert.Same(t, kubeClient, az.KubeClient)
+	assert.NotNil(t, az.eventRecorder)
 
-	recorder := reflect.ValueOf(az.diffTracker).Elem().FieldByName("eventRecorder")
-	assert.True(t, recorder.IsValid(), "difftracker must retain its event recorder dependency")
-	assert.False(t, recorder.IsNil(), "Initialize must publish the event recorder to the difftracker")
+	loadBalancer, supported := az.LoadBalancer()
+	assert.True(t, supported)
+	service := getTestService("servicegateway-not-started", v1.ProtocolTCP, nil, false, 80)
+	_, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &service, nil)
+	assert.EqualError(t, err, "ServiceGateway LoadBalancer is not initialized")
 }
 
 func TestInitializeCloudFromConfig(t *testing.T) {

@@ -333,16 +333,18 @@ func TestServiceGatewayGetLoadBalancerBypassesLegacyLookup(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	az := GetTestCloudWithContainerLoadBalancer(ctrl)
 	service := getTestService("servicegateway-get", v1.ProtocolTCP, nil, false, 80)
+	tracker := newProviderDiffTracker(t, az, az.KubeClient)
+	loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-	status, exists, err := az.GetLoadBalancer(context.Background(), testClusterName, &service)
+	status, exists, err := loadBalancer.GetLoadBalancer(context.Background(), testClusterName, &service)
 	assert.NoError(t, err)
 	assert.False(t, exists)
 	assert.Nil(t, status)
 
 	service.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "10.0.0.4"}}
-	assert.NoError(t, az.diffTracker.ReconcileInboundService(&service))
+	assert.NoError(t, tracker.ReconcileInboundService(&service))
 
-	status, exists, err = az.GetLoadBalancer(context.Background(), testClusterName, &service)
+	status, exists, err = loadBalancer.GetLoadBalancer(context.Background(), testClusterName, &service)
 	assert.NoError(t, err)
 	assert.True(t, exists)
 	assert.Equal(t, &service.Status.LoadBalancer, status)
@@ -858,8 +860,7 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 				NATGateways:   utilsets.NewString(),
 				Locations:     make(map[string]difftracker.NRPLocation),
 			}
-			var err error
-			az.diffTracker, err = difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
+			tracker, err := difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
 				SubscriptionID:             az.SubscriptionID,
 				ResourceGroup:              az.ResourceGroup,
 				Location:                   az.Location,
@@ -869,6 +870,7 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to initialize diffTracker: %v", err)
 			}
+			loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
 			// 			az.locationAndNRPServiceBatchUpdater = newLocationAndNRPServiceBatchUpdater(az)
 			// 			ctx, cancel := context.WithCancel(context.Background())
@@ -899,7 +901,7 @@ func TestEnsureLoadBalancerContainerLoadBalancer(t *testing.T) {
 			mockPLSRepo := privatelinkservice.NewMockRepository(ctrl)
 			mockPLSRepo.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armnetwork.PrivateLinkService{ID: to.Ptr(consts.PrivateLinkServiceNotExistID)}, nil).AnyTimes()
 			az.plsRepo = mockPLSRepo
-			lbStatus, err := az.EnsureLoadBalancer(context.TODO(), testClusterName, &service, clusterResources.nodes)
+			lbStatus, err := loadBalancer.EnsureLoadBalancer(context.TODO(), testClusterName, &service, clusterResources.nodes)
 			assert.Nil(t, err, "TestCase[%d]: %s", i, c.desc)
 			assert.NotNil(t, lbStatus, "TestCase[%d]: %s", i, c.desc)
 			result, rerr := az.NetworkClientFactory.GetLoadBalancerClient().List(context.TODO(), az.Config.ResourceGroup)
@@ -952,8 +954,7 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 				NATGateways:   utilsets.NewString(),
 				Locations:     make(map[string]difftracker.NRPLocation),
 			}
-			var err error
-			az.diffTracker, err = difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
+			tracker, err := difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
 				SubscriptionID:             az.SubscriptionID,
 				ResourceGroup:              az.ResourceGroup,
 				Location:                   az.Location,
@@ -963,6 +964,7 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to initialize diffTracker: %v", err)
 			}
+			loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
 			// Engine pattern is now wired for inbound services (Phase 6 complete)
 			// ServiceUpdater and LocationsUpdater goroutines are started in InitializeCloudFromConfig
@@ -991,7 +993,7 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 			az.plsRepo = mockPLSRepo
 
 			// create the service first.
-			lbStatus, err := az.EnsureLoadBalancer(context.TODO(), testClusterName, &service, clusterResources.nodes)
+			lbStatus, err := loadBalancer.EnsureLoadBalancer(context.TODO(), testClusterName, &service, clusterResources.nodes)
 			assert.Nil(t, err, "TestCase[%d]: %s", i, c.desc)
 			assert.NotNil(t, lbStatus, "TestCase[%d]: %s", i, c.desc)
 			result, rerr := az.NetworkClientFactory.GetLoadBalancerClient().List(context.TODO(), az.Config.ResourceGroup)
@@ -1003,7 +1005,7 @@ func TestEnsureLoadBalancerDeleteContainerLoadBalancer(t *testing.T) {
 			setMockLBs(az, &expectedLBs, "service", 1, i+1, c.isInternalSvc)
 
 			// Delete the service
-			err = az.EnsureLoadBalancerDeleted(context.TODO(), testClusterName, &service)
+			err = loadBalancer.EnsureLoadBalancerDeleted(context.TODO(), testClusterName, &service)
 			assert.Nil(t, err, "TestCase[%d]: %s", i, c.desc)
 		})
 	}
@@ -1080,9 +1082,11 @@ func TestEnsureLoadBalancerServiceGatewaySkipsAzureResourceLock(t *testing.T) {
 	az.azureResourceLocker = NewAzureResourceLocker(
 		az, "holder", "aks-managed-resource-locker", "kube-system", 900,
 	)
+	tracker := newProviderDiffTracker(t, az, kubeClient)
+	loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
 	svc := getTestService("service", v1.ProtocolTCP, nil, false, 80)
-	_, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	_, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 	assert.NoError(t, err)
 }
 
@@ -9473,12 +9477,13 @@ func TestServiceGatewayInternalAnnotation_IsRejected(t *testing.T) {
 	svc := getInternalTestService("servicegateway-internal", 80)
 	kubeClient := fake.NewSimpleClientset(&svc)
 	az.KubeClient = kubeClient
-	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+	tracker := newProviderDiffTracker(t, az, kubeClient)
+	loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 	assert.Error(t, err, "internal load balancer must be rejected when ServiceGateway is enabled")
 	assert.Nil(t, status, "rejected internal service must not receive an ingress status")
-	assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)), "rejected internal service must not be tracked")
+	assert.False(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)), "rejected internal service must not be tracked")
 }
 
 func TestServiceGatewayEnsureLoadBalancer_TracksService(t *testing.T) {
@@ -9490,13 +9495,14 @@ func TestServiceGatewayEnsureLoadBalancer_TracksService(t *testing.T) {
 
 	kubeClient := fake.NewSimpleClientset(&svc)
 	az.KubeClient = kubeClient
-	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+	tracker := newProviderDiffTracker(t, az, kubeClient)
+	loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 	if !assert.NoError(t, err) || !assert.NotNil(t, status) {
 		t.FailNow()
 	}
-	assert.True(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
+	assert.True(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
 }
 
 func TestServiceGatewayEnsureLoadBalancerDeleted_ReturnsNil(t *testing.T) {
@@ -9508,13 +9514,14 @@ func TestServiceGatewayEnsureLoadBalancerDeleted_ReturnsNil(t *testing.T) {
 
 	kubeClient := fake.NewSimpleClientset(&svc)
 	az.KubeClient = kubeClient
-	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+	tracker := newProviderDiffTracker(t, az, kubeClient)
+	loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-	_, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	_, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 	if !assert.NoError(t, err) {
 		t.FailNow()
 	}
-	err = az.EnsureLoadBalancerDeleted(context.Background(), testClusterName, &svc)
+	err = loadBalancer.EnsureLoadBalancerDeleted(context.Background(), testClusterName, &svc)
 	assert.NoError(t, err)
 }
 
@@ -9524,12 +9531,13 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		defer ctrl.Finish()
 
 		svc := getTestServiceDualStack("sgw-dualstack", v1.ProtocolTCP, nil, 80)
-		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		az, tracker, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
-		assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
+		assert.False(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 			"a rejected dual-stack service must not be tracked")
 
 		select {
@@ -9545,12 +9553,13 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		defer ctrl.Finish()
 
 		svc := getTestServiceWithNamedTargetPorts("sgw-named-port", v1.ProtocolTCP, nil, false, 8080, "http")
-		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		az, tracker, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
-		assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
+		assert.False(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 			"a rejected named-targetPort service must not be tracked")
 
 		select {
@@ -9566,12 +9575,13 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		defer ctrl.Finish()
 
 		svc := getTestService("sgw-sctp", v1.ProtocolSCTP, nil, false, 80)
-		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		az, tracker, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
-		assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
+		assert.False(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 			"a rejected SCTP service must not be tracked")
 
 		select {
@@ -9594,12 +9604,13 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		for i := range svc.Spec.Ports {
 			svc.Spec.Ports[i].TargetPort = intstr.FromInt(8080)
 		}
-		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		az, tracker, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
-		assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
+		assert.False(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 			"a rejected backend-port-collision service must not be tracked")
 
 		select {
@@ -9615,9 +9626,10 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		defer ctrl.Finish()
 
 		svc := getInternalTestService("sgw-internal-warning", 80)
-		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		az, tracker, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.Error(t, err)
 		assert.Nil(t, status)
 
@@ -9634,12 +9646,13 @@ func TestServiceGatewayUnsupportedInputs_Events(t *testing.T) {
 		defer ctrl.Finish()
 
 		svc := getTestService("sgw-supported", v1.ProtocolTCP, nil, false, 80)
-		az, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		az, tracker, rec := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+		loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, status)
-		assert.True(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
+		assert.True(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
 		assertNoEvent(t, rec)
 	})
 }
@@ -9649,16 +9662,17 @@ func TestServiceGateway_EnsureAndDelete(t *testing.T) {
 	defer ctrl.Finish()
 
 	svc := getTestService("sgw-ensure-delete", v1.ProtocolTCP, nil, false, 80)
-	az, _ := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+	az, tracker, _ := newSGWCloudWithServiceAndRecorder(t, ctrl, svc)
+	loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
-	status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 	if !assert.NoError(t, err) {
 		t.FailNow()
 	}
 	assert.NotNil(t, status)
-	assert.True(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
+	assert.True(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)))
 
-	err = az.EnsureLoadBalancerDeleted(context.Background(), testClusterName, &svc)
+	err = loadBalancer.EnsureLoadBalancerDeleted(context.Background(), testClusterName, &svc)
 	assert.NoError(t, err)
 }
 
@@ -9676,13 +9690,14 @@ func TestServiceGatewayEnsureLoadBalancer_ZeroPortServiceNoPanic(t *testing.T) {
 
 	kubeClient := fake.NewSimpleClientset(&svc)
 	az.KubeClient = kubeClient
-	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
+	tracker := newProviderDiffTracker(t, az, kubeClient)
+	loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
 	assert.NotPanics(t, func() {
-		status, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+		status, err := loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, status)
 	})
-	assert.False(t, az.diffTracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
+	assert.False(t, tracker.IsServiceTracked(difftracker.ServiceUID(&svc)),
 		"a port-less service has no PodIP backend and must not be tracked")
 }

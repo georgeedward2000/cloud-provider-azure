@@ -639,8 +639,7 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 				// },
 			}
 
-			var err error
-			cloud.diffTracker, err = difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
+			tracker, err := difftracker.New(log.Noop(), k8s, nrp, difftracker.Config{
 				SubscriptionID:             cloud.SubscriptionID,
 				ResourceGroup:              cloud.ResourceGroup,
 				Location:                   cloud.Location,
@@ -669,7 +668,8 @@ func TestEndpointSlicesInformerContainerLoadBalancer(t *testing.T) {
 			// EndpointSlice informer calls diffTracker.UpdateEndpoints which handles buffering/state
 			// ServiceUpdater and LocationsUpdater goroutines handle async resource creation
 
-			cloud.setUpEndpointSlicesInformer(informerFactory)
+			_, err = difftracker.RegisterInformers(informerFactory, tracker)
+			assert.NoError(t, err)
 			stopChan := make(chan struct{})
 			defer func() {
 				stopChan <- struct{}{}
@@ -709,14 +709,16 @@ func TestServiceGatewayEndpointSliceUpdateDoesNotUseProviderCache(t *testing.T) 
 
 	client := fake.NewSimpleClientset(existingEPS)
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	cloud.setUpEndpointSlicesInformer(informerFactory)
+	tracker := newProviderDiffTracker(t, cloud, client)
+	_, err := difftracker.RegisterInformers(informerFactory, tracker)
+	assert.NoError(t, err)
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	informerFactory.Start(stopCh)
 	informerFactory.WaitForCacheSync(stopCh)
 
-	_, err := client.DiscoveryV1().EndpointSlices("test").Update(context.Background(), updatedEPS, metav1.UpdateOptions{})
+	_, err = client.DiscoveryV1().EndpointSlices("test").Update(context.Background(), updatedEPS, metav1.UpdateOptions{})
 	assert.NoError(t, err)
 
 	assert.Never(t, func() bool {
@@ -870,21 +872,23 @@ func TestServiceGatewayEndpointSliceInformer_TracksService(t *testing.T) {
 	}
 	kubeClient := fake.NewSimpleClientset(&svc, existingEPS, node1, node2)
 	az.KubeClient = kubeClient
-	az.diffTracker = newProviderDiffTracker(t, az, kubeClient)
-	az.diffTracker.NRPResources.LoadBalancers.Insert(difftracker.ServiceUID(&svc))
+	tracker := newProviderDiffTracker(t, az, kubeClient)
+	tracker.NRPResources.LoadBalancers.Insert(difftracker.ServiceUID(&svc))
 
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	az.serviceLister = informerFactory.Core().V1().Services().Lister()
 	az.nodeLister = informerFactory.Core().V1().Nodes().Lister()
-	az.diffTracker.SetNodeLister(az.nodeLister)
-	az.setUpEndpointSlicesInformer(informerFactory)
+	tracker.SetNodeLister(az.nodeLister)
+	_, err := difftracker.RegisterInformers(informerFactory, tracker)
+	assert.NoError(t, err)
+	loadBalancer := initializeTestServiceGatewayLoadBalancer(az, tracker)
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	informerFactory.Start(stopCh)
 	informerFactory.WaitForCacheSync(stopCh)
 
-	_, err := az.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
+	_, err = loadBalancer.EnsureLoadBalancer(context.Background(), testClusterName, &svc, nil)
 	if !assert.NoError(t, err) {
 		t.FailNow()
 	}
@@ -895,7 +899,7 @@ func TestServiceGatewayEndpointSliceInformer_TracksService(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	locationData := az.diffTracker.GetSyncLocationsAddresses()
+	locationData := tracker.GetSyncLocationsAddresses()
 	location, ok := locationData.Locations["192.168.0.2"]
 	if !assert.True(t, ok, "updated endpoint must be mapped to node2's InternalIP") {
 		return
@@ -911,7 +915,7 @@ func TestServiceGatewayEndpointSliceInformer_TracksService(t *testing.T) {
 		t.FailNow()
 	}
 	assert.Eventually(t, func() bool {
-		locationData := az.diffTracker.GetSyncLocationsAddresses()
+		locationData := tracker.GetSyncLocationsAddresses()
 		location, ok := locationData.Locations["192.168.0.2"]
 		if !ok {
 			return true
