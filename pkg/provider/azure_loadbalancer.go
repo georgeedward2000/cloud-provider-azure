@@ -99,6 +99,15 @@ func (az *Cloud) GetLoadBalancer(ctx context.Context, clusterName string, servic
 	logger := log.FromContextOrBackground(ctx).WithName(Operation).WithValues("service", service.Name)
 	ctx = log.NewContext(ctx, logger)
 
+	if az.ServiceGatewayEnabled {
+		if !az.diffTracker.IsServiceTracked(difftracker.ServiceUID(service)) {
+			return nil, false, nil
+		}
+
+		logger.V(5).Info("ServiceGateway service is tracked; reporting it as existing so deletion is engine-driven")
+		return service.Status.LoadBalancer.DeepCopy(), true, nil
+	}
+
 	existingLBs, err := az.ListLB(ctx, service)
 	if err != nil {
 		return nil, az.existsPip(ctx, clusterName, service), err
@@ -109,27 +118,10 @@ func (az *Cloud) GetLoadBalancer(ctx context.Context, clusterName string, servic
 		return status, existsLb || az.existsPip(ctx, clusterName, service), err
 	}
 
-	// ServiceGateway uses a single per-service LB, so skip the flipped-service check.
-	if !az.ServiceGatewayEnabled {
-		flippedService := flipServiceInternalAnnotation(service)
-		_, _, status, _, existsLb, _, err = az.getServiceLoadBalancer(ctx, flippedService, clusterName, nil, false, existingLBs)
-		if err != nil || existsLb {
-			return status, existsLb || az.existsPip(ctx, clusterName, service), err
-		}
-	}
-
-	// When ServiceGateway is enabled the difftracker owns each service's full lifecycle,
-	// including services it still tracks that have no Azure LB/PIP yet (e.g. a service parked
-	// after a terminal build rejection such as a named targetPort or a dual-stack spec).
-	// GetLoadBalancer is consulted by the upstream service controller when a service is being
-	// deleted: if it reports exists=false the controller removes only the K8s LB finalizer and
-	// never calls EnsureLoadBalancerDeleted, stranding our ServiceGateway finalizer and leaving
-	// the Service (and its namespace) stuck Terminating. Report a tracked service as existing so
-	// deletion is routed through EnsureLoadBalancerDeleted -> difftracker.DeleteService, which
-	// removes our finalizer.
-	if az.ServiceGatewayEnabled && az.diffTracker != nil && az.diffTracker.IsServiceTracked(difftracker.ServiceUID(service)) {
-		logger.V(5).Info("ServiceGateway-tracked service has no Azure LB/PIP; reporting as existing so deletion is engine-driven")
-		return nil, true, nil
+	flippedService := flipServiceInternalAnnotation(service)
+	_, _, status, _, existsLb, _, err = az.getServiceLoadBalancer(ctx, flippedService, clusterName, nil, false, existingLBs)
+	if err != nil || existsLb {
+		return status, existsLb || az.existsPip(ctx, clusterName, service), err
 	}
 
 	// Return exists = false only if the load balancer and the public IP are not found on Azure

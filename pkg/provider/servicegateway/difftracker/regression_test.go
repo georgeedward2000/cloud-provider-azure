@@ -285,8 +285,8 @@ func TestSDKV9WireValues(t *testing.T) {
 		}
 		assert.Equal(t, armnetwork.LoadBalancerSKUName("Service"), *lb.SKU.Name,
 			"SGW inbound LB SKU must serialize as exactly \"Service\"")
-		assert.Equal(t, "Service", consts.LoadBalancerSKUNameService,
-			"consts.LoadBalancerSKUNameService must remain \"Service\"")
+		assert.Equal(t, "Service", consts.LoadBalancerARMSKUService,
+			"consts.LoadBalancerARMSKUService must remain \"Service\"")
 	})
 
 	t.Run("AddressUpdateActionEnumWireValues", func(t *testing.T) {

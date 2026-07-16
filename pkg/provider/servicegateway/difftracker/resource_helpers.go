@@ -215,7 +215,7 @@ func buildInboundServiceResources(serviceUID string, config *InboundConfig, dtCo
 		ID:       to.Ptr(fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/loadBalancers/%s", dtConfig.SubscriptionID, dtConfig.ResourceGroup, serviceUID)),
 		Location: to.Ptr(dtConfig.Location),
 		SKU: &armnetwork.LoadBalancerSKU{
-			Name: to.Ptr(armnetwork.LoadBalancerSKUName(consts.LoadBalancerSKUNameService)),
+			Name: to.Ptr(armnetwork.LoadBalancerSKUName(consts.LoadBalancerARMSKUService)),
 		},
 		Properties: &armnetwork.LoadBalancerPropertiesFormat{
 			Scope: to.Ptr(armnetwork.LoadBalancerScopePublic),

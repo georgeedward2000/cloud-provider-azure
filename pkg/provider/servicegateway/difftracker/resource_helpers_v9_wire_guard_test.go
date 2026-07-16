@@ -47,8 +47,8 @@ func TestGuardV9WireValues_InboundResources(t *testing.T) {
 	// LoadBalancer SKU must be the case-sensitive "Service" string (no v9 enum exists for it).
 	if assert.NotNil(t, lb.SKU) && assert.NotNil(t, lb.SKU.Name) {
 		assert.Equal(t, "Service", string(*lb.SKU.Name),
-			"inbound LB SKU must be sent as case-sensitive %q", consts.LoadBalancerSKUNameService)
-		assert.Equal(t, consts.LoadBalancerSKUNameService, string(*lb.SKU.Name))
+			"inbound LB SKU must be sent as case-sensitive %q", consts.LoadBalancerARMSKUService)
+		assert.Equal(t, consts.LoadBalancerARMSKUService, string(*lb.SKU.Name))
 	}
 
 	// Frontend must reference a Public IP — the SGW inbound path always provisions a public frontend.
@@ -82,5 +82,5 @@ func TestGuardV9WireValues_EnumStrings(t *testing.T) {
 	assert.Equal(t, "Public", string(armnetwork.LoadBalancerScopePublic))
 	assert.Equal(t, "StandardV2", string(armnetwork.PublicIPAddressSKUNameStandardV2))
 	assert.Equal(t, "StandardV2", string(armnetwork.NatGatewaySKUNameStandardV2))
-	assert.Equal(t, "Service", consts.LoadBalancerSKUNameService)
+	assert.Equal(t, "Service", consts.LoadBalancerARMSKUService)
 }

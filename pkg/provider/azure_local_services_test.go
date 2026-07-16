@@ -905,4 +905,18 @@ func TestServiceGatewayEndpointSliceInformer_TracksService(t *testing.T) {
 		return
 	}
 	assert.True(t, address.ServiceRef.Has(difftracker.ServiceUID(&svc)))
+
+	err = kubeClient.DiscoveryV1().EndpointSlices("test").Delete(context.Background(), updatedEPS.Name, metav1.DeleteOptions{})
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+	assert.Eventually(t, func() bool {
+		locationData := az.diffTracker.GetSyncLocationsAddresses()
+		location, ok := locationData.Locations["192.168.0.2"]
+		if !ok {
+			return true
+		}
+		_, exists := location.Addresses["10.0.0.2"]
+		return !exists
+	}, time.Second, 10*time.Millisecond, "deleted EndpointSlice must be removed through the ServiceGateway handler")
 }

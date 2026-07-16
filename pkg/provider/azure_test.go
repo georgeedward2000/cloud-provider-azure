@@ -1271,22 +1271,6 @@ func getTestServiceWithNamedTargetPorts(identifier string, proto v1.Protocol, an
 	return svc
 }
 
-func getTestServiceWithIntTargetPorts(identifier string, proto v1.Protocol, annotations map[string]string, isIPv6 bool, servicePort int32, intTargetPorts ...int32) v1.Service {
-	targetPorts := []intstr.IntOrString{}
-	for _, port := range intTargetPorts {
-		targetPorts = append(targetPorts, intstr.FromInt(int(port)))
-	}
-	svc := getTestServiceWithTargetPortsCommon(identifier, proto, annotations, servicePort, targetPorts...)
-	svc.Spec.ClusterIP = "10.0.0.2"
-	svc.Spec.IPFamilies = []v1.IPFamily{v1.IPv4Protocol}
-	if isIPv6 {
-		svc.Spec.ClusterIP = "fd00::1907"
-		svc.Spec.IPFamilies = []v1.IPFamily{v1.IPv6Protocol}
-	}
-
-	return svc
-}
-
 func getTestServiceWithTargetPortsCommon(identifier string, proto v1.Protocol, annotations map[string]string, servicePort int32, targetPorts ...intstr.IntOrString) v1.Service {
 	ports := []v1.ServicePort{}
 	for _, port := range targetPorts {
@@ -1705,7 +1689,7 @@ func serviceGatewayConfig() *config.Config {
 	}
 }
 
-func TestNewCloudPreinitializesKubeClientOnlyForServiceGatewayCCM(t *testing.T) {
+func TestNewCloudInitializesKubeClientAtRequiredStage(t *testing.T) {
 	t.Run("ServiceGateway CCM", func(t *testing.T) {
 		builder := &trackingControllerClientBuilder{client: fake.NewSimpleClientset()}
 		config := serviceGatewayConfig()
@@ -1717,7 +1701,7 @@ func TestNewCloudPreinitializesKubeClientOnlyForServiceGatewayCCM(t *testing.T) 
 		assert.Equal(t, 1, builder.calls)
 	})
 
-	t.Run("non-ServiceGateway CCM", func(t *testing.T) {
+	t.Run("invalid non-ServiceGateway CCM", func(t *testing.T) {
 		builder := &trackingControllerClientBuilder{client: fake.NewSimpleClientset()}
 		config := &providerconfig.Config{LoadBalancerBackendPoolConfigurationType: "invalid"}
 
@@ -1725,6 +1709,20 @@ func TestNewCloudPreinitializesKubeClientOnlyForServiceGatewayCCM(t *testing.T) 
 
 		assert.ErrorContains(t, err, "is not supported")
 		assert.Zero(t, builder.calls)
+	})
+
+	t.Run("non-ServiceGateway non-CCM", func(t *testing.T) {
+		kubeClient := fake.NewSimpleClientset()
+		builder := &trackingControllerClientBuilder{client: kubeClient}
+
+		cloud, err := NewCloud(context.Background(), builder, &providerconfig.Config{}, false)
+
+		assert.NoError(t, err)
+		if err != nil {
+			return
+		}
+		assert.Same(t, kubeClient, cloud.(*Cloud).KubeClient)
+		assert.Equal(t, 1, builder.calls)
 	})
 
 	t.Run("ServiceGateway non-CCM", func(t *testing.T) {
@@ -2820,7 +2818,7 @@ func TestInitializeCloudFromConfig(t *testing.T) {
 		}
 		err := az.InitializeCloudFromConfig(context.Background(), &azureconfig, false, false)
 		assert.NoError(t, err)
-		assert.Equal(t, consts.LoadBalancerBackendPoolConfigurationTypePodIP, az.Config.LoadBalancerBackendPoolConfigurationType)
+		assert.Equal(t, consts.LoadBalancerBackendPoolConfigurationTypePodIP, az.LoadBalancerBackendPoolConfigurationType)
 		assert.True(t, az.ServiceGatewayEnabled)
 		assert.Nil(t, az.LoadBalancerBackendPool)
 
