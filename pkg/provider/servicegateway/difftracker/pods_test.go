@@ -37,6 +37,27 @@ import (
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
 
+func TestSetUpPodInformerLifecycle(t *testing.T) {
+	t.Run("nil stop channel", func(t *testing.T) {
+		tracker := &DiffTracker{kubeClient: fake.NewSimpleClientset()}
+		assert.EqualError(t, tracker.SetUpPodInformer(nil), "setUpPodInformerForEgress: stop channel must not be nil")
+	})
+
+	t.Run("cancelled before sync", func(t *testing.T) {
+		tracker := &DiffTracker{kubeClient: fake.NewSimpleClientset()}
+		stopCh := make(chan struct{})
+		close(stopCh)
+		assert.EqualError(t, tracker.SetUpPodInformer(stopCh), "setUpPodInformerForEgress: cache sync stopped before completion")
+	})
+
+	t.Run("syncs and uses caller lifecycle", func(t *testing.T) {
+		tracker := &DiffTracker{kubeClient: fake.NewSimpleClientset()}
+		stopCh := make(chan struct{})
+		assert.NoError(t, tracker.SetUpPodInformer(stopCh))
+		close(stopCh)
+	})
+}
+
 // TestPodInformerAddPod tests the podInformerAddPod function
 func TestPodInformerAddPod(t *testing.T) {
 	now := metav1.Now()
