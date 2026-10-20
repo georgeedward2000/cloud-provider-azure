@@ -67,6 +67,29 @@ func init() { nrpOperationTimeout.Store(int64(defaultNRPOperationTimeout)) }
 
 func getNRPOperationTimeout() time.Duration { return time.Duration(nrpOperationTimeout.Load()) }
 
+// defaultEgressSettleDelay is how long the managed outbound runs of an egress identity are held back
+// after a write whose outcome is unknown: twice ARM's 60 s limit for a provider to answer a forwarded
+// request. Settled reads are trusted after it.
+const defaultEgressSettleDelay = 2 * time.Minute
+
+// egressSettleDelay holds the settle delay in nanoseconds. Stored atomically so tests can shorten it.
+var egressSettleDelay atomic.Int64
+
+func init() { egressSettleDelay.Store(int64(defaultEgressSettleDelay)) }
+
+func getEgressSettleDelay() time.Duration { return time.Duration(egressSettleDelay.Load()) }
+
+// defaultEgressPublicIPConcurrency bounds the Azure calls on the Public IPs and Public IP prefixes of
+// one egress identity that are in flight at once.
+const defaultEgressPublicIPConcurrency = 8
+
+// egressPublicIPConcurrency holds the concurrency bound. Stored atomically so tests can lower it.
+var egressPublicIPConcurrency atomic.Int64
+
+func init() { egressPublicIPConcurrency.Store(defaultEgressPublicIPConcurrency) }
+
+func getEgressPublicIPConcurrency() int { return int(egressPublicIPConcurrency.Load()) }
+
 // LocationsUpdater syncs location and address changes to NRP Service Gateway
 type LocationsUpdater struct {
 	diffTracker *DiffTracker

@@ -51,6 +51,12 @@ func newTestDiffTracker() *DiffTracker {
 		pendingPods:             make(map[string][]PendingPodUpdate),
 		pendingServiceDeletions: make(map[string]*PendingServiceDeletion),
 		pendingPodDeletions:     make(map[string]*PendingPodDeletion),
+		egress: egressTrackerState{
+			votes:    newEgressVotes(),
+			mode:     make(map[string]egressMode),
+			rejected: make(map[string]egressRejection),
+			warned:   make(map[string]egressRejection),
+		},
 		serviceUpdaterTrigger:   make(chan bool, 1),
 		locationsUpdaterTrigger: make(chan bool, 1),
 	}
@@ -1672,22 +1678,26 @@ func TestAddPod_RejectsEgressIdentityCollidingWithInboundService(t *testing.T) {
 // TestAddPod_DoesNotReviveOutboundServiceWhoseDeleteWasAttempted pins that the revive only fires
 // while nothing has been dispatched to Azure. deleteOutboundService is not transactional: on failure
 // it still deletes the NAT Gateway and Public IP, so reviving would publish pods to a gateway that
-// no longer exists. RetryCount==0 is the control: an untouched deletion still revives.
+// no longer exists. An untouched deletion of a registered identity is the control: it still revives, and so
+// does an update in flight whatever its retries. A deletion that failed after the last pod left keeps refusing
+// revivals, also after a waiting pod left again.
 func TestAddPod_DoesNotReviveOutboundServiceWhoseDeleteWasAttempted(t *testing.T) {
-	newTrackerWithPendingDelete := func(retryCount int) *DiffTracker {
+	newTrackerWithPendingDelete := func(retryCount int, inFlight operationKind) *DiffTracker {
 		dt := newTestDiffTracker()
 
 		dt.pendingServiceOps["egress"] = &ServiceOperationState{
-			ServiceUID: "egress",
-			Config:     NewOutboundServiceConfig("egress", nil),
-			State:      StateDeletionPending,
-			RetryCount: retryCount,
+			ServiceUID:   "egress",
+			Config:       NewOutboundServiceConfig("egress", nil),
+			State:        StateDeletionPending,
+			RetryCount:   retryCount,
+			InFlightKind: inFlight,
 		}
 		dt.pendingServiceDeletions["egress"] = &PendingServiceDeletion{ServiceUID: "egress"}
+		dt.NRPResources.NATGateways.Insert("egress")
 		return dt
 	}
 
-	attempted := newTrackerWithPendingDelete(1)
+	attempted := newTrackerWithPendingDelete(1, operationNone)
 	attempted.AddPodWithUID("egress", "ns/replacement", "uid-1", "10.0.0.1", "10.244.0.5")
 	attempted.mu.Lock()
 	attemptedState := attempted.pendingServiceOps["egress"].State
@@ -1701,7 +1711,7 @@ func TestAddPod_DoesNotReviveOutboundServiceWhoseDeleteWasAttempted(t *testing.T
 	assert.Equal(t, 1, attemptedBuffered,
 		"the pod must be buffered so the delete-success path re-creates the service for it")
 
-	fresh := newTrackerWithPendingDelete(0)
+	fresh := newTrackerWithPendingDelete(0, operationNone)
 	fresh.AddPodWithUID("egress", "ns/replacement", "uid-1", "10.0.0.1", "10.244.0.5")
 	fresh.mu.Lock()
 	freshState := fresh.pendingServiceOps["egress"].State
@@ -1711,6 +1721,35 @@ func TestAddPod_DoesNotReviveOutboundServiceWhoseDeleteWasAttempted(t *testing.T
 	assert.Equal(t, StateCreated, freshState,
 		"control: an undispatched deletion must still revive so a sole egress pod's IP change keeps egress")
 	assert.False(t, freshStillDeleting, "control: reviving must clear the pending deletion record")
+
+	updating := newTrackerWithPendingDelete(1, operationUpdate)
+	updating.AddPodWithUID("egress", "ns/replacement", "uid-1", "10.0.0.1", "10.244.0.5")
+	assert.Equal(t, StateUpdateInProgress, updating.pendingServiceOps["egress"].State,
+		"the retries of an update in flight are not a deletion attempt: it must revive")
+	assert.NotContains(t, updating.pendingServiceDeletions, "egress")
+
+	failed := newTestDiffTracker()
+	failed.pendingServiceOps["egress"] = &ServiceOperationState{
+		ServiceUID: "egress",
+		Config:     NewOutboundServiceConfig("egress", nil),
+		State:      StateCreated,
+	}
+	failed.NRPResources.NATGateways.Insert("egress")
+	failed.AddPodWithUID("egress", "ns/last", "uid-0", "10.0.0.1", "10.244.0.4")
+	failed.DeletePod("egress", "10.0.0.1", []string{"10.244.0.4"}, "ns", "last", "uid-0")
+	failed.CheckPendingServiceDeletions()
+	dispatchWithoutRunning(t, failed)
+	failed.OnServiceCreationComplete("egress", false, errors.New(serviceOverlayMappingsErrorCode))
+	if !assert.Equal(t, StateDeletionPending, failed.pendingServiceOps["egress"].State, "control: the failed deletion waits for a drain") {
+		return
+	}
+	failed.AddPodWithUID("egress", "ns/waiting", "uid-1", "10.0.0.1", "10.244.0.5")
+	assert.Equal(t, StateDeletionPending, failed.pendingServiceOps["egress"].State, "a failed deletion must not be revived")
+	failed.DeletePod("egress", "10.0.0.1", []string{"10.244.0.5"}, "ns", "waiting", "uid-1")
+	failed.AddPodWithUID("egress", "ns/next", "uid-2", "10.0.0.1", "10.244.0.6")
+	assert.Equal(t, StateDeletionPending, failed.pendingServiceOps["egress"].State,
+		"the failed deletion must not be revived once a waiting pod left again")
+	assert.Len(t, failed.pendingPods["egress"], 1, "the pod must wait for the re-creation")
 }
 
 // TestReconcileInboundService_SkipsServiceBeingDeleted pins that a Service carrying a
@@ -2037,4 +2076,153 @@ func TestHandleEmptyOutboundService_FailedCreateSchedulesTeardown(t *testing.T) 
 		assert.False(t, tracked, "with no Azure resources there is nothing to tear down")
 		assert.NotContains(t, dt.pendingServiceDeletions, egress)
 	})
+}
+
+// TestConfigsEqualForUpdate pins what the update path treats as a change: the inbound shape, and for
+// an outbound service its NAT Gateway configuration only (IPFamilies is decided at creation). An outbound
+// service without a config carries the zero configuration.
+func TestConfigsEqualForUpdate(t *testing.T) {
+	inbound := func(ports ...int32) *ServiceConfig {
+		cfg := NewInboundServiceConfig("svc", makeInboundConfig(ports...))
+		return &cfg
+	}
+	outbound := func(families []string, egress EgressConfig) *ServiceConfig {
+		cfg := NewOutboundServiceConfig("egress", &OutboundConfig{IPFamilies: families, Egress: egress})
+		return &cfg
+	}
+	unconfigured := func() *ServiceConfig {
+		cfg := NewOutboundServiceConfig("egress", nil)
+		return &cfg
+	}
+	agreed := EgressConfig{IdleTimeoutMinutes: 10, IPv4: egressFamilyConfig{ManagedPublicIPs: 2}}
+	other := EgressConfig{IdleTimeoutMinutes: 10, IPv4: egressFamilyConfig{ManagedPublicIPs: 3}}
+
+	cases := []struct {
+		name string
+		a, b *ServiceConfig
+		want bool
+	}{
+		{"both nil", nil, nil, true},
+		{"one nil", outbound(nil, agreed), nil, false},
+		{"inbound and outbound", inbound(80), outbound(nil, EgressConfig{}), false},
+		{"inbound equal", inbound(80, 443), inbound(80, 443), true},
+		{"inbound different", inbound(80), inbound(443), false},
+		{"outbound same egress", outbound([]string{"IPv4"}, agreed), outbound([]string{"IPv4"}, agreed), true},
+		{"outbound different egress", outbound([]string{"IPv4"}, agreed), outbound([]string{"IPv4"}, other), false},
+		{"outbound egress and unknown", outbound(nil, agreed), outbound(nil, egressUnknown), false},
+		{"outbound families decided at creation", outbound([]string{"IPv4"}, agreed), outbound([]string{"IPv4", "IPv6"}, agreed), true},
+		{"outbound without a config and zero egress", unconfigured(), outbound(nil, EgressConfig{}), true},
+		{"outbound without a config and a configured egress", unconfigured(), outbound(nil, agreed), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, configsEqualForUpdate(tc.a, tc.b))
+			assert.Equal(t, tc.want, configsEqualForUpdate(tc.b, tc.a), "the comparison must be symmetric")
+		})
+	}
+}
+
+// TestOnServiceCreationComplete_LastAppliedOutboundIsACopy pins that the applied configuration recorded
+// on success shares nothing with the config it was copied from. The update path compares the desired
+// config with it, so an in-place edit reaching both would hide a change.
+func TestOnServiceCreationComplete_LastAppliedOutboundIsACopy(t *testing.T) {
+	const uid = "egress-applied-copy"
+	applied := EgressConfig{IdleTimeoutMinutes: 10, IPv4: egressFamilyConfig{ManagedPublicIPs: 2}}
+	newConfig := func() ServiceConfig {
+		return NewOutboundServiceConfig(uid, &OutboundConfig{IPFamilies: []string{"IPv4"}, Egress: applied})
+	}
+
+	cases := []struct {
+		name     string
+		state    ResourceState
+		inFlight bool
+		outcome  *egressOutcome
+	}{
+		{"create from the in-flight snapshot", StateCreationInProgress, true, nil},
+		{"create from the desired config", StateCreationInProgress, false, nil},
+		{"update from the in-flight snapshot", StateUpdateInProgress, true, &egressOutcome{Mode: egressModeManaged, Applied: &applied, Swept: true}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dt := newTestDiffTracker()
+			op := &ServiceOperationState{ServiceUID: uid, Config: newConfig(), State: tc.state}
+			source := op.Config.OutboundConfig
+			if tc.inFlight {
+				inflight := newConfig()
+				op.InFlightConfig = &inflight
+				source = inflight.OutboundConfig
+			}
+			dt.pendingServiceOps[uid] = op
+
+			dt.onServiceOperationComplete(uid, true, nil, tc.outcome)
+
+			// An in-place edit no code may make.
+			source.IPFamilies[0] = "IPv6"
+			source.Egress = egressUnknown
+
+			assert.Equal(t, StateCreated, op.State)
+			if assert.NotNil(t, op.LastAppliedConfig) && assert.NotNil(t, op.LastAppliedConfig.OutboundConfig) {
+				assert.Equal(t, []string{"IPv4"}, op.LastAppliedConfig.OutboundConfig.IPFamilies)
+				assert.Equal(t, applied, op.LastAppliedConfig.OutboundConfig.Egress)
+			}
+		})
+	}
+}
+
+// TestResetRetryStateLocked_KeepsEgressQuietUntil pins that fresh intent resets the retry budget but
+// never the quiet period: a write whose outcome is unknown may still land however the intent changed.
+func TestResetRetryStateLocked_KeepsEgressQuietUntil(t *testing.T) {
+	const uid = "egress-quiet"
+
+	cases := []struct {
+		name  string
+		state ResourceState
+		// quietFor is when the quiet period ends, from now. A running quiet period holds the park re-arm
+		// back (TestRetryGate_EgressQuietPeriod), so that case uses one that has just ended: the reset
+		// must keep its value all the same.
+		quietFor time.Duration
+		reset    func(dt *DiffTracker, op *ServiceOperationState)
+	}{
+		{"direct", StateUpdateInProgress, 2 * time.Minute, func(dt *DiffTracker, op *ServiceOperationState) {
+			dt.mu.Lock()
+			defer dt.mu.Unlock()
+			resetRetryStateLocked(op)
+		}},
+		{"a delete re-arms the retry budget", StateCreated, 2 * time.Minute, func(dt *DiffTracker, _ *ServiceOperationState) {
+			dt.DeleteService(uid, false, false)
+		}},
+		{"the park cooldown re-arms the operation after the quiet period", StateUpdateInProgress, -time.Second, func(dt *DiffTracker, op *ServiceOperationState) {
+			su := newTestServiceUpdater(dt)
+			su.activeOps[uid] = true
+			op.RetriesExhausted = true
+			op.NextRetryAt = time.Now().Add(-time.Second)
+			dt.mu.Lock()
+			defer dt.mu.Unlock()
+			assert.False(t, su.retryGate(uid, op), "the elapsed cooldown must re-arm the operation")
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dt := newTestDiffTracker()
+			quietUntil := time.Now().Add(tc.quietFor)
+			op := &ServiceOperationState{
+				ServiceUID:  uid,
+				Config:      NewOutboundServiceConfig(uid, &OutboundConfig{}),
+				State:       tc.state,
+				RetryCount:  maxServiceRetries,
+				NextRetryAt: time.Now().Add(time.Minute),
+				Egress:      egressOperationState{QuietUntil: quietUntil},
+			}
+			dt.pendingServiceOps[uid] = op
+
+			tc.reset(dt, op)
+
+			assert.Zero(t, op.RetryCount, "control: the retry budget must have been reset")
+			assert.False(t, op.RetriesExhausted)
+			assert.Equal(t, quietUntil, op.Egress.QuietUntil, "the quiet period must survive a retry reset")
+		})
+	}
 }

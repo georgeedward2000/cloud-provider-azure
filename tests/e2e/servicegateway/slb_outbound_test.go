@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -2077,12 +2076,7 @@ func createBYOPublicIPPrefix(rg, name, version string, length int) string {
 const byoAccessIdentitiesEnvVar = "BYO_E2E_CLUSTER_IDENTITY_OBJECT_IDS"
 
 func byoAccessTestIdentities() []string {
-	var ids []string
-	for _, id := range strings.Split(os.Getenv(byoAccessIdentitiesEnvVar), ",") {
-		if id = strings.TrimSpace(id); id != "" {
-			ids = append(ids, id)
-		}
-	}
+	ids := clusterIdentityObjectIDs()
 	if len(ids) == 0 {
 		Skip(byoAccessIdentitiesEnvVar + " is not set; this spec changes the cluster identity's role on the VNet resource group")
 	}

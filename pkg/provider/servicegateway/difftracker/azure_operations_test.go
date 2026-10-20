@@ -568,11 +568,11 @@ func TestGetServiceByUIDViaList_FindsServiceRetypedAwayFromLoadBalancer(t *testi
 	}
 }
 
-// TestDisassociateNatGateway_ClearsReferencesOnTheWire pins the marshalled request bodies, not just
+// TestUnlinkNatGateway_ClearsReferencesOnTheWire pins the marshalled request bodies, not just
 // that the calls happen. Assigning a plain typed nil to clear a field is silently dropped by the
 // generated marshaller, and ARM reads an absent field as "leave unchanged", so both clears become
 // no-ops that still report success.
-func TestDisassociateNatGateway_ClearsReferencesOnTheWire(t *testing.T) {
+func TestUnlinkNatGateway_ClearsReferencesOnTheWire(t *testing.T) {
 	const sgwName, natName = "sgw", "egress-uid"
 	sgwID := "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/serviceGateways/" + sgwName
 	natID := "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/natGateways/" + natName
@@ -619,7 +619,7 @@ func TestDisassociateNatGateway_ClearsReferencesOnTheWire(t *testing.T) {
 	dt.networkClientFactory = mockFactory
 	dt.config = testConfig()
 
-	assert.NoError(t, dt.disassociateNatGatewayFromServiceGateway(context.Background(), sgwName, natName))
+	assert.NoError(t, dt.unlinkNatGateway(context.Background(), sgwName, natName, dt.config.ResourceGroup, natName))
 
 	assert.Contains(t, string(sgwBody), `"publicNatGatewayId":null`,
 		"the ServiceGateway-side reference must be cleared explicitly, not omitted")

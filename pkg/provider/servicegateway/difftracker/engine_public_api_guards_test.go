@@ -261,19 +261,8 @@ func TestGuardOnServiceCreationComplete_UnknownServiceIsNoOp(t *testing.T) {
 }
 
 // ================================================================================================
-// AddPod — input validation & idempotent recovery for NRP-existing service
+// AddPod — idempotent recovery for NRP-existing service (AddEgressPod's validation: TestAddEgressPod)
 // ================================================================================================
-
-// TestGuardAddPod_InvalidParamsIsNoOp verifies the validation rule (empty
-// serviceUID / location / address are rejected without state mutation).
-func TestGuardAddPod_InvalidParamsIsNoOp(t *testing.T) {
-	dt := newTestDiffTracker()
-	dt.AddPod("", "ns/p", "loc", "addr")
-	dt.AddPod("uid", "ns/p", "", "addr")
-	dt.AddPod("uid", "ns/p", "loc", "")
-	assert.Empty(t, dt.pendingServiceOps, "invalid-param AddPod must not synthesize a service")
-	assert.Empty(t, dt.pendingPods, "invalid-param AddPod must not buffer anything")
-}
 
 // TestGuardAddPod_ExistingNRPNATGatewayAddsImmediately verifies the recovery path:
 // when the NAT Gateway exists in NRP but no tracking entry exists, AddPod must

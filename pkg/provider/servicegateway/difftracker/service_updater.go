@@ -49,15 +49,22 @@ type ServiceUpdater struct {
 	// pending revisit. Guarded by mu.
 	retryTimers map[string]*time.Timer
 	logger      logr.Logger
+	// onOutboundComplete receives an outbound run's completion with its outcome.
+	onOutboundComplete func(serviceUID string, success bool, err error, outcome *egressOutcome)
 }
 
-// NewServiceUpdater creates a new ServiceUpdater instance
-func NewServiceUpdater(ctx context.Context, diffTracker *DiffTracker, onComplete func(string, bool, error), triggerChan <-chan bool) *ServiceUpdater {
+// NewServiceUpdater creates a new ServiceUpdater instance. onComplete receives the completion of an inbound run and of
+// a run that panicked; onOutboundComplete the completion of an outbound run, with its outcome.
+func NewServiceUpdater(ctx context.Context, diffTracker *DiffTracker, onComplete func(string, bool, error),
+	onOutboundComplete func(string, bool, error, *egressOutcome), triggerChan <-chan bool) *ServiceUpdater {
 	if diffTracker == nil {
 		panic("ServiceUpdater: diffTracker must not be nil")
 	}
 	if onComplete == nil {
 		panic("ServiceUpdater: onComplete callback must not be nil")
+	}
+	if onOutboundComplete == nil {
+		panic("ServiceUpdater: onOutboundComplete callback must not be nil")
 	}
 	if triggerChan == nil {
 		panic("ServiceUpdater: triggerChan must not be nil")
@@ -76,7 +83,14 @@ func NewServiceUpdater(ctx context.Context, diffTracker *DiffTracker, onComplete
 		activeOps:   make(map[string]bool),
 		retryTimers: make(map[string]*time.Timer),
 		logger:      diffTracker.logger.WithName("ServiceUpdater"),
+		// Outbound runs complete with their outcome.
+		onOutboundComplete: onOutboundComplete,
 	}
+}
+
+// completeOutbound reports the completion of an outbound run with its outcome.
+func (s *ServiceUpdater) completeOutbound(serviceUID string, success bool, err error, outcome *egressOutcome) {
+	s.onOutboundComplete(serviceUID, success, err, outcome)
 }
 
 // terminalError marks a creation failure as non-retryable (a deterministic error
@@ -204,15 +218,31 @@ const maxServiceRetries = 12
 const parkReArmCooldown = 5 * time.Minute
 
 // retryGate decides whether a retryable operation should be skipped this dispatch pass. It returns
-// true (caller must `continue`) when the op is still within its post-failure backoff window
-// (scheduling a guaranteed revisit via time.AfterFunc) or has exhausted its current retry burst
-// (a park-and-re-arm cooldown). It must be called with s.diffTracker.mu held and after
-// activeOps[uid] has been set; it releases activeOps[uid] on skip.
+// true (caller must `continue`) when the op is an outbound operation within its egress quiet period,
+// is still within its post-failure backoff window (scheduling a guaranteed revisit via
+// time.AfterFunc) or has exhausted its current retry burst (a park-and-re-arm cooldown). It must be
+// called with s.diffTracker.mu held and after activeOps[uid] has been set; it releases activeOps[uid]
+// on skip.
 //
 // Note the op is never abandoned: exhausting maxServiceRetries parks it for parkReArmCooldown and
 // schedules a revisit, after which it re-arms and retries again. A permanently failing op therefore
 // retries forever at one burst per cooldown rather than stranding until CCM restart.
 func (s *ServiceUpdater) retryGate(serviceUID string, opState *ServiceOperationState) bool {
+	// Egress quiet period: a write of this identity whose outcome is unknown may still be applied by
+	// Azure, so none of its runs (create retry, update, observe-and-clean, delete) is dispatched before
+	// the period ends. Waiting is not a failed attempt: the retry budget and backoff are left as they
+	// are, and the revisit is scheduled for the end of the period.
+	if !opState.Config.IsInbound && time.Now().Before(opState.Egress.QuietUntil) {
+		delay := time.Until(opState.Egress.QuietUntil)
+		s.mu.Lock()
+		delete(s.activeOps, serviceUID)
+		s.mu.Unlock()
+		s.logger.V(4).Info("Deferred outbound service operation until its egress quiet period ends",
+			"serviceUID", serviceUID, "state", opState.State, "quietUntil", opState.Egress.QuietUntil)
+		s.scheduleRetry(serviceUID, delay)
+		return true
+	}
+
 	// Retry-burst ceiling: pause re-dispatching until the park cooldown elapses.
 	if opState.RetryCount >= maxServiceRetries {
 		// A parked op has no external driver on a stable cluster, so it must self-arm or it strands
@@ -257,18 +287,20 @@ func (s *ServiceUpdater) retryGate(serviceUID string, opState *ServiceOperationS
 	return false
 }
 
+// serviceWork is a run the dispatcher started: the operation's configuration snapshot and the kind of run it recorded.
+type serviceWork struct {
+	serviceUID             string
+	config                 ServiceConfig
+	kind                   operationKind
+	correlationID          string
+	triggeringPodNamespace string
+	triggeringPodName      string
+}
+
 // processBatch scans pendingServiceOps and spawns goroutines for services that need processing
 func (s *ServiceUpdater) processBatch() {
 	// Collect work to do while holding lock, then spawn goroutines after releasing lock
-	type workItem struct {
-		serviceUID             string
-		config                 ServiceConfig
-		state                  ResourceState
-		correlationID          string
-		triggeringPodNamespace string
-		triggeringPodName      string
-	}
-	var workToDo []workItem
+	var workToDo []serviceWork
 
 	s.diffTracker.mu.Lock()
 	for serviceUID, opState := range s.diffTracker.pendingServiceOps {
@@ -298,9 +330,18 @@ func (s *ServiceUpdater) processBatch() {
 			}
 			opState.State = StateCreationInProgress
 			opState.OperationStartedAt = time.Now()
-			configSnapshot := opState.Config
+			opState.InFlightKind = operationCreate
+			opState.Egress.noteDispatched()
+			if !opState.Config.IsInbound {
+				// The creation configuration is decided by the members of the identity at dispatch, the linearisation
+				// point, and nowhere else: the operation is tracked, and re-created, with its IP families alone.
+				if creation := s.diffTracker.creationConfigLocked(serviceUID, outboundFamilies(opState.Config.OutboundConfig)); creation != outboundEgress(opState.Config.OutboundConfig) {
+					setDesiredEgress(opState, creation)
+				}
+			}
+			configSnapshot := opState.Config.snapshot()
 			opState.InFlightConfig = &configSnapshot
-			workToDo = append(workToDo, workItem{serviceUID, configSnapshot, StateCreationInProgress, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
+			workToDo = append(workToDo, serviceWork{serviceUID, configSnapshot, opState.InFlightKind, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
 
 		case StateCreationInProgress:
 			// Already being processed by another goroutine, skip
@@ -330,17 +371,23 @@ func (s *ServiceUpdater) processBatch() {
 				continue
 			}
 			opState.OperationStartedAt = time.Now()
-			workToDo = append(workToDo, workItem{serviceUID, opState.Config, StateDeletionInProgress, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
+			opState.InFlightKind = operationDelete
+			opState.Egress.noteDispatched()
+			workToDo = append(workToDo, serviceWork{serviceUID, opState.Config.snapshot(), opState.InFlightKind, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
 
 		case StateUpdateInProgress:
 			if s.retryGate(serviceUID, opState) {
 				continue
 			}
-			// Snapshot the desired config so OnServiceCreationComplete can detect drift.
+			// Snapshot the desired config, the kind of the run and the observation generation for the run's
+			// completion: it detects drift, is processed as the run it is, and tells an obligation raised
+			// while the run was in flight from one the run settled.
 			opState.OperationStartedAt = time.Now()
-			configSnapshot := opState.Config
+			opState.InFlightKind = s.diffTracker.updateRunKindLocked(serviceUID, opState)
+			opState.Egress.noteDispatched()
+			configSnapshot := opState.Config.snapshot()
 			opState.InFlightConfig = &configSnapshot
-			workToDo = append(workToDo, workItem{serviceUID, configSnapshot, StateUpdateInProgress, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
+			workToDo = append(workToDo, serviceWork{serviceUID, configSnapshot, opState.InFlightKind, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
 		}
 	}
 	s.diffTracker.mu.Unlock()
@@ -365,42 +412,39 @@ func (s *ServiceUpdater) processBatch() {
 
 	// Spawn goroutines after releasing diffTracker lock
 	for _, work := range workToDo {
-		switch work.state {
-		case StateCreationInProgress:
-			s.wg.Add(1)
-			go func(uid string, cfg ServiceConfig, corrID string, podNS string, podName string) {
-				s.runWorker(uid, func() {
-					if cfg.IsInbound {
-						s.createInboundService(uid, cfg.InboundConfig, corrID)
-					} else {
-						s.createOutboundService(uid, cfg.OutboundConfig, corrID, podNS, podName)
-					}
-				})
-			}(work.serviceUID, work.config, work.correlationID, work.triggeringPodNamespace, work.triggeringPodName)
-		case StateDeletionInProgress:
-			s.wg.Add(1)
-			go func(uid string, cfg ServiceConfig, corrID string) {
-				s.runWorker(uid, func() {
-					if cfg.IsInbound {
-						s.deleteInboundService(uid, corrID)
-					} else {
-						s.deleteOutboundService(uid, corrID)
-					}
-				})
-			}(work.serviceUID, work.config, work.correlationID)
-		case StateUpdateInProgress:
-			s.wg.Add(1)
-			go func(uid string, cfg ServiceConfig, corrID string) {
-				s.runWorker(uid, func() {
-					if cfg.IsInbound {
-						s.updateInboundService(uid, cfg.InboundConfig, corrID)
-					} else {
-						s.logger.Info("Skipped outbound service update; egress identities cannot be updated in place", "serviceUID", uid)
-						recordOutboundServiceUpdateSkipped()
-						s.onComplete(uid, true, nil)
-					}
-				})
-			}(work.serviceUID, work.config, work.correlationID)
+		s.wg.Add(1)
+		go func(work serviceWork) {
+			s.runWorker(work.serviceUID, func() { s.runServiceWork(work) })
+		}(work)
+	}
+}
+
+// runServiceWork runs the operation the dispatcher started, chosen by the kind of run recorded at dispatch rather than by
+// the operation's state, which may have changed since. An update of an egress identity applies its configuration or
+// observes it, and the update of a BYO one is the cleanup of its residue.
+func (s *ServiceUpdater) runServiceWork(w serviceWork) {
+	switch {
+	case w.config.IsInbound && w.kind == operationCreate:
+		s.createInboundService(w.serviceUID, w.config.InboundConfig, w.correlationID)
+	case w.config.IsInbound && w.kind == operationUpdate:
+		s.updateInboundService(w.serviceUID, w.config.InboundConfig, w.correlationID)
+	case w.config.IsInbound && w.kind == operationDelete:
+		s.deleteInboundService(w.serviceUID, w.correlationID)
+	case w.kind == operationCreate:
+		s.createOutboundService(w.serviceUID, w.config.OutboundConfig, w.correlationID, w.triggeringPodNamespace, w.triggeringPodName)
+	case w.kind == operationUpdate:
+		s.updateOutboundService(w.serviceUID, w.config.OutboundConfig, w.correlationID)
+	case w.kind == operationEgressResidueCleanup:
+		s.cleanupOutboundResidue(w.serviceUID, w.correlationID)
+	case w.kind == operationDelete:
+		s.deleteOutboundService(w.serviceUID, w.correlationID)
+	default:
+		// Never dispatched; failing the operation retries it instead of leaving it in flight forever.
+		err := fmt.Errorf("service %q: no run of kind %d", w.serviceUID, w.kind)
+		if w.config.IsInbound {
+			s.onComplete(w.serviceUID, false, err)
+		} else {
+			s.completeOutbound(w.serviceUID, false, err, &egressOutcome{})
 		}
 	}
 }
@@ -629,7 +673,8 @@ func (s *ServiceUpdater) updateInboundService(serviceUID string, config *Inbound
 	s.logger.V(2).Info("Updated inbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 }
 
-// createOutboundService provisions an egress identity: links its BYO NAT Gateway, or creates a managed one
+// createOutboundService provisions an egress identity: links its BYO NAT Gateway, or creates a managed one with its
+// creation configuration (createManagedOutboundService)
 func (s *ServiceUpdater) createOutboundService(serviceUID string, config *OutboundConfig, correlationID string, triggeringPodNS string, triggeringPodName string) {
 	s.logger.V(5).Info("Started creating outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "pod", triggeringPodNS+"/"+triggeringPodName)
 
@@ -639,60 +684,15 @@ func (s *ServiceUpdater) createOutboundService(serviceUID string, config *Outbou
 	byoNATGateway, err := s.resolveBYONATGateway(ctx, serviceUID, triggeringPodNS, triggeringPodName)
 	if err != nil {
 		s.logger.V(4).Info("Could not resolve NAT Gateway for outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "err", err)
-		s.onComplete(serviceUID, false, err)
+		// Which NAT Gateway serves the identity is not resolved: the outcome reports no mode.
+		s.completeOutbound(serviceUID, false, err, &egressOutcome{})
 		return
 	}
 	if byoNATGateway != nil {
 		s.createBYOOutboundService(ctx, serviceUID, config, byoNATGateway, correlationID, triggeringPodNS, triggeringPodName)
 		return
 	}
-
-	// Step 1: Build resources using shared helper
-	pipResources, natGatewayResource, servicesDTO := buildOutboundServiceResources(serviceUID, config, s.diffTracker.config)
-
-	// Step 2: Create every Public IP the NAT Gateway references. Creating them all before the
-	// gateway keeps the retry idempotent: a partial failure here leaves addresses the next attempt
-	// reuses, and the gateway is never PUT referencing an address that does not exist.
-	for i := range pipResources {
-		pipResource := pipResources[i]
-		if err := s.diffTracker.createOrUpdatePIP(ctx, s.diffTracker.config.ResourceGroup, &pipResource); err != nil {
-			httpStatus, errCode := extractAzureErrorInfo(err)
-			s.logger.V(4).Info("Could not create Public IP for outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "pod", triggeringPodNS+"/"+triggeringPodName, "publicIP", derefString(pipResource.Name), "httpStatus", httpStatus, "errorCode", errCode, "err", err)
-			s.onComplete(serviceUID, false, fmt.Errorf("failed to create Public IP: %w", err))
-			return
-		}
-		s.logger.V(5).Info("Created Public IP for outbound service", "serviceUID", serviceUID, "publicIP", derefString(pipResource.Name))
-	}
-
-	// Step 3: Create NAT Gateway
-	if err := s.diffTracker.createOrUpdateNatGateway(ctx, s.diffTracker.config.ResourceGroup, natGatewayResource); err != nil {
-		httpStatus, errCode := extractAzureErrorInfo(err)
-		s.logger.V(4).Info("Could not create NAT Gateway for outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "pod", triggeringPodNS+"/"+triggeringPodName, "httpStatus", httpStatus, "errorCode", errCode, "err", err)
-		// Don't delete PIP here - retry will use existing PIP
-		s.onComplete(serviceUID, false, fmt.Errorf("failed to create NAT Gateway: %w", err))
-		return
-	}
-	s.logger.V(5).Info("Created NAT Gateway for outbound service", "serviceUID", serviceUID)
-
-	// Step 4: Register service with ServiceGateway API
-	if err := s.diffTracker.updateNRPSGWServices(ctx, s.diffTracker.config.ServiceGatewayResourceName, servicesDTO); err != nil {
-		httpStatus, errCode := extractAzureErrorInfo(err)
-		s.logger.V(4).Info("Could not register outbound service with ServiceGateway", "serviceUID", serviceUID, "correlationID", correlationID, "pod", triggeringPodNS+"/"+triggeringPodName, "httpStatus", httpStatus, "errorCode", errCode, "err", err)
-		// Don't delete resources - retry will reconcile
-		s.onComplete(serviceUID, false, fmt.Errorf("failed to register with ServiceGateway: %w", err))
-		return
-	}
-	s.logger.V(5).Info("Registered outbound service with ServiceGateway", "serviceUID", serviceUID)
-
-	// Update NRPResources to reflect the sync
-	s.diffTracker.UpdateNRPNATGateways(SyncServicesReturnType{
-		Additions: newIgnoreCaseSetFromSlice([]string{serviceUID}),
-		Removals:  nil,
-	})
-
-	// Step 4: Success callback
-	s.onComplete(serviceUID, true, nil)
-	s.logger.V(2).Info("Created outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "pod", triggeringPodNS+"/"+triggeringPodName)
+	s.createManagedOutboundService(serviceUID, config, correlationID, triggeringPodNS+"/"+triggeringPodName)
 }
 
 // deleteInboundService deletes LoadBalancer resources
@@ -809,129 +809,117 @@ func (s *ServiceUpdater) deleteInboundService(serviceUID string, correlationID s
 }
 
 // deleteOutboundService releases an egress identity: unlinks its BYO NAT Gateway, or deletes the managed
-// NAT Gateway and Public IPs it owns
+// NAT Gateway and every reserved Public IP and prefix it owns
 func (s *ServiceUpdater) deleteOutboundService(serviceUID string, correlationID string) {
 	s.logger.V(5).Info("Started deleting outbound service", "serviceUID", serviceUID, "correlationID", correlationID)
 
-	ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
-	defer cancel()
-
 	if natGatewayID := s.diffTracker.byoNATGatewayID(serviceUID); natGatewayID != "" {
+		ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
+		defer cancel()
 		s.deleteBYOOutboundService(ctx, serviceUID, natGatewayID, correlationID)
 		return
 	}
 	if s.diffTracker.isUnmanagedNATGateway(serviceUID) {
 		// Its creation was rejected, so it provisioned nothing; the gateway of its name is not ours.
-		s.finishOutboundDeletion(ctx, serviceUID, correlationID, nil)
+		s.finishOutboundDeletion(serviceUID, correlationID, nil, &egressOutcome{Swept: true})
 		return
 	}
-	// Checked before anything changes, so a failed check retries the whole delete.
-	owned, err := s.diffTracker.ownsClusterNATGateway(ctx, serviceUID)
+	// The managed deletion follows the rules of every managed egress run (design 4.4): each Azure call has a budget of
+	// its own, taken from the updater's context, and each write is a single attempt; one whose outcome is unknown ends
+	// the run, which then writes nothing else. Checked before anything changes, so a failed check retries the whole
+	// delete.
+	owned, err := s.diffTracker.ownsClusterNATGateway(s.ctx, serviceUID)
 	if err != nil {
-		s.finishOutboundDeletion(ctx, serviceUID, correlationID, err)
+		s.finishOutboundDeletion(serviceUID, correlationID, err, &egressOutcome{})
 		return
 	}
+	// Every step from here on may write to Azure. The operation is marked first, so a run that stops on a panic is
+	// known to have written.
+	s.diffTracker.noteEgressMutationStarted(serviceUID)
 	var lastErr error
 
 	// Step 1: Disassociate NAT Gateway from ServiceGateway. A gateway this identity does not own is
 	// not written at all; Step 2 still removes the identity's own registration.
 	if !owned {
 		s.logger.V(2).Info("Skipped disassociating a NAT Gateway not owned by this identity", "serviceUID", serviceUID)
-	} else if err := s.diffTracker.disassociateNatGatewayFromServiceGateway(ctx, s.diffTracker.config.ServiceGatewayResourceName, serviceUID); err != nil {
+	} else if unlink := s.diffTracker.unlinkManagedEgress(s.ctx, serviceUID); unlink.CommitUnknown || unlink.Busy {
+		s.finishOutboundDeletion(serviceUID, correlationID, fmt.Errorf("disassociating NAT Gateway from ServiceGateway: %w", unlink.Err),
+			unlink.toOutcome(egressModeUnknown))
+		return
+	} else if unlink.Err != nil {
 		// Continue: the later steps are what free the resources. Logged at error level and counted
 		// because nothing retries this step, the deletion is still recorded as a success, and the
 		// ServiceGateway keeps a stale NAT Gateway association.
 		recordDeleteSubstepFailure(deleteStepDisassociateNAT)
-		s.logger.Error(err, "Could not disassociate NAT Gateway from ServiceGateway; continuing with deletion", "serviceUID", serviceUID)
+		s.logger.Error(unlink.Err, "Could not disassociate NAT Gateway from ServiceGateway; continuing with deletion", "serviceUID", serviceUID)
 	} else {
 		s.logger.V(5).Info("Disassociated NAT Gateway from ServiceGateway", "serviceUID", serviceUID)
 	}
 
 	// Step 2: Unregister from ServiceGateway API
-	servicesDTO := buildServiceGatewayRemovalDTO(serviceUID, false, s.diffTracker.config)
-
-	if err := s.diffTracker.updateNRPSGWServices(ctx, s.diffTracker.config.ServiceGatewayResourceName, servicesDTO); err != nil {
-		// Treat 404 NotFound as success - the service is already gone from ServiceGateway
-		var respErr *azcore.ResponseError
-		if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
-			s.logger.V(4).Info("Skipped already unregistered outbound service", "serviceUID", serviceUID, "httpStatus", http.StatusNotFound)
-		} else {
-			httpStatus, errCode := extractAzureErrorInfo(err)
-			s.logger.V(4).Info("Could not unregister outbound service from ServiceGateway", "serviceUID", serviceUID, "correlationID", correlationID, "httpStatus", httpStatus, "errorCode", errCode, "err", err)
-			lastErr = fmt.Errorf("failed to unregister from ServiceGateway: %w", err)
-			// Continue with deletion
-		}
-	} else {
+	err = s.diffTracker.unregisterEgressIdentity(s.ctx, serviceUID)
+	switch unregister := classifyEgressSyncWrite(err); {
+	case unregister.Outcome == egressWriteSucceeded:
 		s.logger.V(5).Info("Unregistered outbound service from ServiceGateway", "serviceUID", serviceUID)
+	case unregister.Outcome == egressWriteUnknown:
+		s.finishOutboundDeletion(serviceUID, correlationID, fmt.Errorf("unregistering from ServiceGateway: Azure may still apply it: %w", err),
+			&egressOutcome{CommitUnknown: true})
+		return
+	case unregister.StatusCode == http.StatusNotFound:
+		// The service is already gone from ServiceGateway.
+		s.logger.V(4).Info("Skipped already unregistered outbound service", "serviceUID", serviceUID, "httpStatus", http.StatusNotFound)
+	default:
+		httpStatus, errCode := extractAzureErrorInfo(err)
+		s.logger.V(4).Info("Could not unregister outbound service from ServiceGateway", "serviceUID", serviceUID, "correlationID", correlationID, "httpStatus", httpStatus, "errorCode", errCode, "err", err)
+		lastErr = fmt.Errorf("failed to unregister from ServiceGateway: %w", err)
+		// Continue with deletion
 	}
 
-	// Steps 3-4: delete the NAT Gateway and its Public IPs, unless they are not this identity's to
-	// delete (not created by this controller, or used by another service such as the default one).
+	// Steps 3-4: delete the NAT Gateway and sweep every reserved Public IP and prefix of the identity, unless they are
+	// not this identity's to delete (not created by this controller, or used by another service such as the default
+	// one): nothing is then left that the deletion may delete.
+	outcome := &egressOutcome{Swept: true}
 	if !owned {
 		s.logger.V(2).Info("Kept NAT Gateway and Public IPs not owned by this identity", "serviceUID", serviceUID)
-	} else if err := s.deleteManagedOutboundResources(ctx, serviceUID, correlationID); err != nil {
-		lastErr = err
+	} else {
+		var err error
+		if outcome, err = s.deleteManagedOutboundEgress(serviceUID, correlationID); err != nil {
+			lastErr = err
+		}
 	}
 
-	s.finishOutboundDeletion(ctx, serviceUID, correlationID, lastErr)
+	s.finishOutboundDeletion(serviceUID, correlationID, lastErr, outcome)
 }
 
 // finishOutboundDeletion is Step 5 of deleting an egress identity: once its Azure resources are
 // released (deleted, unlinked for BYO, or left alone when not its own; lastErr == nil) it updates NRPResources, releases the last pods' finalizers and forgets any BYO
-// NAT Gateway; otherwise it reports the failure so the delete is retried.
-func (s *ServiceUpdater) finishOutboundDeletion(ctx context.Context, serviceUID, correlationID string, lastErr error) {
+// NAT Gateway; otherwise it reports the failure so the delete is retried. Either way the deletion run completes with
+// outcome. The finalizers are released with a budget of their own, whatever the Azure steps took.
+func (s *ServiceUpdater) finishOutboundDeletion(serviceUID, correlationID string, lastErr error, outcome *egressOutcome) {
 	if lastErr != nil {
 		s.logger.V(4).Info("Could not delete outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "err", lastErr)
-		s.onComplete(serviceUID, false, lastErr)
-	} else {
-		s.logger.V(2).Info("Deleted outbound service", "serviceUID", serviceUID, "correlationID", correlationID)
-		// Update NRPResources to reflect the deletion
-		s.diffTracker.UpdateNRPNATGateways(SyncServicesReturnType{
-			Additions: nil,
-			Removals:  newIgnoreCaseSetFromSlice([]string{serviceUID}),
-		})
-
-		// Remove finalizers from last-pod entries now that the identity's Azure resources are released
-		// (deleted, or unlinked for BYO). If that exhausts retries, report the delete as failed so it
-		// retries (every Azure step is idempotent) instead of stranding the pod finalizer.
-		if err := s.diffTracker.RemoveLastPodFinalizers(ctx, serviceUID); err != nil {
-			s.logger.V(4).Info("Could not clean up last-pod finalizers for outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "err", err)
-			s.onComplete(serviceUID, false, err)
-			return
-		}
-
-		// Forgotten last: a retried delete must still take the BYO (unlink-only) path.
-		s.diffTracker.setBYONATGatewayID(serviceUID, "")
-		s.onComplete(serviceUID, true, nil)
+		s.completeOutbound(serviceUID, false, lastErr, outcome)
+		return
 	}
-}
+	s.logger.V(2).Info("Deleted outbound service", "serviceUID", serviceUID, "correlationID", correlationID)
+	// Update NRPResources to reflect the deletion
+	s.diffTracker.UpdateNRPNATGateways(SyncServicesReturnType{
+		Additions: nil,
+		Removals:  newIgnoreCaseSetFromSlice([]string{serviceUID}),
+	})
 
-// deleteManagedOutboundResources deletes the NAT Gateway and Public IPs this controller created for an
-// egress identity (steps 3 and 4 of deleteOutboundService) and returns the last error.
-func (s *ServiceUpdater) deleteManagedOutboundResources(ctx context.Context, serviceUID, correlationID string) error {
-	var lastErr error
-	// Step 3: Delete NAT Gateway
-	if err := s.diffTracker.deleteNatGateway(ctx, s.diffTracker.config.ResourceGroup, serviceUID); err != nil {
-		httpStatus, errCode := extractAzureErrorInfo(err)
-		s.logger.V(4).Info("Could not delete NAT Gateway for outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "httpStatus", httpStatus, "errorCode", errCode, "err", err)
-		lastErr = fmt.Errorf("failed to delete NAT Gateway: %w", err)
-		// Continue with PIP deletion
-	} else {
-		s.logger.V(5).Info("Deleted NAT Gateway for outbound service", "serviceUID", serviceUID)
+	// Remove finalizers from last-pod entries now that the identity's Azure resources are released
+	// (deleted, or unlinked for BYO). If that exhausts retries, report the delete as failed so it
+	// retries (every Azure step is idempotent) instead of stranding the pod finalizer.
+	ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
+	defer cancel()
+	if err := s.diffTracker.RemoveLastPodFinalizers(ctx, serviceUID); err != nil {
+		s.logger.V(4).Info("Could not clean up last-pod finalizers for outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "err", err)
+		s.completeOutbound(serviceUID, false, err, outcome)
+		return
 	}
 
-	// Step 4: Delete every Public IP this identity can own. Both names are reserved for this
-	// controller, and the config that decided the families is not available here, so both are
-	// always attempted. A delete for an address that was never created is a 404, which
-	// deletePublicIP already treats as success.
-	for _, pipName := range OutboundPublicIPNames(serviceUID) {
-		if err := s.diffTracker.deletePublicIP(ctx, s.diffTracker.config.ResourceGroup, pipName); err != nil {
-			httpStatus, errCode := extractAzureErrorInfo(err)
-			s.logger.V(4).Info("Could not delete Public IP for outbound service", "serviceUID", serviceUID, "correlationID", correlationID, "publicIP", pipName, "httpStatus", httpStatus, "errorCode", errCode, "err", err)
-			lastErr = fmt.Errorf("failed to delete Public IP: %w", err)
-		} else {
-			s.logger.V(5).Info("Deleted Public IP for outbound service", "serviceUID", serviceUID, "publicIP", pipName)
-		}
-	}
-	return lastErr
+	// Forgotten last: a retried delete must still take the BYO (unlink-only) path.
+	s.diffTracker.setBYONATGatewayID(serviceUID, "")
+	s.completeOutbound(serviceUID, true, nil, outcome)
 }

@@ -71,7 +71,7 @@ func TestGuardV9WireValues_InboundResources(t *testing.T) {
 // TestGuardV9WireValues_OutboundResources pins the StandardV2 wire values for the egress NAT Gateway
 // path (PIP SKU + NAT Gateway SKU), which the v6->v9 migration must preserve.
 func TestGuardV9WireValues_OutboundResources(t *testing.T) {
-	pips, natGateway, _ := buildOutboundServiceResources("egress-wire-guard", &OutboundConfig{}, testConfig())
+	pips, natGateway := egressCreationRequests(t, "egress-wire-guard", defaultEgressConfig(egressParseContext{}), false, testConfig())
 	pip := pips[0]
 
 	if assert.NotNil(t, pip.SKU) && assert.NotNil(t, pip.SKU.Name) {

@@ -286,41 +286,6 @@ func TestResourceIDsAreConsistent(t *testing.T) {
 	assert.Equal(t, expectedFrontendIPID, *lb.Properties.LoadBalancingRules[0].Properties.FrontendIPConfiguration.ID)
 }
 
-// TestOutboundWorkflow tests NAT Gateway creation workflow
-func TestOutboundWorkflow(t *testing.T) {
-	egressUID := "egress-gateway-789"
-	dtConfig := Config{
-		SubscriptionID:             "sub-123",
-		ResourceGroup:              "rg-456",
-		Location:                   "westus2",
-		ServiceGatewayResourceName: "sgw-789",
-	}
-
-	pips, natGw, servicesDTO := buildOutboundServiceResources(egressUID, nil, dtConfig)
-	pip := pips[0]
-
-	// Validate PIP
-	assert.Equal(t, egressUID+"-pip", *pip.Name)
-	assert.Equal(t, "westus2", *pip.Location)
-
-	// Validate NAT Gateway
-	assert.Equal(t, egressUID, *natGw.Name)
-	assert.Equal(t, "westus2", *natGw.Location)
-
-	// Verify NAT Gateway references ServiceGateway
-	assert.NotNil(t, natGw.Properties.ServiceGateway)
-	assert.Equal(t, dtConfig.ServiceGatewayResourceID(), *natGw.Properties.ServiceGateway.ID)
-
-	// Verify NAT Gateway references PIP
-	assert.Len(t, natGw.Properties.PublicIPAddresses, 1)
-	expectedPIPID := "/subscriptions/sub-123/resourceGroups/rg-456/providers/Microsoft.Network/publicIPAddresses/egress-gateway-789-pip"
-	assert.Equal(t, expectedPIPID, *natGw.Properties.PublicIPAddresses[0].ID)
-
-	// Validate ServicesDTO
-	assert.Len(t, servicesDTO.Services, 1)
-	assert.Equal(t, Outbound, servicesDTO.Services[0].ServiceType)
-}
-
 // TestMultipleServicesIndependence validates that multiple services don't interfere
 func TestMultipleServicesIndependence(t *testing.T) {
 	dtConfig := Config{

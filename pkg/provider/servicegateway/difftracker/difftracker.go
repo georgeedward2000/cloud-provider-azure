@@ -19,6 +19,7 @@ package difftracker
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -100,6 +101,12 @@ func New(logger logr.Logger, k8s K8sState, nrp NRPState, config Config, networkC
 
 		recoveredServiceFinalizers: make(map[string]struct{}),
 		byoNATGateways:             make(map[string]string),
+		egress: egressTrackerState{
+			votes:    newEgressVotes(),
+			mode:     make(map[string]egressMode),
+			rejected: make(map[string]egressRejection),
+			warned:   make(map[string]egressRejection),
+		},
 
 		// Initialize Engine communication channels
 		serviceUpdaterTrigger:   make(chan bool, 1),
@@ -141,11 +148,20 @@ func (dt *DiffTracker) SetNodeLister(lister corelisters.NodeLister) {
 }
 
 // SetEventRecorder publishes the recorder used to emit Service Gateway pod events. Set post-init,
-// before the egress pod informer starts.
+// before the egress pod informer starts. The egress events queued until then are emitted in order.
 func (dt *DiffTracker) SetEventRecorder(recorder record.EventRecorder) {
 	dt.mu.Lock()
-	defer dt.mu.Unlock()
 	dt.eventRecorder = recorder
+	var queued []egressEvent
+	if recorder != nil {
+		queued = dt.egress.pendingEvents
+		dt.egress.pendingEvents = nil
+	}
+	dt.mu.Unlock()
+	// Emitted without dt.mu, like recordEvent: Event performs I/O.
+	for _, event := range queued {
+		recorder.Event(event.pod, event.eventType, event.reason, event.message)
+	}
 }
 
 // recordEvent emits a Kubernetes Event for object, if a recorder has been published.
@@ -166,6 +182,44 @@ func (dt *DiffTracker) recordEvent(object runtime.Object, eventType, reason, mes
 		return
 	}
 	recorder.Event(object, eventType, reason, message)
+}
+
+// maxPendingEgressEvents bounds the egress pod events queued until a recorder is published.
+const maxPendingEgressEvents = 1000
+
+// egressEvent is an egress pod event waiting for a recorder.
+type egressEvent struct {
+	pod                        *v1.Pod
+	eventType, reason, message string
+}
+
+// recordEgressEvent emits an egress Event on pod, or queues it until SetEventRecorder publishes a
+// recorder, so the events raised during initialization are reported. Must be called without dt.mu.
+func (dt *DiffTracker) recordEgressEvent(pod *v1.Pod, eventType, reason, message string) {
+	if dt == nil || pod == nil {
+		return
+	}
+	dt.mu.Lock()
+	recorder := dt.eventRecorder
+	if recorder == nil {
+		dt.queueEgressEventLocked(egressEvent{pod: pod, eventType: eventType, reason: reason, message: message})
+		dt.mu.Unlock()
+		return
+	}
+	dt.mu.Unlock()
+	recorder.Event(pod, eventType, reason, message)
+}
+
+// queueEgressEventLocked appends event to egress.pendingEvents, dropping the oldest event when the
+// queue is full. Must be called with dt.mu held.
+func (dt *DiffTracker) queueEgressEventLocked(event egressEvent) {
+	if len(dt.egress.pendingEvents) >= maxPendingEgressEvents {
+		dropped := dt.egress.pendingEvents[0]
+		dt.egress.pendingEvents = slices.Delete(dt.egress.pendingEvents, 0, 1)
+		dt.logger.V(4).Info("Dropped queued egress event because the queue is full",
+			"pod", dropped.pod.Namespace+"/"+dropped.pod.Name, "reason", dropped.reason, "limit", maxPendingEgressEvents)
+	}
+	dt.egress.pendingEvents = append(dt.egress.pendingEvents, event)
 }
 
 // lockWithLatency acquires dt.mu and returns a release function that unlocks it and,

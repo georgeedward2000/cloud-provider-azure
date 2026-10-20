@@ -256,6 +256,72 @@ const (
 	// PodLabelServiceEgressGateway is the label used on the pod
 	PodLabelServiceEgressGateway = "kubernetes.azure.com/service-egress-gateway"
 
+	// PodAnnotationServiceEgressGatewayPrefix is the prefix of the pod annotations that configure the NAT Gateway
+	// of the pod's egress identity. The NAT Gateway is changed only when every pod of the identity asks for the
+	// same configuration. Any other annotation with this prefix is invalid.
+	PodAnnotationServiceEgressGatewayPrefix = "kubernetes.azure.com/service-egress-gateway-"
+	// PodAnnotationServiceEgressGatewayIdleTimeout is the TCP idle timeout of the NAT Gateway in minutes.
+	PodAnnotationServiceEgressGatewayIdleTimeout = "kubernetes.azure.com/service-egress-gateway-idle-timeout"
+	// PodAnnotationServiceEgressGatewayPublicIPCount is the number of IPv4 Public IPs created for the NAT Gateway.
+	PodAnnotationServiceEgressGatewayPublicIPCount = "kubernetes.azure.com/service-egress-gateway-public-ip-count"
+	// PodAnnotationServiceEgressGatewayPublicIPCountIPv6 is the number of IPv6 Public IPs created for the NAT Gateway.
+	PodAnnotationServiceEgressGatewayPublicIPCountIPv6 = "kubernetes.azure.com/service-egress-gateway-public-ip-count-ipv6"
+	// PodAnnotationServiceEgressGatewayPublicIPPrefixLength is the length of the IPv4 Public IP prefix created for the NAT Gateway.
+	PodAnnotationServiceEgressGatewayPublicIPPrefixLength = "kubernetes.azure.com/service-egress-gateway-public-ip-prefix-length"
+	// PodAnnotationServiceEgressGatewayPublicIPPrefixLengthIPv6 is the length of the IPv6 Public IP prefix created for the NAT Gateway.
+	PodAnnotationServiceEgressGatewayPublicIPPrefixLengthIPv6 = "kubernetes.azure.com/service-egress-gateway-public-ip-prefix-length-ipv6"
+	// PodAnnotationServiceEgressGatewayPublicIPPrefixIDs is the comma-separated IDs of user IPv4 Public IP prefixes for the NAT Gateway.
+	PodAnnotationServiceEgressGatewayPublicIPPrefixIDs = "kubernetes.azure.com/service-egress-gateway-public-ip-prefix-ids"
+	// PodAnnotationServiceEgressGatewayPublicIPPrefixIDsIPv6 is the comma-separated IDs of user IPv6 Public IP prefixes for the NAT Gateway.
+	PodAnnotationServiceEgressGatewayPublicIPPrefixIDsIPv6 = "kubernetes.azure.com/service-egress-gateway-public-ip-prefix-ids-ipv6"
+	// PodAnnotationServiceEgressGatewayPublicIPIDs is the comma-separated IDs of user IPv4 Public IPs for the NAT Gateway.
+	PodAnnotationServiceEgressGatewayPublicIPIDs = "kubernetes.azure.com/service-egress-gateway-public-ip-ids"
+	// PodAnnotationServiceEgressGatewayPublicIPIDsIPv6 is the comma-separated IDs of user IPv6 Public IPs for the NAT Gateway.
+	PodAnnotationServiceEgressGatewayPublicIPIDsIPv6 = "kubernetes.azure.com/service-egress-gateway-public-ip-ids-ipv6"
+	// PodAnnotationServiceEgressGatewayTags is the comma-separated key=value tags added to the NAT Gateway and to the
+	// Public IPs and Public IP prefixes created for it.
+	PodAnnotationServiceEgressGatewayTags = "kubernetes.azure.com/service-egress-gateway-tags"
+
+	// ServiceEgressGatewayIdleTimeoutMinMinutes and ServiceEgressGatewayIdleTimeoutMaxMinutes bound the NAT Gateway idle timeout.
+	ServiceEgressGatewayIdleTimeoutMinMinutes = 4
+	ServiceEgressGatewayIdleTimeoutMaxMinutes = 120
+	// ServiceEgressGatewayIdleTimeoutDefaultMinutes is the NAT Gateway idle timeout when none is configured.
+	ServiceEgressGatewayIdleTimeoutDefaultMinutes = 4
+	// ServiceEgressGatewayPublicIPCountMin and ServiceEgressGatewayPublicIPCountMax bound the number of Public IPs
+	// created for a NAT Gateway per IP family.
+	ServiceEgressGatewayPublicIPCountMin = 0
+	ServiceEgressGatewayPublicIPCountMax = 16
+	// ServiceEgressGatewayMaxAddressesPerFamily is the number of public addresses a NAT Gateway accepts per IP family.
+	ServiceEgressGatewayMaxAddressesPerFamily = 16
+	// ServiceEgressGatewayPublicIPPrefixLengthMin and ServiceEgressGatewayPublicIPPrefixLengthMax bound the length of
+	// an IPv4 Public IP prefix created for a NAT Gateway.
+	ServiceEgressGatewayPublicIPPrefixLengthMin = 28
+	ServiceEgressGatewayPublicIPPrefixLengthMax = 31
+	// ServiceEgressGatewayPublicIPPrefixLengthIPv6Min and ServiceEgressGatewayPublicIPPrefixLengthIPv6Max bound the
+	// length of an IPv6 Public IP prefix created for a NAT Gateway.
+	ServiceEgressGatewayPublicIPPrefixLengthIPv6Min = 124
+	ServiceEgressGatewayPublicIPPrefixLengthIPv6Max = 127
+	// ServiceEgressGatewayMaxTags is the number of tags Azure accepts on a resource.
+	ServiceEgressGatewayMaxTags = 50
+	// ServiceEgressGatewayMaxTagKeyLength and ServiceEgressGatewayMaxTagValueLength are the numbers of characters
+	// Azure accepts in a tag name and in a tag value.
+	ServiceEgressGatewayMaxTagKeyLength   = 512
+	ServiceEgressGatewayMaxTagValueLength = 256
+	// ServiceEgressGatewayTagKeyInvalidCharacters are the characters Azure does not accept in a tag name.
+	ServiceEgressGatewayTagKeyInvalidCharacters = `<>%&\?/`
+
+	// ServiceEgressGatewayReasonInvalidConfig is the event reason for a pod whose egress configuration is invalid.
+	ServiceEgressGatewayReasonInvalidConfig = "InvalidEgressConfig"
+	// ServiceEgressGatewayReasonConfigConflict is the event reason for a pod whose egress configuration differs from
+	// the applied one while the pods of its egress identity disagree.
+	ServiceEgressGatewayReasonConfigConflict = "EgressConfigConflict"
+	// ServiceEgressGatewayReasonConfigApplied is the event reason for a pod whose egress identity had a changed
+	// configuration applied.
+	ServiceEgressGatewayReasonConfigApplied = "EgressConfigApplied"
+	// ServiceEgressGatewayReasonConfigRejected is the event reason for a pod whose egress configuration was rejected
+	// when it was applied.
+	ServiceEgressGatewayReasonConfigRejected = "EgressConfigRejected"
+
 	// ServiceAnnotationLoadBalancerInternal is the annotation used on the service
 	ServiceAnnotationLoadBalancerInternal = "service.beta.kubernetes.io/azure-load-balancer-internal"
 

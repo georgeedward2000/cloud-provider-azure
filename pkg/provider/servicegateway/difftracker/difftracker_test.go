@@ -17,6 +17,7 @@ limitations under the License.
 package difftracker
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,8 +26,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
@@ -307,4 +310,77 @@ func TestRecordEvent_IsRaceFreeAndNilSafe(t *testing.T) {
 
 	close(stop)
 	<-done
+}
+
+// TestDiffTrackerConstructorsInitializeEgressState pins that the egress maps exist from construction:
+// the engine writes to them under dt.mu, and a write to a nil map panics.
+func TestDiffTrackerConstructorsInitializeEgressState(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func(t *testing.T) *DiffTracker
+	}{
+		{"New", func(t *testing.T) *DiffTracker {
+			ctrl := gomock.NewController(t)
+			dt, err := New(log.Noop(), emptyK8sState(), emptyNRPState(), validTestConfig(),
+				mock_azclient.NewMockClientFactory(ctrl), fake.NewSimpleClientset())
+			assert.NoError(t, err)
+			return dt
+		}},
+		{"test constructor", func(*testing.T) *DiffTracker { return newTestDiffTracker() }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dt := tc.build(t)
+			assert.NotNil(t, dt.egress.votes)
+			assert.NotNil(t, dt.egress.mode)
+			assert.NotNil(t, dt.egress.rejected)
+			assert.NotNil(t, dt.egress.warned)
+			assert.Empty(t, dt.egress.pendingEvents)
+		})
+	}
+}
+
+// TestRecordEgressEvent_QueuesUntilARecorderIsPublished pins the egress event queue. Events raised
+// before SetEventRecorder (during initialization) are kept, bounded by dropping the oldest, and emitted
+// in order once the recorder is published; later events are emitted directly.
+func TestRecordEgressEvent_QueuesUntilARecorderIsPublished(t *testing.T) {
+	const reason = consts.ServiceEgressGatewayReasonConfigApplied
+
+	cases := []struct {
+		name      string
+		raised    int
+		firstKept int
+	}{
+		{"below the bound", 3, 0},
+		{"at the bound", maxPendingEgressEvents, 0},
+		{"over the bound drops the oldest", maxPendingEgressEvents + 2, 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dt := newTestDiffTracker()
+			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod"}}
+			for i := 0; i < tc.raised; i++ {
+				dt.recordEgressEvent(pod, v1.EventTypeNormal, reason, fmt.Sprintf("event-%d", i))
+			}
+			assert.Len(t, dt.egress.pendingEvents, tc.raised-tc.firstKept)
+
+			// Room for every raised event, so a queue that failed to drop its oldest fails here, not blocks.
+			recorder := record.NewFakeRecorder(tc.raised + 1)
+			dt.SetEventRecorder(recorder)
+
+			var want []string
+			for i := tc.firstKept; i < tc.raised; i++ {
+				want = append(want, fmt.Sprintf("%s %s event-%d", v1.EventTypeNormal, reason, i))
+			}
+			assert.Equal(t, want, drainEvents(recorder), "the queued events must be emitted once, oldest first")
+			assert.Empty(t, dt.egress.pendingEvents)
+
+			dt.recordEgressEvent(pod, v1.EventTypeWarning, consts.ServiceEgressGatewayReasonConfigRejected, "direct")
+			assert.Equal(t, []string{v1.EventTypeWarning + " " + consts.ServiceEgressGatewayReasonConfigRejected + " direct"},
+				drainEvents(recorder), "an event raised after the recorder is published must be emitted at once")
+			assert.Empty(t, dt.egress.pendingEvents)
+		})
+	}
 }

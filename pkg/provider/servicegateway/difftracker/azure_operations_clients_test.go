@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/natgatewayclient/mock_natgatewayclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipaddressclient/mock_publicipaddressclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipprefixclient/mock_publicipprefixclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient/mock_servicegatewayclient"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
@@ -52,8 +53,16 @@ func notFoundError() error {
 	return &azcore.ResponseError{StatusCode: http.StatusNotFound}
 }
 
-func TestCreateOrUpdatePIP_Mock(t *testing.T) {
-	pip := &armnetwork.PublicIPAddress{Name: ptr.To("svc-pip")}
+func TestCreateOrUpdatePIPWithResponse_Mock(t *testing.T) {
+	pip := &armnetwork.PublicIPAddress{
+		Name:     ptr.To("svc-pip"),
+		Location: ptr.To("eastus"),
+		SKU:      &armnetwork.PublicIPAddressSKU{Name: ptr.To(armnetwork.PublicIPAddressSKUNameStandardV2)},
+		Properties: &armnetwork.PublicIPAddressPropertiesFormat{
+			PublicIPAllocationMethod: ptr.To(armnetwork.IPAllocationMethodStatic),
+			PublicIPAddressVersion:   ptr.To(armnetwork.IPVersionIPv4),
+		},
+	}
 
 	t.Run("success", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
@@ -61,17 +70,22 @@ func TestCreateOrUpdatePIP_Mock(t *testing.T) {
 		mockFactory := mock_azclient.NewMockClientFactory(ctrl)
 		mockPIP := mock_publicipaddressclient.NewMockInterface(ctrl)
 		mockFactory.EXPECT().GetPublicIPAddressClient().Return(mockPIP).AnyTimes()
-		// Pin the builder -> client seam (see TestCreateOrUpdateLB_Mock).
+		// Pin the builder -> client seam (see TestCreateOrUpdateLB_Mock), and that the caller gets the Public IP as
+		// Azure returned it, with the address Azure allocated.
+		allocated := &armnetwork.PublicIPAddress{Name: ptr.To("svc-pip"),
+			Properties: &armnetwork.PublicIPAddressPropertiesFormat{IPAddress: ptr.To("20.1.2.3")}}
 		var sent armnetwork.PublicIPAddress
 		mockPIP.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "svc-pip", gomock.Any()).
 			DoAndReturn(func(_ context.Context, _, _ string, got armnetwork.PublicIPAddress) (*armnetwork.PublicIPAddress, error) {
 				sent = got
-				return pip, nil
+				return allocated, nil
 			})
 
 		dt := &DiffTracker{networkClientFactory: mockFactory, config: testConfig()}
-		assert.NoError(t, dt.createOrUpdatePIP(context.Background(), "rg", pip))
+		got, err := dt.createOrUpdatePIPWithResponse(context.Background(), "rg", pip)
+		assert.NoError(t, err)
 		assert.Equal(t, *pip, sent, "the Public IP sent to Azure must be the one the caller built")
+		assert.Equal(t, allocated, got, "the caller must get the Public IP as Azure returned it")
 	})
 
 	t.Run("error", func(t *testing.T) {
@@ -80,10 +94,13 @@ func TestCreateOrUpdatePIP_Mock(t *testing.T) {
 		mockFactory := mock_azclient.NewMockClientFactory(ctrl)
 		mockPIP := mock_publicipaddressclient.NewMockInterface(ctrl)
 		mockFactory.EXPECT().GetPublicIPAddressClient().Return(mockPIP).AnyTimes()
-		mockPIP.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "svc-pip", gomock.Any()).Return(nil, errors.New("boom"))
+		boom := errors.New("boom")
+		mockPIP.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "svc-pip", gomock.Any()).Return(nil, boom)
 
 		dt := &DiffTracker{networkClientFactory: mockFactory, config: testConfig()}
-		assert.Error(t, dt.createOrUpdatePIP(context.Background(), "rg", pip))
+		got, err := dt.createOrUpdatePIPWithResponse(context.Background(), "rg", pip)
+		assert.ErrorIs(t, err, boom, "Azure's error must be returned")
+		assert.Nil(t, got, "no Public IP is returned with an error")
 	})
 }
 
@@ -239,37 +256,6 @@ func TestCreateOrUpdateNatGateway_Mock(t *testing.T) {
 	t.Run("empty name", func(t *testing.T) {
 		dt := &DiffTracker{config: testConfig()}
 		assert.Error(t, dt.createOrUpdateNatGateway(context.Background(), "rg", armnetwork.NatGateway{}))
-	})
-}
-
-func TestDeleteNatGateway_Mock(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
-		mockFactory := mock_azclient.NewMockClientFactory(ctrl)
-		mockNAT := mock_natgatewayclient.NewMockInterface(ctrl)
-		mockFactory.EXPECT().GetNatGatewayClient().Return(mockNAT).AnyTimes()
-		mockNAT.EXPECT().Delete(gomock.Any(), "rg", "svc").Return(nil)
-
-		dt := &DiffTracker{networkClientFactory: mockFactory, config: testConfig()}
-		assert.NoError(t, dt.deleteNatGateway(context.Background(), "rg", "svc"))
-	})
-
-	t.Run("error", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
-		mockFactory := mock_azclient.NewMockClientFactory(ctrl)
-		mockNAT := mock_natgatewayclient.NewMockInterface(ctrl)
-		mockFactory.EXPECT().GetNatGatewayClient().Return(mockNAT).AnyTimes()
-		mockNAT.EXPECT().Delete(gomock.Any(), "rg", "svc").Return(errors.New("boom"))
-
-		dt := &DiffTracker{networkClientFactory: mockFactory, config: testConfig()}
-		assert.Error(t, dt.deleteNatGateway(context.Background(), "rg", "svc"))
-	})
-
-	t.Run("empty name", func(t *testing.T) {
-		dt := &DiffTracker{config: testConfig()}
-		assert.Error(t, dt.deleteNatGateway(context.Background(), "rg", ""))
 	})
 }
 
@@ -491,7 +477,7 @@ func TestUpdateNRPSGWAddressLocations_Mock(t *testing.T) {
 	})
 }
 
-func TestDisassociateNatGatewayFromServiceGateway_Mock(t *testing.T) {
+func TestUnlinkNatGateway_Mock(t *testing.T) {
 	// Simplest reconcile path: no matching SGW service to clear, and the NAT
 	// gateway is already gone (404) -> method returns nil.
 	ctrl := gomock.NewController(t)
@@ -506,7 +492,7 @@ func TestDisassociateNatGatewayFromServiceGateway_Mock(t *testing.T) {
 	mockNAT.EXPECT().Get(gomock.Any(), "rg", "svc", gomock.Any()).Return(nil, notFoundError())
 
 	dt := &DiffTracker{networkClientFactory: mockFactory, config: testConfig()}
-	assert.NoError(t, dt.disassociateNatGatewayFromServiceGateway(context.Background(), "sgw", "svc"))
+	assert.NoError(t, dt.unlinkNatGateway(context.Background(), "sgw", "svc", "rg", "svc"))
 }
 
 func TestConvertServicesUpdateActionToARM(t *testing.T) {
@@ -630,6 +616,9 @@ func TestInitializeFromCluster_ReusesFetchedPIPListForOrphanCleanup(t *testing.T
 	mockSGW.EXPECT().UpdateServices(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	mockLB.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
 	mockNAT.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
+	mockPrefix := mock_publicipprefixclient.NewMockInterface(ctrl)
+	mockFactory.EXPECT().GetPublicIPPrefixClient().Return(mockPrefix).AnyTimes()
+	mockPrefix.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
 
 	// A single detached PIP (no IPConfiguration) that no Kubernetes object or NRP entry claims.
 	// List returns a NON-NIL slice: init must reuse it and never call List again, which is what
@@ -676,7 +665,7 @@ func TestARMPrimitivesDoNotHoldStateLock(t *testing.T) {
 
 	armDone := make(chan struct{})
 	go func() {
-		_ = dt.createOrUpdatePIP(context.Background(), "rg", &armnetwork.PublicIPAddress{Name: ptr.To("svc-pip")})
+		_, _ = dt.createOrUpdatePIPWithResponse(context.Background(), "rg", &armnetwork.PublicIPAddress{Name: ptr.To("svc-pip")})
 		close(armDone)
 	}()
 
@@ -734,6 +723,9 @@ func TestBuildNRPState_RecordsUnmanagedNATGateways(t *testing.T) {
 	mockLB.EXPECT().List(gomock.Any(), "rg").Return(nil, nil)
 	mockNAT.EXPECT().List(gomock.Any(), "rg").Return([]*armnetwork.NatGateway{{Name: ptr.To("byo-nat"), Properties: &armnetwork.NatGatewayPropertiesFormat{}}}, nil)
 	mockPIP.EXPECT().List(gomock.Any(), "rg").Return(nil, nil)
+	mockPrefix := mock_publicipprefixclient.NewMockInterface(ctrl)
+	mockFactory.EXPECT().GetPublicIPPrefixClient().Return(mockPrefix).AnyTimes()
+	mockPrefix.EXPECT().List(gomock.Any(), "rg").Return(nil, nil)
 
 	nrp, _, _, _, _, err := buildNRPState(context.Background(), byoNATConfig(), mockFactory)
 	if assert.NoError(t, err) && assert.NotNil(t, nrp.UnmanagedNATGateways) {

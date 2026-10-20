@@ -117,3 +117,52 @@ func withPodIPs(pod *v1.Pod, ips ...string) *v1.Pod {
 	}
 	return pod
 }
+
+// AddEgressPod is addEgressPod with vote, for tests that build votes rather than pods: vote is registered as parsed
+// for the identity's IP families (its ParsedForIPv6 is overwritten), so it must be one parsed for them. Production
+// parses the pod's annotations for them under dt.mu instead (egressVoteParser).
+func (dt *DiffTracker) AddEgressPod(identity string, pod egressPodRef, vote egressVote, accepted []egressAddress) {
+	dt.addEgressPod(identity, pod, accepted, func(pc egressParseContext) egressVote {
+		vote.ParsedForIPv6 = pc.WantsIPv6
+		return vote
+	})
+}
+
+// SetEgressVote is setEgressVote with vote, registered as parsed for the identity's IP families as by AddEgressPod.
+func (dt *DiffTracker) SetEgressVote(identity string, pod egressPodRef, vote egressVote) {
+	dt.setEgressVote(identity, pod, func(pc egressParseContext) egressVote {
+		vote.ParsedForIPv6 = pc.WantsIPv6
+		return vote
+	})
+}
+
+// AddPod and AddPodWithUID add one address of an egress pod to its identity without a vote, for tests of the address
+// and lifecycle state machine that do not exercise votes: like addEgressPod, they reject invalid parameters and an
+// identity that collides with an inbound service, then call addPodAddressLocked. Production adds members only through
+// addEgressPod, so every member votes.
+func (dt *DiffTracker) AddPod(serviceUID, podKey, location, address string) {
+	dt.addPod(serviceUID, podKey, "", location, address)
+}
+
+// AddPodWithUID is AddPod for a pod with UID podUID.
+func (dt *DiffTracker) AddPodWithUID(serviceUID, podKey, podUID, location, address string) {
+	dt.addPod(serviceUID, podKey, podUID, location, address)
+}
+
+func (dt *DiffTracker) addPod(serviceUID, podKey, podUID, location, address string) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	if serviceUID == "" || location == "" || address == "" {
+		dt.logger.V(4).Info("Could not add pod with invalid parameters", "service", serviceUID, "location", location, "address", address)
+		return
+	}
+
+	if dt.outboundIdentityConflictsWithInboundLocked(serviceUID) {
+		dt.logger.V(2).Info("Rejected egress pod whose identity collides with an inbound service",
+			"service", serviceUID, "pod", podKey)
+		return
+	}
+
+	dt.addPodAddressLocked(serviceUID, podKey, podUID, location, address)
+}

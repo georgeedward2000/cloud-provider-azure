@@ -31,6 +31,7 @@ pkg/
     azure_*_repo.go               Data access and repository pattern
     azure_fakes.go                Manual test fakes
     azure_mock_*.go               Generated mocks
+    servicegateway/               ServiceGateway engine
   azclient/                     Azure SDK client wrappers; do not call Azure SDK directly
   consts/                       Shared constants
   cache/                        Caching layer for Azure API responses

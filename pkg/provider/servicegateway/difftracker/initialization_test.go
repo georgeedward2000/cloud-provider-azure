@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +50,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/natgatewayclient/mock_natgatewayclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipaddressclient/mock_publicipaddressclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/publicipprefixclient/mock_publicipprefixclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient/mock_servicegatewayclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
@@ -173,26 +176,6 @@ func TestBuildInboundServiceResources_LongServiceUID(t *testing.T) {
 	assert.Equal(t, longUID, *lb.Name)
 	assert.Equal(t, longUID+"-pip", *pip.Name)
 	assert.Equal(t, longUID, *lb.Properties.BackendAddressPools[0].Name)
-}
-
-func TestBuildOutboundServiceResources_NilConfig(t *testing.T) {
-	// OutboundConfig is currently not used but test nil handling
-	dtConfig := Config{
-		SubscriptionID:             "test-sub",
-		ResourceGroup:              "test-rg",
-		Location:                   "westus",
-		ServiceGatewayResourceName: "test-sgw",
-	}
-
-	pips, natGw, servicesDTO := buildOutboundServiceResources("egress-123", nil, dtConfig)
-	pip := pips[0]
-
-	// Should create resources even with nil config
-	assert.NotNil(t, pip)
-	assert.NotNil(t, natGw)
-	assert.NotNil(t, servicesDTO)
-	assert.Equal(t, "egress-123-pip", *pip.Name)
-	assert.Equal(t, "egress-123", *natGw.Name)
 }
 
 func TestBuildInboundServiceResources_MultipleConfigs(t *testing.T) {
@@ -1583,7 +1566,13 @@ func TestReconcileServices_OutboundAdditionsCarryClusterIPFamilies(t *testing.T)
 		if op.Config.OutboundConfig != nil {
 			families = op.Config.OutboundConfig.IPFamilies
 		}
-		pips, nat, _ := buildOutboundServiceResources(uid, op.Config.OutboundConfig, dt.config)
+		// The NAT Gateway is created from the configuration the creation is dispatched with.
+		dispatchWithoutRunning(t, dt)
+		if op.InFlightConfig == nil {
+			t.Fatalf("the creation was not dispatched")
+		}
+		config := op.InFlightConfig.OutboundConfig
+		pips, nat := egressCreationRequests(t, uid, outboundEgress(config), outboundWantsIPv6(config), dt.config)
 		return families, len(nat.Properties.PublicIPAddressesV6) > 0, len(pips)
 	}
 
@@ -1667,11 +1656,13 @@ func TestInitializeFromCluster_SeedsClusterAddressFamiliesFromNodes(t *testing.T
 		mockLB := mock_loadbalancerclient.NewMockInterface(ctrl)
 		mockNAT := mock_natgatewayclient.NewMockInterface(ctrl)
 		mockPIP := mock_publicipaddressclient.NewMockInterface(ctrl)
+		mockPrefix := mock_publicipprefixclient.NewMockInterface(ctrl)
 
 		mockFactory.EXPECT().GetServiceGatewayClient().Return(mockSGW).AnyTimes()
 		mockFactory.EXPECT().GetLoadBalancerClient().Return(mockLB).AnyTimes()
 		mockFactory.EXPECT().GetNatGatewayClient().Return(mockNAT).AnyTimes()
 		mockFactory.EXPECT().GetPublicIPAddressClient().Return(mockPIP).AnyTimes()
+		mockFactory.EXPECT().GetPublicIPPrefixClient().Return(mockPrefix).AnyTimes()
 
 		mockSGW.EXPECT().GetServices(gomock.Any(), "rg", "sgw").Return(nil, nil).AnyTimes()
 		mockSGW.EXPECT().GetAddressLocations(gomock.Any(), "rg", "sgw").Return(nil, nil).AnyTimes()
@@ -1680,6 +1671,7 @@ func TestInitializeFromCluster_SeedsClusterAddressFamiliesFromNodes(t *testing.T
 		mockLB.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
 		mockNAT.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
 		mockPIP.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
+		mockPrefix.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
 
 		objects := make([]runtime.Object, 0, len(nodes))
 		for _, node := range nodes {
@@ -1787,9 +1779,10 @@ func TestFetchAzureNATGateways_MarksNATGatewaysNotCreatedByThisController(t *tes
 	}, nil)
 
 	nrp := &NRPState{}
-	names, err := fetchAzureNATGateways(context.Background(), cfg, mockFactory, nrp)
+	names, listed, err := fetchAzureNATGateways(context.Background(), cfg, mockFactory, nrp)
 	assert.NoError(t, err)
 	assert.Equal(t, 10, names.Len(), "every NAT Gateway still counts as existing")
+	assert.Len(t, listed, 10, "every NAT Gateway is kept as listed for the egress identities")
 	if assert.NotNil(t, nrp.UnmanagedNATGateways) {
 		assert.ElementsMatch(t, []string{"no-addresses", "other-identity", "foreign-address", "other-rg-address", "with-prefix", "with-prefix-v6", "foreign-v6-address"},
 			nrp.UnmanagedNATGateways.UnsortedList())
@@ -1918,4 +1911,295 @@ func TestRecordLinkedBYONATGateways(t *testing.T) {
 	netNRP.NATGateways = utilsets.NewString("linked-net")
 	recordLinkedBYONATGateways(context.Background(), netCfg, m.factory, &netNRP)
 	assert.Equal(t, "/subscriptions/netsub/resourceGroups/"+byoNATGatewayRG+"/providers/Microsoft.Network/natGateways/linked-net", netNRP.OutboundNATGatewayIDs["linked-net"])
+}
+
+// TestStartInitialization_WiresEgressOutcomeToTheEngine pins that the running ServiceUpdater reports
+// outbound outcomes to the engine's completion state machine instead of dropping them.
+func TestStartInitialization_WiresEgressOutcomeToTheEngine(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	dt := newTestDiffTracker()
+	dt.networkClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+	assert.NoError(t, startInitialization(context.Background(), dt))
+	// Stop the updaters so the completion below triggers no Azure call.
+	dt.serviceUpdater.Stop()
+	dt.locationsUpdater.Stop()
+
+	const uid = "egress-wired"
+	cfg := NewOutboundServiceConfig(uid, &OutboundConfig{})
+	inflight := cfg
+	dt.mu.Lock()
+	dt.pendingServiceOps[uid] = &ServiceOperationState{ServiceUID: uid, Config: cfg, InFlightConfig: &inflight, State: StateCreationInProgress}
+	dt.mu.Unlock()
+
+	dt.serviceUpdater.completeOutbound(uid, true, nil, &egressOutcome{Mode: egressModeManaged})
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	assert.Equal(t, StateCreated, dt.pendingServiceOps[uid].State, "the outcome must reach the engine's completion")
+	assert.Equal(t, egressModeManaged, dt.egress.mode[uid], "the engine records the mode the outcome reports")
+}
+
+// TestSeedEgressVotes pins startup admission (4.6 step 2): the pods processK8sEgresses admits as members of their
+// identities, with the membership predicate of the pod informer, vote with their annotations, parsed for the
+// cluster's families, before anything is planned: nothing is evaluated, triggered or created and no event is raised.
+// An identity that collides with an inbound service, known from the cluster or from NRP, has no members: its pods
+// neither vote nor count, and it is not desired. The members, and only they, are kept as listed for the pod informer
+// to reconcile.
+func TestSeedEgressVotes(t *testing.T) {
+	const colliding = "11111111-2222-3333-4444-555555555555"
+	now := metav1.Now()
+	ipv4Default := defaultEgressConfig(egressParseContext{})
+	dualStackDefault := defaultEgressConfig(egressParseContext{WantsIPv6: true})
+	explicitDefault := map[string]string{consts.PodAnnotationServiceEgressGatewayIdleTimeout: "4"}
+	address := func(name string, ips ...string) []string {
+		if len(ips) == 0 {
+			return []string{memberIP(memberPod(name)) + "@" + memberNode}
+		}
+		return ips
+	}
+	collidingService := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default", UID: types.UID(colliding)},
+		Spec:       v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+	}
+
+	cases := []struct {
+		name          string
+		services      []*v1.Service
+		nrpLBs        []string
+		nodeIPs       map[string][]string
+		pods          []*v1.Pod
+		wantVotes     map[string]egressVoteView
+		wantAddresses map[string][]string // identity -> addresses
+		wantEgresses  []string
+		wantPodCounts map[string]int // identity -> pod count; identities not listed have none
+	}{
+		{
+			name:    "members vote with their annotations; pods that are no members neither vote nor count",
+			nodeIPs: map[string][]string{"node": {memberNode}},
+			pods: []*v1.Pod{
+				// A full pod: startup keeps only what the reconciliation reads of it.
+				podWith(membershipPod("p1", memberIdentity, annotationsA()), func(p *v1.Pod) {
+					p.Labels["app"] = "web"
+					p.Annotations = maps.Clone(p.Annotations)
+					p.Annotations["team"] = "payments"
+					p.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kubectl", Operation: metav1.ManagedFieldsOperationApply}}
+					p.Spec = v1.PodSpec{NodeName: "node", Containers: []v1.Container{{Name: "app", Image: "app:1"}}}
+				}),
+				membershipPod("p2", memberIdentity, invalidAnnotations()),
+				membershipPod("p3", memberIdentity, explicitDefault),
+				podWith(membershipPod("p4", memberIdentity, annotationsA()), func(p *v1.Pod) { p.DeletionTimestamp = &now }),
+				podWith(membershipPod("p5", memberIdentity, annotationsA()), func(p *v1.Pod) { p.Status.Phase = v1.PodFailed }),
+				podWith(membershipPod("p6", memberIdentity, annotationsA(), "fd00::6"), onIPv4OnlyNode),
+			},
+			wantVotes: map[string]egressVoteView{
+				"ns/p1": expectedVote("p1", memberIdentity, &consensusA, true),
+				"ns/p2": expectedVote("p2", memberIdentity, nil, true),
+				"ns/p3": expectedVote("p3", memberIdentity, &ipv4Default, true),
+			},
+			wantAddresses: map[string][]string{memberIdentity: append(append(address("p1"), address("p2")...), address("p3")...)},
+			wantEgresses:  []string{memberIdentity},
+			wantPodCounts: map[string]int{memberIdentity: 3},
+		},
+		{
+			name:     "an identity colliding with a cluster Service has no members",
+			services: []*v1.Service{collidingService},
+			nodeIPs:  map[string][]string{"node": {memberNode}},
+			pods: []*v1.Pod{
+				membershipPod("p1", colliding, annotationsA()),
+				membershipPod("p2", memberIdentity, annotationsA()),
+			},
+			wantVotes:     map[string]egressVoteView{"ns/p2": expectedVote("p2", memberIdentity, &consensusA, true)},
+			wantAddresses: map[string][]string{colliding: nil, memberIdentity: address("p2")},
+			wantEgresses:  []string{memberIdentity},
+			wantPodCounts: map[string]int{memberIdentity: 1},
+		},
+		{
+			name:          "an identity colliding with a load balancer in NRP has no members",
+			nrpLBs:        []string{colliding},
+			nodeIPs:       map[string][]string{"node": {memberNode}},
+			pods:          []*v1.Pod{membershipPod("p1", colliding, nil, "10.244.1.1", "fd00::1")},
+			wantAddresses: map[string][]string{colliding: nil},
+		},
+		{
+			name:    "a dual-stack cluster: the votes are parsed for both families",
+			nodeIPs: map[string][]string{"node": {memberNode, membershipNodeV6}},
+			pods:    []*v1.Pod{membershipPod("p1", memberIdentity, nil, "10.244.1.1", "fd00::1")},
+			wantVotes: map[string]egressVoteView{
+				"ns/p1": expectedVote("p1", memberIdentity, &dualStackDefault, false),
+			},
+			wantAddresses: map[string][]string{memberIdentity: {"10.244.1.1@" + memberNode, "fd00::1@" + membershipNodeV6}},
+			wantEgresses:  []string{memberIdentity},
+			wantPodCounts: map[string]int{memberIdentity: 2},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			objects := make([]runtime.Object, 0, len(tc.services)+len(tc.pods))
+			for _, service := range tc.services {
+				objects = append(objects, service)
+			}
+			for _, pod := range tc.pods {
+				objects = append(objects, pod)
+			}
+			kube := fake.NewSimpleClientset(objects...)
+			k8s := newK8sStateForSeeders()
+			_, _, err := processK8sServices(context.Background(), kube, &k8s)
+			assert.NoError(t, err)
+			pods, err := processK8sEgresses(context.Background(), kube, &k8s)
+			assert.NoError(t, err)
+			dt := seededDT(t, gomock.NewController(t), kube, k8s,
+				NRPState{LoadBalancers: utilsets.NewString(tc.nrpLBs...), NATGateways: utilsets.NewString(), Locations: map[string]NRPLocation{}})
+			dt.SetEventRecorder(nil)
+			dt.seedClusterAddressFamilies(tc.nodeIPs)
+
+			dt.seedEgressVotes(pods)
+
+			votes := map[string]egressVoteView{}
+			for _, pod := range tc.pods {
+				if vote, ok := registeredVoteOf(dt, pod.Namespace+"/"+pod.Name); ok {
+					votes[pod.Namespace+"/"+pod.Name] = vote
+				}
+			}
+			assert.Equal(t, orEmpty(tc.wantVotes), votes, "votes")
+			admitted, voters := map[string]types.UID{}, map[string]types.UID{}
+			for podKey, pod := range dt.egress.admitted {
+				admitted[podKey] = pod.UID
+				// Only what the reconciliation reads is kept (admittedEgressPod), detached from the listing.
+				for i := range pods.Items {
+					assert.NotSame(t, &pods.Items[i], pod, "%s: an admitted pod does not hold on to the listing", podKey)
+					if pods.Items[i].Namespace+"/"+pods.Items[i].Name == podKey {
+						assert.Equal(t, admittedEgressPod(&pods.Items[i]), pod, "%s: the admitted pod is its trimmed copy", podKey)
+					}
+				}
+			}
+			for podKey, vote := range votes {
+				voters[podKey] = vote.PodUID
+			}
+			assert.Equal(t, voters, admitted, "the pods kept as listed for the pod informer are the members that vote")
+			for identity, want := range tc.wantAddresses {
+				got := egressAddressesOf(dt, identity)
+				slices.Sort(want)
+				assert.Equal(t, want, got, "addresses of %s", identity)
+			}
+			assert.ElementsMatch(t, tc.wantEgresses, dt.K8sResources.Egresses.UnsortedList(), "desired egress identities")
+			podCounts := map[string]int{}
+			dt.outboundIdentityPodRefCount.Range(func(key, value any) bool {
+				podCounts[key.(string)] = value.(int)
+				return true
+			})
+			assert.Equal(t, orEmpty(tc.wantPodCounts), podCounts, "pod counts")
+
+			assert.Empty(t, dt.pendingServiceOps, "seeding plans nothing")
+			assert.Empty(t, dt.serviceUpdaterTrigger, "seeding triggers nothing")
+			assert.Empty(t, dt.locationsUpdaterTrigger, "seeding triggers nothing")
+			assert.Empty(t, takeEgressEvents(dt), "the unchanged baseline of a restart raises no event")
+			assertEgressInvariants(t, dt)
+		})
+	}
+
+	t.Run("without a pod list nothing is seeded", func(t *testing.T) {
+		dt := newTestDiffTracker()
+		assert.NotPanics(t, func() { dt.seedEgressVotes(nil) })
+		assert.Empty(t, dt.egress.votes.byPod)
+	})
+}
+
+// TestInitializeFromCluster_SeedsEgressVotes pins the startup wiring: the votes of the egress pods are seeded while
+// the tracker is initialized, before anything is planned, and raise no event.
+func TestInitializeFromCluster_SeedsEgressVotes(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockFactory := mock_azclient.NewMockClientFactory(ctrl)
+	mockSGW := mock_servicegatewayclient.NewMockInterface(ctrl)
+	mockLB := mock_loadbalancerclient.NewMockInterface(ctrl)
+	mockNAT := mock_natgatewayclient.NewMockInterface(ctrl)
+	mockPIP := mock_publicipaddressclient.NewMockInterface(ctrl)
+	mockFactory.EXPECT().GetServiceGatewayClient().Return(mockSGW).AnyTimes()
+	mockFactory.EXPECT().GetLoadBalancerClient().Return(mockLB).AnyTimes()
+	mockFactory.EXPECT().GetNatGatewayClient().Return(mockNAT).AnyTimes()
+	mockFactory.EXPECT().GetPublicIPAddressClient().Return(mockPIP).AnyTimes()
+	mockPrefix := mock_publicipprefixclient.NewMockInterface(ctrl)
+	mockFactory.EXPECT().GetPublicIPPrefixClient().Return(mockPrefix).AnyTimes()
+	mockPrefix.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
+
+	// The identity's NAT Gateway is registered already, so startup creates nothing.
+	mockSGW.EXPECT().GetServices(gomock.Any(), "rg", "sgw").Return([]*armnetwork.ServiceGatewayService{{
+		Name: ptr.To(memberIdentity),
+		Properties: &armnetwork.ServiceGatewayServicePropertiesFormat{
+			ServiceType:        ptr.To(armnetwork.ServiceTypeOutbound),
+			PublicNatGatewayID: ptr.To("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/natGateways/" + memberIdentity),
+		},
+	}}, nil).AnyTimes()
+	mockSGW.EXPECT().GetAddressLocations(gomock.Any(), "rg", "sgw").Return(nil, nil).AnyTimes()
+	mockSGW.EXPECT().UpdateAddressLocations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockLB.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
+	mockNAT.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
+	mockPIP.EXPECT().List(gomock.Any(), "rg").Return(nil, nil).AnyTimes()
+
+	node := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Status: v1.NodeStatus{Addresses: []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: memberNode}}}}
+	pod := podWith(membershipPod("p1", memberIdentity, annotationsA()), func(p *v1.Pod) {
+		p.Spec.NodeName = node.Name
+		p.Status.HostIPs = nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dt, err := InitializeFromCluster(ctx, testConfig(), mockFactory, fake.NewSimpleClientset(node, pod))
+	if !assert.NoError(t, err) || dt == nil {
+		t.FailNow()
+	}
+	defer cleanupOnError(dt)
+
+	vote, ok := registeredVoteOf(dt, "ns/p1")
+	assert.True(t, ok, "the pod's vote is seeded at startup")
+	assert.Equal(t, expectedVote("p1", memberIdentity, &consensusA, true), vote)
+	assert.Equal(t, []string{memberIP(memberPod("p1")) + "@" + memberNode}, egressAddressesOf(dt, memberIdentity))
+	assert.Empty(t, takeEgressEvents(dt), "the unchanged baseline of a restart raises no event")
+	assertEgressInvariants(t, dt)
+}
+
+// TestAdmittedEgressPod pins what startup keeps of a member it admits for the pod informer: its identity, UID,
+// creation and deletion times, egress label and annotations, finalizers and the status that decides its membership and
+// addresses (both families), and nothing else of the listed pod.
+func TestAdmittedEgressPod(t *testing.T) {
+	created := metav1.NewTime(time.Date(2026, 10, 15, 8, 0, 0, 0, time.UTC))
+	listed := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns", Name: "p1", UID: "p1-uid", CreationTimestamp: created, ResourceVersion: "42", Generation: 3,
+			Labels:          map[string]string{consts.PodLabelServiceEgressGateway: "Egress-A", "app": "web"},
+			Annotations:     map[string]string{consts.PodAnnotationServiceEgressGatewayIdleTimeout: "10", "team": "payments"},
+			Finalizers:      []string{ServiceGatewayPodCleanupFinalizer, "other"},
+			ManagedFields:   []metav1.ManagedFieldsEntry{{Manager: "kubectl"}},
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "rs"}},
+		},
+		Spec: v1.PodSpec{NodeName: "node", Containers: []v1.Container{{Name: "app", Image: "app:1"}}},
+		Status: v1.PodStatus{
+			Phase: v1.PodRunning, HostIP: "10.224.0.4", HostIPs: []v1.HostIP{{IP: "10.224.0.4"}, {IP: "fd00::a"}},
+			PodIP: "10.244.1.1", PodIPs: []v1.PodIP{{IP: "10.244.1.1"}, {IP: "fd00::1"}},
+			Conditions: []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}},
+		},
+	}
+
+	got := admittedEgressPod(listed)
+
+	assert.Equal(t, &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns", Name: "p1", UID: "p1-uid", CreationTimestamp: created,
+			Labels:      map[string]string{consts.PodLabelServiceEgressGateway: "Egress-A"},
+			Annotations: map[string]string{consts.PodAnnotationServiceEgressGatewayIdleTimeout: "10"},
+			Finalizers:  []string{ServiceGatewayPodCleanupFinalizer, "other"},
+		},
+		Status: v1.PodStatus{
+			Phase: v1.PodRunning, HostIP: "10.224.0.4", HostIPs: []v1.HostIP{{IP: "10.224.0.4"}, {IP: "fd00::a"}},
+			PodIP: "10.244.1.1", PodIPs: []v1.PodIP{{IP: "10.244.1.1"}, {IP: "fd00::1"}},
+		},
+	}, got)
+	got.Status.PodIPs[0].IP = "changed"
+	got.Status.HostIPs[0].IP = "changed"
+	got.Finalizers[0] = "changed"
+	assert.Equal(t, "10.244.1.1", listed.Status.PodIPs[0].IP, "the copy shares no slice with the listed pod")
+	assert.Equal(t, "10.224.0.4", listed.Status.HostIPs[0].IP, "the copy shares no slice with the listed pod")
+	assert.Equal(t, ServiceGatewayPodCleanupFinalizer, listed.Finalizers[0], "the copy shares no slice with the listed pod")
 }

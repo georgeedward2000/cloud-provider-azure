@@ -22,6 +22,7 @@ import (
 	"net/netip"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,11 +143,13 @@ func InitializeFromCluster(
 	}
 
 	// Build NRP state from Azure (includes pipNameToIP for External IP recovery)
-	// We keep currentLoadBalancersInNRP and currentNATGatewaysInNRP to identify and clean up orphaned Azure resources
-	nrp, currentLoadBalancersInNRP, currentNATGatewaysInNRP, azurePIPs, pipNameToIP, err := buildNRPState(ctx, config, networkClientFactory)
+	// We keep currentLoadBalancersInNRP and currentNATGatewaysInNRP to identify and clean up orphaned Azure resources,
+	// and the listing of the NAT Gateways, Public IPs and Public IP prefixes to adopt the egress identities found in Azure
+	nrp, currentLoadBalancersInNRP, currentNATGatewaysInNRP, egressResources, pipNameToIP, err := buildNRPState(ctx, config, networkClientFactory)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build NRP state: %w", err)
 	}
+	azurePIPs := egressResources.publicIPs
 
 	// Existence set of every Azure PIP name, independent of whether its address has been allocated
 	// yet. pipNameToIP only contains PIPs with an allocated IPAddress, so it must NOT be used to
@@ -161,6 +164,7 @@ func InitializeFromCluster(
 	}
 	diffTracker.initializeEndpointSlicesCache(endpointSliceList)
 	diffTracker.seedClusterAddressFamilies(nodeNameToIPs)
+	diffTracker.seedEgressVotes(egressPodList)
 
 	// FIX FOR ORPHANED SERVICES: We intentionally do NOT enhance NRP state with orphaned Azure resources.
 	// Orphaned resources are LBs/NATs that exist in Azure but are NOT registered in ServiceGateway.
@@ -192,6 +196,19 @@ func InitializeFromCluster(
 	if err := startInitialization(ctx, diffTracker); err != nil {
 		return nil, err
 	}
+	// Planning latch: initialization cannot complete before all the startup work below is enqueued, however fast the
+	// work enqueued first completes. The deferred release covers an early return.
+	planning := true
+	defer func() {
+		if planning {
+			diffTracker.endInitializationPlanning()
+		}
+	}()
+
+	// Adopt the egress identities registered with the Service Gateway: their mode, the IP families their NAT Gateway
+	// serves, the configuration it satisfies and whether it must be observed, from the listing above (4.6 step 3). Their
+	// runs are started through the tracked trigger; egress configuration runs never hold initialization open.
+	diffTracker.adoptStartupEgressIdentities(egressResources)
 
 	// Reconcile services (create/delete LBs and NAT Gateways in Azure)
 	diffTracker.reconcileServices(syncOperations, serviceUIDToService)
@@ -231,6 +248,11 @@ func InitializeFromCluster(
 		diffTracker.triggerLocationsUpdater()
 	}
 
+	// Every piece of startup work is enqueued: release the planning latch, which also checks completion, so a
+	// startup that enqueued nothing (or whose work already completed) completes now.
+	planning = false
+	diffTracker.endInitializationPlanning()
+
 	// Wait for all async operations to complete (service creations/deletions + location syncs + orphan deletions)
 	// WaitForInitialSync monitors:
 	//   - pendingServiceOps (ServiceUpdater work - includes orphan deletions)
@@ -250,18 +272,23 @@ func InitializeFromCluster(
 	// before updateServiceLoadBalancerStatus could patch the K8s Service with the IP.
 	recoverServiceExternalIPs(ctx, diffTracker, serviceUIDToService, pipNameToIP)
 
-	// Cleanup any remaining orphaned PIPs (PIPs without an associated LB/NAT).
+	// Cleanup any remaining orphaned PIPs (PIPs without an associated LB/NAT), and the managed Public IP prefixes
+	// of egress identities likewise.
 	// This catches PIPs where the LB deletion succeeded but PIP deletion failed. Reuse the PIP list
 	// already fetched by buildNRPState rather than re-listing: a transient failure on a second List
 	// is swallowed (cleanupOrphanedPIPs is non-fatal) and would leak orphan PIPs that were already
 	// visible in the fetched list.
-	cleanupOrphanedPIPs(ctx, diffTracker, azurePIPs)
+	cleanupOrphanedPIPs(ctx, diffTracker, azurePIPs, egressResources.prefixes)
 
 	// Mark initialization complete
 	diffTracker.InitialSyncDone = true
 	isOperationSucceeded = true
 	recordInitializationDuration(initStartTime)
 	logger.V(2).Info("Completed DiffTracker initialization")
+
+	// Writes of the previous process that land after the listing above are caught by the confirmation pass, run
+	// once the egress settle delay has passed (4.6 step 3a). It never holds initialization open.
+	go diffTracker.runEgressConfirmationPass(ctx)
 
 	return diffTracker, nil
 }
@@ -387,8 +414,8 @@ func SelectSameFamilyNodeIP(nodeIPs []string, wantIPv6 bool) (string, bool) {
 //
 // The Node lister is published after InitializeFromCluster returns, so it is nil for the whole of
 // initialization. Without this seed the startup create path would observe no Nodes and give every
-// egress identity it provisions an IPv4-only NAT Gateway; outbound has no update path, so that
-// choice would never be corrected.
+// egress identity it provisions an IPv4-only NAT Gateway; an identity's IP families never change
+// after its creation, so that choice would never be corrected.
 func (dt *DiffTracker) seedClusterAddressFamilies(nodeNameToIPs map[string][]string) {
 	for _, ips := range nodeNameToIPs {
 		for _, ip := range ips {
@@ -404,13 +431,12 @@ func (dt *DiffTracker) seedClusterAddressFamilies(nodeNameToIPs map[string][]str
 // clusterProvidesIPv6Locked reports whether any Node exposes an IPv6 InternalIP, i.e. whether the cluster
 // can run IPv6 workloads at all.
 //
-// Egress families are decided from the cluster rather than from an identity's pods because there is
-// no outbound update path: a NAT Gateway is created once and never modified, and a dual-stack
-// cluster can run single-stack pods, so the pods present at create time do not predict later ones.
-// A false answer here (no Node lister, or an empty cluster) yields today's IPv4-only behaviour.
-// Must be called with dt.mu held: the only caller decides an outbound config inside addPod's
-// critical section, and dt.mu is not reentrant. The lister read is an in-memory indexer lookup,
-// not I/O.
+// Egress families are decided from the cluster rather than from an identity's pods because an
+// identity's IP families never change after its creation (its configuration is updated in place, its
+// families are not), and a dual-stack cluster can run single-stack pods, so the pods present at
+// create time do not predict later ones. A false answer here (no Node lister, or an empty cluster)
+// yields IPv4-only families. Must be called with dt.mu held (through outboundIPFamiliesLocked):
+// dt.mu is not reentrant. The lister read is an in-memory indexer lookup, not I/O.
 func (dt *DiffTracker) clusterProvidesIPv6Locked() bool {
 	// Cached once observed: this walks every Node, and the answer is a stable cluster property.
 	// Only the negative result is recomputed, so a cluster that gains IPv6 nodes is still picked up
@@ -819,11 +845,13 @@ func processK8sEndpoints(
 	return endpointSliceList, nil
 }
 
-// processK8sEgresses fetches egress pods and populates K8s nodes/pods with outbound identities
-// NOTE: Pods with DeletionTimestamp are EXCLUDED because they are being deleted and should not
-// contribute to the pod counter. Their cleanup is handled by recoverStuckFinalizers. Pods not in
-// Running or Pending phase are also EXCLUDED, matching the runtime egress admission gate.
-// Returns the raw pod list for reuse by recoverStuckFinalizers to avoid duplicate API calls.
+// processK8sEgresses fetches the egress pods and admits the members of their egress identities into the K8s
+// state: egressMembership, the predicate of the runtime add path, decides, and each accepted address is
+// recorded under its node location with the pod's identity. A pod being deleted is no member, so it does not
+// count toward its identity; its cleanup is handled by recoverStuckFinalizers. The votes of the admitted pods
+// are seeded once the tracker exists (seedEgressVotes), which also withdraws the pods of an identity that
+// collides with an inbound service.
+// Returns the raw pod list for reuse by recoverStuckFinalizers and seedEgressVotes to avoid duplicate API calls.
 func processK8sEgresses(
 	ctx context.Context,
 	kubeClient kubernetes.Interface,
@@ -837,82 +865,160 @@ func processK8sEgresses(
 		return nil, fmt.Errorf("failed to list pods with egress label: %w", err)
 	}
 
-	for _, pod := range egressPods.Items {
-		// Skip pods that are being deleted - they shouldn't count toward the service
-		// Their addresses will be synced out by recoverStuckFinalizers or during normal deletion
-		if pod.DeletionTimestamp != nil {
-			logger.V(5).Info("Skipped deleting pod", "namespace", pod.Namespace, "pod", pod.Name)
+	for i := range egressPods.Items {
+		pod := &egressPods.Items[i]
+		identity, accepted, reason := egressMembership(pod)
+		if len(accepted) == 0 {
+			logger.V(5).Info("Skipped egress pod that is not a member of its egress identity", "namespace", pod.Namespace, "pod", pod.Name, "egress", identity, "reason", reason)
 			continue
 		}
-
-		// Import only Running/Pending pods, matching the runtime path (podInformerAddPod).
-		// Succeeded/Failed containers have terminated and Unknown is unobtainable, so none is a live
-		// egress backend; importing one would program a stale NRP address no later event clears.
-		if pod.Status.Phase != v1.PodRunning && pod.Status.Phase != v1.PodPending {
-			logger.V(5).Info("Skipped egress pod not in Running/Pending phase", "namespace", pod.Namespace, "pod", pod.Name, "phase", pod.Status.Phase)
-			continue
+		if reason != "" {
+			logger.V(4).Info("Skipped egress pod addresses that cannot be registered", "namespace", pod.Namespace, "pod", pod.Name, "egress", identity, "reason", reason)
 		}
-
-		egressVal := strings.ToLower(pod.Labels[consts.PodLabelServiceEgressGateway])
-		if egressVal == "" || len(PodEgressAddresses(&pod)) == 0 || pod.Status.HostIP == "" || pod.Spec.NodeName == "" || !IsValidEgressIdentity(egressVal) {
-			logger.V(5).Info("Skipped invalid egress pod", "namespace", pod.Namespace, "pod", pod.Name, "label", egressVal, "podIP", pod.Status.PodIP, "hostIP", pod.Status.HostIP, "node", pod.Spec.NodeName)
-			continue
+		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+		for _, address := range accepted {
+			ensureNodeExists(k8s, address.Location)
+			addOutboundIdentityToPod(k8s, address.Location, address.IP, identity, podKey, string(pod.UID))
 		}
-
-		// Validate HostIP before it becomes the location key (matches podInformerAddPod); a malformed
-		// value would make NRP reject the whole batch and stall location sync.
-		if _, err := netip.ParseAddr(pod.Status.HostIP); err != nil {
-			logger.V(4).Info("Skipped egress pod with malformed HostIP", "namespace", pod.Namespace, "pod", pod.Name, "hostIP", pod.Status.HostIP)
-			continue
-		}
-
-		// A dual-stack pod contributes one address per IP family (Status.PodIPs); register each so the
-		// secondary family egresses through the NAT Gateway too. Skip individually malformed addresses.
-		var validAddrs []string
-		for _, podIP := range PodEgressAddresses(&pod) {
-			if _, err := netip.ParseAddr(podIP); err != nil {
-				logger.V(4).Info("Skipped egress pod with malformed PodIP", "namespace", pod.Namespace, "pod", pod.Name, "podIP", podIP)
-				continue
-			}
-			validAddrs = append(validAddrs, podIP)
-		}
-		if len(validAddrs) == 0 {
-			continue
-		}
-
-		// Seed each address under its same-family node location (see PodNodeLocationsByFamily). Mark the
-		// egress desired only once at least one address maps to a same-family location, matching the
-		// runtime path (podInformerAddPod), so init never provisions a NAT Gateway with no backing pod
-		// address (e.g. an IPv6 PodIP on a node exposing only an IPv4 InternalIP).
-		hostByFamily := PodNodeLocationsByFamily(&pod)
-		seeded := false
-		for _, podIP := range validAddrs {
-			nodeIP, ok := NodeLocationForAddress(hostByFamily, podIP)
-			if !ok {
-				logger.V(4).Info("Skipped egress pod address with no same-family node IP", "namespace", pod.Namespace, "pod", pod.Name, "podIP", podIP, "hostIPs", pod.Status.HostIPs)
-				continue
-			}
-			ensureNodeExists(k8s, nodeIP)
-			addOutboundIdentityToPod(k8s, nodeIP, podIP, egressVal, fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), string(pod.UID))
-			seeded = true
-		}
-		if seeded {
-			k8s.Egresses.Insert(egressVal)
-		}
+		k8s.Egresses.Insert(identity)
 	}
 	logger.V(2).Info("Processed Kubernetes egress services", "egresses", k8s.Egresses.Len())
 	return egressPods, nil
 }
 
+// seedEgressVotes registers the vote of every pod that processK8sEgresses admitted from pods as a member of its
+// egress identity, decided by the same predicate, before the identities are planned (4.6 step 2). Nothing is
+// evaluated or triggered and no event is raised: the unchanged baseline of a restart reports nothing. An
+// identity that collides with an inbound service has no members (I1): the vote is not registered and the
+// addresses admitted for the pod are withdrawn, so the identity is neither created nor counted. It must run
+// after the cluster's address families are seeded, as they decide how annotations are parsed, and before the
+// sync operations are computed; startup parses the votes of an identity it adopts again when its NAT Gateway
+// serves other families (adoptStartupEgressIdentities). Every member is kept as listed (admitted), for the pod
+// informer, which starts later, to reconcile what became of it meanwhile.
+func (dt *DiffTracker) seedEgressVotes(pods *v1.PodList) {
+	if pods == nil {
+		return
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	seeded, refused := 0, 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		identity, accepted, _ := egressMembership(pod)
+		if len(accepted) == 0 {
+			continue
+		}
+		vote := parseEgressVote(pod, dt.egressParseContextOfLocked(identity))
+		if dt.seedEgressVoteLocked(identity, egressPodRefOf(pod), vote) {
+			if dt.egress.admitted == nil {
+				dt.egress.admitted = make(map[string]*v1.Pod)
+			}
+			dt.egress.admitted[pod.Namespace+"/"+pod.Name] = admittedEgressPod(pod)
+			seeded++
+			continue
+		}
+		refused++
+		dt.logger.V(2).Info("Skipped egress pod whose identity collides with an inbound service",
+			"namespace", pod.Namespace, "pod", pod.Name, "service", identity)
+		dt.withdrawEgressAddressesLocked(identity, accepted)
+	}
+	dt.logger.V(2).Info("Seeded egress votes", "votes", seeded, "refused", refused)
+}
+
+// withdrawEgressAddressesLocked removes addresses from the egress identity in the K8s state, releasing their pod
+// count, and the identity from the desired egresses once it has no address left. Must be called with dt.mu held.
+func (dt *DiffTracker) withdrawEgressAddressesLocked(identity string, addresses []egressAddress) {
+	for _, address := range addresses {
+		if err := dt.updateK8sPodLocked(UpdatePodInputType{
+			PodOperation:           Remove,
+			PublicOutboundIdentity: identity,
+			Location:               address.Location,
+			Address:                address.IP,
+		}); err != nil {
+			dt.logger.V(4).Info("Could not withdraw egress pod address", "err", err, "service", identity, "address", address.IP)
+		}
+	}
+	if !dt.outboundServiceHasLiveOrBufferedPodLocked(identity) {
+		dt.K8sResources.Egresses.Delete(identity)
+	}
+}
+
+// admittedEgressPod returns what the pod informer's reconciliation of an admitted member reads of pod (its identity,
+// UID, creation time, egress label and annotations, finalizers and the status that decides membership and addresses),
+// so that startup does not keep its whole listing.
+func admittedEgressPod(pod *v1.Pod) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID, CreationTimestamp: pod.CreationTimestamp,
+			DeletionTimestamp: pod.DeletionTimestamp.DeepCopy(),
+			Labels:            map[string]string{consts.PodLabelServiceEgressGateway: pod.Labels[consts.PodLabelServiceEgressGateway]},
+			Annotations:       egressAnnotations(pod),
+			Finalizers:        slices.Clone(pod.Finalizers),
+		},
+		Status: v1.PodStatus{Phase: pod.Status.Phase, HostIP: pod.Status.HostIP, HostIPs: slices.Clone(pod.Status.HostIPs),
+			PodIP: pod.Status.PodIP, PodIPs: slices.Clone(pod.Status.PodIPs)},
+	}
+}
+
+// takeAdmittedEgressPod returns the pod with podKey that startup admitted as a member (its trimmed copy,
+// admittedEgressPod) and forgets it, so that the pod informer reconciles it once (reconcileEgressPodAdd).
+func (dt *DiffTracker) takeAdmittedEgressPod(podKey string) (*v1.Pod, bool) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	pod, ok := dt.egress.admitted[podKey]
+	delete(dt.egress.admitted, podKey)
+	if len(dt.egress.admitted) == 0 {
+		dt.egress.admitted = nil
+	}
+	return pod, ok
+}
+
+// removeUnlistedEgressPods removes the pods startup admitted that the pod informer's synced store does not hold
+// (listed reports whether it holds a pod key; SetUpPodInformer). The store is listed consistently, so it is never
+// older than startup's listing (egressPodListOptions): each was deleted, or left the informer's selection, since
+// startup listed it. A pod the store holds is left to its own ADD, which may still be on its way through the handler
+// (reconcileEgressPodAdd), so startup never waits for the handler; a pod the store listed and dropped again may still
+// get its queued ADD, which adds it back until its queued DELETE removes it again. A pod is removed as the informer
+// removes a deleted pod (DeletePod): its addresses, as startup admitted them, and its vote leave the identity it was
+// admitted to, only where the pod (key and UID) still holds them, and the identity is deleted after its last pod. A pod
+// with nothing to drain gets a ready finalizer-removal record, which releases a finalizer it still carries without an
+// API call here. Each is removed and forgotten under one lock, so that a pod the informer lists afterwards (its egress
+// label key added back) is added after its removal, never removed after its add.
+func (dt *DiffTracker) removeUnlistedEgressPods(listed func(podKey string) bool) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	for podKey, pod := range dt.egress.admitted {
+		if listed(podKey) {
+			continue
+		}
+		delete(dt.egress.admitted, podKey)
+		identity, uid := egressIdentityOf(pod), string(pod.UID)
+		result := dt.deletePodLocked(identity, pod.Status.HostIP, PodEgressAddresses(pod), pod.Namespace, pod.Name, uid, podRemoved)
+		withdrawn := dt.removeEgressVoteLocked(identity, podKey, pod.UID)
+		if _, recorded := dt.pendingPodDeletions[podKey]; !recorded && result.FinalizerDecision == PodFinalizerDecisionReleaseNoDrain {
+			dt.pendingPodDeletions[podKey] = &PendingPodDeletion{Namespace: pod.Namespace, Name: pod.Name, UID: uid,
+				ServiceUID: identity, Timestamp: time.Now().Format(time.RFC3339)}
+			dt.triggerLocationsUpdater()
+		}
+		dt.logger.V(2).Info("Removed egress pod that the pod informer did not list", "pod", podKey, "podUID", uid,
+			"service", identity, "voteWithdrawn", withdrawn, "lastPod", result.IsLastPod)
+	}
+	if len(dt.egress.admitted) == 0 {
+		dt.egress.admitted = nil
+	}
+}
+
 // buildNRPState fetches and constructs the complete NRP state (services, locations, LBs, NATs)
 // Also returns:
-// - azurePIPs: raw PIP slice for orphan cleanup
+// - egressResources: the NAT Gateways, Public IPs (raw slice for orphan cleanup) and prefixes listed
 // - pipNameToIP: map for External IP recovery
 func buildNRPState(
 	ctx context.Context,
 	config Config,
 	networkClientFactory azclient.ClientFactory,
-) (NRPState, *utilsets.IgnoreCaseSet, *utilsets.IgnoreCaseSet, []*armnetwork.PublicIPAddress, map[string]string, error) {
+) (NRPState, *utilsets.IgnoreCaseSet, *utilsets.IgnoreCaseSet, *egressListing, map[string]string, error) {
 	nrp := NRPState{
 		LoadBalancers: utilsets.NewString(),
 		NATGateways:   utilsets.NewString(),
@@ -938,7 +1044,7 @@ func buildNRPState(
 	}
 
 	// Fetch Azure NAT Gateways
-	currentNATs, err := fetchAzureNATGateways(ctx, config, networkClientFactory, &nrp)
+	currentNATs, natGateways, err := fetchAzureNATGateways(ctx, config, networkClientFactory, &nrp)
 	if err != nil {
 		return NRPState{}, nil, nil, nil, nil, err
 	}
@@ -954,7 +1060,14 @@ func buildNRPState(
 		return NRPState{}, nil, nil, nil, nil, fmt.Errorf("failed to fetch Azure public IPs: %w", err)
 	}
 
-	return nrp, currentLBs, currentNATs, azurePIPs, pipNameToIP, nil
+	// Fetch Azure Public IP prefixes. Fatal like the Public IPs: the configuration an egress identity's NAT
+	// Gateway satisfies, and the managed prefixes left behind, cannot be told without them.
+	prefixes, err := fetchAzurePublicIPPrefixes(ctx, config, networkClientFactory)
+	if err != nil {
+		return NRPState{}, nil, nil, nil, nil, err
+	}
+
+	return nrp, currentLBs, currentNATs, newStartupEgressListing(nrp, natGateways, azurePIPs, prefixes), pipNameToIP, nil
 }
 
 // fetchServiceGatewayServices fetches services from ServiceGateway API
@@ -1085,18 +1198,19 @@ func fetchAzureLoadBalancers(
 }
 
 // fetchAzureNATGateways fetches NAT Gateways from Azure and records in nrp.UnmanagedNATGateways
-// those this controller did not create (see ownsNATGateway)
+// those this controller did not create (see ownsNATGateway). It returns their names and the NAT
+// Gateways as listed.
 func fetchAzureNATGateways(
 	ctx context.Context,
 	config Config,
 	networkClientFactory azclient.ClientFactory,
 	nrp *NRPState,
-) (*utilsets.IgnoreCaseSet, error) {
+) (*utilsets.IgnoreCaseSet, []*armnetwork.NatGateway, error) {
 	logger := log.FromContextOrBackground(ctx)
 	ngclient := networkClientFactory.GetNatGatewayClient()
 	ngs, err := ngclient.List(ctx, config.ResourceGroup)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list nat gateways: %w", err)
+		return nil, nil, fmt.Errorf("failed to list nat gateways: %w", err)
 	}
 
 	currentNATs := utilsets.NewString()
@@ -1112,7 +1226,7 @@ func fetchAzureNATGateways(
 		}
 	}
 	logger.V(2).Info("Fetched Azure NAT gateways", "natGateways", currentNATs.Len())
-	return currentNATs, nil
+	return currentNATs, ngs, nil
 }
 
 // fetchAzurePublicIPs fetches all Public IPs from Azure and returns:
@@ -1140,6 +1254,22 @@ func fetchAzurePublicIPs(
 	}
 	logger.V(2).Info("Fetched Azure Public IPs", "publicIPs", len(pips), "allocatedAddresses", len(pipNameToIP))
 	return pips, pipNameToIP, nil
+}
+
+// fetchAzurePublicIPPrefixes fetches all Public IP prefixes of the node resource group from Azure: the managed
+// prefixes of egress identities are among them.
+func fetchAzurePublicIPPrefixes(
+	ctx context.Context,
+	config Config,
+	networkClientFactory azclient.ClientFactory,
+) ([]*armnetwork.PublicIPPrefix, error) {
+	logger := log.FromContextOrBackground(ctx)
+	prefixes, err := networkClientFactory.GetPublicIPPrefixClient().List(ctx, config.ResourceGroup)
+	if err != nil {
+		return nil, fmt.Errorf("listing Public IP prefixes: %w", err)
+	}
+	logger.V(2).Info("Fetched Azure Public IP prefixes", "prefixes", len(prefixes))
+	return prefixes, nil
 }
 
 // pipNamesInAzureFromList collects every Public IP name from an Azure PIP enumeration, independent of
@@ -1178,16 +1308,18 @@ func logSyncOperations(syncOps *SyncDiffTrackerReturnType) {
 	logger.V(2).Info("Computed sync operations", "loadBalancerAdditions", syncOps.LoadBalancerUpdates.Additions.Len(), "loadBalancerRemovals", syncOps.LoadBalancerUpdates.Removals.Len(), "natGatewayAdditions", syncOps.NATGatewayUpdates.Additions.Len(), "natGatewayRemovals", syncOps.NATGatewayUpdates.Removals.Len(), "locations", len(syncOps.LocationData.Locations))
 }
 
-// startInitialization sets up initialization mode and starts updaters
+// startInitialization sets up initialization mode and starts updaters. Initialization is planning from here
+// until endInitializationPlanning: it cannot complete before all startup work is enqueued.
 func startInitialization(ctx context.Context, diffTracker *DiffTracker) error {
 	logger := log.FromContextOrBackground(ctx)
 	diffTracker.mu.Lock()
 	atomic.StoreInt32(&diffTracker.isInitializing, 1)
 	diffTracker.initCompletionChecker = make(chan struct{})
+	diffTracker.initPlanning = true
 	diffTracker.mu.Unlock()
 
 	logger.V(2).Info("Started ServiceUpdater and LocationsUpdater")
-	diffTracker.serviceUpdater = NewServiceUpdater(ctx, diffTracker, diffTracker.OnServiceCreationComplete, diffTracker.GetServiceUpdaterTrigger())
+	diffTracker.serviceUpdater = NewServiceUpdater(ctx, diffTracker, diffTracker.OnServiceCreationComplete, diffTracker.onServiceOperationComplete, diffTracker.GetServiceUpdaterTrigger())
 	diffTracker.locationsUpdater = NewLocationsUpdater(ctx, diffTracker)
 	go diffTracker.serviceUpdater.Run()
 	go diffTracker.locationsUpdater.Run()
@@ -1195,6 +1327,15 @@ func startInitialization(ctx context.Context, diffTracker *DiffTracker) error {
 	// Give updaters time to start their event loops
 	time.Sleep(50 * time.Millisecond)
 	return nil
+}
+
+// endInitializationPlanning releases the planning latch once all startup work is enqueued, and checks whether
+// initialization is complete: work that completed while startup was still enqueueing could not complete it.
+func (dt *DiffTracker) endInitializationPlanning() {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	dt.initPlanning = false
+	dt.checkInitializationCompleteLocked()
 }
 
 // cleanupOnError cleans up initialization state on failure
@@ -1432,12 +1573,15 @@ func scheduleOrphanedResourceDeletions(diffTracker *DiffTracker, currentLBsInAzu
 	logger.V(2).Info("Scheduled orphaned resource deletions", "resources", totalOrphans)
 }
 
-// cleanupOrphanedPIPs attempts to cleanup orphaned Public IPs (non-fatal)
-// Uses pre-fetched PIPs from buildNRPState to avoid duplicate API calls.
-func cleanupOrphanedPIPs(ctx context.Context, diffTracker *DiffTracker, azurePIPs []*armnetwork.PublicIPAddress) {
+// cleanupOrphanedPIPs attempts to cleanup orphaned Public IPs and managed Public IP prefixes (non-fatal)
+// Uses pre-fetched PIPs and prefixes from buildNRPState to avoid duplicate API calls.
+func cleanupOrphanedPIPs(ctx context.Context, diffTracker *DiffTracker, azurePIPs []*armnetwork.PublicIPAddress, prefixes []*armnetwork.PublicIPPrefix) {
 	logger := log.FromContextOrBackground(ctx)
 	if err := diffTracker.cleanupOrphanedPublicIPs(ctx, azurePIPs); err != nil {
 		logger.V(4).Info("Could not clean up orphaned Public IPs", "err", err)
+	}
+	if err := diffTracker.cleanupOrphanedPublicIPPrefixes(ctx, prefixes); err != nil {
+		logger.V(4).Info("Could not clean up orphaned Public IP prefixes", "err", err)
 	}
 }
 
@@ -1757,9 +1901,10 @@ func (dt *DiffTracker) reconcileServices(syncOps *SyncDiffTrackerReturnType, ser
 			dt.AddService(config)
 		}
 
-		// Startup must decide address families exactly as the runtime pod path does. Outbound has
-		// no update path, so a NAT Gateway created here without them stays single-stack for its
-		// whole life. Resolved once because it is a cluster property, not a per-identity one.
+		// Startup must decide address families exactly as the runtime pod path does. An identity's
+		// IP families never change after its creation, so a NAT Gateway created here without them
+		// stays single-stack for its whole life. Resolved once because it is a cluster property, not a
+		// per-identity one; the creation configuration is decided at dispatch.
 		var outboundFamilies []string
 		if len(natAdditions) > 0 {
 			outboundFamilies = dt.outboundIPFamilies()
@@ -1801,8 +1946,12 @@ func (dt *DiffTracker) cleanupOrphanedPublicIPs(ctx context.Context, pips []*arm
 
 		pipName := *pip.Name
 
-		// Map the address back to its identity. Both "-pip" and "-pip-v6" are ours.
+		// Map the address back to its identity. Both "-pip" and "-pip-v6" are ours. A numbered managed
+		// Public IP of an egress identity is recognised by its reserved name and the ownership tag.
 		identity, ok := identityFromPublicIPName(pipName)
+		if !ok {
+			identity, ok = taggedManagedNameOwner(pipName, pip.Tags, egressManagedPublicIP)
+		}
 		if !ok {
 			logger.V(5).Info("Skipped Public IP with unexpected name", "publicIP", pipName)
 			continue

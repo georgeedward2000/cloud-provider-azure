@@ -656,3 +656,21 @@ func TestIsTerminalLocationSyncStatus_ClassifiesEveryStatus(t *testing.T) {
 			"status %d is transient and must stay retryable", status)
 	}
 }
+
+// TestEgressTuningDefaults pins the signed-off egress tuning: a 2 minute quiet period after a write
+// whose outcome is unknown, and at most 8 Public IP or prefix calls in flight per egress identity.
+func TestEgressTuningDefaults(t *testing.T) {
+	cases := []struct {
+		name      string
+		got, want any
+	}{
+		{"settle delay", getEgressSettleDelay(), 2 * time.Minute},
+		{"public IP concurrency", getEgressPublicIPConcurrency(), 8},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.got)
+		})
+	}
+}

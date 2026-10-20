@@ -22,8 +22,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
+	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -31,6 +33,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 
+	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/tests/e2e/utils"
 )
 
@@ -207,19 +210,72 @@ func isTransientAzureFailure(output string) bool {
 		"ServiceUnavailable",
 		"(503)",
 		"Gateway Timeout",
+		"GatewayTimeout", // the error code, as SDK commands print it: (GatewayTimeout) ...
 		"(504)",
 		"TooManyRequests",
+		"Too Many Requests", // the reason, as az rest prints it whatever the error code (SubscriptionRequestsThrottled, ...)
 		"(429)",
 		"temporarily unavailable",
 		"connection reset by peer",
+		"Connection reset by peer", // Python's ConnectionResetError, also while reading a response ("Connection broken: ...")
+		// Connection-level failures of az's own HTTP client, as ('Connection aborted.', RemoteDisconnected(...)).
+		"Connection aborted",
+		"RemoteDisconnected",
 		"Please run 'az login'",
 		"AADSTS700082", // expired refresh token; the next attempt re-authenticates
+		// An ARM or resource provider 500, as az rest prints it (Internal Server Error({"error":{"code":"InternalServerError"...)
+		// and as SDK commands print it ((InternalServerError) ...).
+		"InternalServerError",
 	} {
 		if strings.Contains(output, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+func TestIsTransientAzureFailure(t *testing.T) {
+	for _, tc := range []struct {
+		output    string
+		transient bool
+	}{
+		{"ERROR: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))", true},
+		{"ERROR: ('Connection aborted.', BrokenPipeError(32, 'Broken pipe'))", true},
+		{"ERROR: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))", true},
+		{"ERROR: Service Unavailable(<HTML><HEAD><TITLE>Service Unavailable</TITLE></HEAD><BODY><h2>Service Unavailable</h2>" +
+			"<hr><p>HTTP Error 503. The service is unavailable.</p></BODY></HTML>)", true},
+		{"ERROR: (ServiceUnavailable) The service is unavailable. Please retry the request later.\nCode: ServiceUnavailable\n" +
+			"Message: The service is unavailable. Please retry the request later.", true},
+		{"ERROR: Operation returned an invalid status 'Gateway Timeout'", true},
+		{"ERROR: (TooManyRequests) The request is being throttled. Please retry after 10 seconds.\nCode: TooManyRequests\n" +
+			"Message: The request is being throttled. Please retry after 10 seconds.", true},
+		{"ERROR: HTTPSConnectionPool(host='management.azure.com', port=443): Max retries exceeded with url: /subscriptions " +
+			"(Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7f3c2a1b5e50>: Failed to establish a new " +
+			"connection: [Errno 11] Resource temporarily unavailable'))", true},
+		{"ERROR: (InternalServerError) read tcp 10.224.0.4:52422->10.0.0.1:443: read: connection reset by peer\n" +
+			"Code: InternalServerError\nMessage: read tcp 10.224.0.4:52422->10.0.0.1:443: read: connection reset by peer", true},
+		{"ERROR: Please run 'az login' to setup account.", true},
+		{"ERROR: AADSTS700082: The refresh token has expired due to inactivity. The token was issued on 2026-07-01T10:00:00Z " +
+			"and was inactive for 90.00:00:00.", true},
+		{"ERROR: (503)", true},
+		{"ERROR: (504)", true},
+		{"ERROR: (429)", true},
+		{"ERROR: (GatewayTimeout) The gateway did not receive a response from 'Microsoft.Network' within the specified time period.\n" +
+			"Code: GatewayTimeout\nMessage: The gateway did not receive a response from 'Microsoft.Network' within the specified time period.", true},
+		{`ERROR: Too Many Requests({"error":{"code":"SubscriptionRequestsThrottled","message":"Number of 'read' requests for subscription ` +
+			`'00000000-0000-0000-0000-000000000000' actor '11111111-1111-1111-1111-111111111111' exceeded. Please try again after '5' seconds ` +
+			`after additional tokens are available. Refer to https://aka.ms/arm-throttling for additional information."}})`, true},
+		{`ERROR: ("Connection broken: ConnectionResetError(104, 'Connection reset by peer')", ConnectionResetError(104, 'Connection reset by peer'))`, true},
+		{`ERROR: Internal Server Error({"error":{"code":"InternalServerError","message":"Encountered internal server error. ` +
+			`Diagnostic information: timestamp '20261020T094905Z', subscription id '00000000-0000-0000-0000-000000000000'."}})`, true},
+		{"ERROR: (InternalServerError) Encountered internal server error.\nCode: InternalServerError\n" +
+			"Message: Encountered internal server error.", true},
+		{"ERROR: (ResourceNotFound) The Resource 'Microsoft.Network/publicIPAddresses/x' under resource group 'rg' was not found.", false},
+	} {
+		if got := isTransientAzureFailure(tc.output); got != tc.transient {
+			t.Errorf("isTransientAzureFailure(%q) = %v, want %v", tc.output, got, tc.transient)
+		}
+	}
 }
 
 // runAz runs an `az` command and returns its stdout, retrying transient control-plane failures.
@@ -530,6 +586,318 @@ func azureEgressResourcesAbsentErr(egressName string) error {
 	// the same create and removed by the same delete, so a teardown that misses it leaks a second
 	// billable address per egress identity.
 	return azurePublicIPNamedAbsentErr(fmt.Sprintf("%s-pip-v6", egressName))
+}
+
+// egressIdentityTagKey is the tag the controller sets, to the identity, on the NAT Gateway and on
+// every Public IP and Public IP prefix it manages for an egress identity.
+const egressIdentityTagKey = "k8s-azure-egress-identity"
+
+// egressManagedPublicIPName returns the name of the n-th (from 1) managed Public IP of egress
+// identity id in one IP family: "<id>-pip" or "<id>-pip-v6" for the first, the names used before
+// egress configuration existed, then "<id>-pip-2" or "<id>-pip-v6-2" and so on.
+func egressManagedPublicIPName(id string, ipv6 bool, n int) string {
+	name := id + "-pip"
+	if ipv6 {
+		name += "-v6"
+	}
+	if n > 1 {
+		name = fmt.Sprintf("%s-%d", name, n)
+	}
+	return name
+}
+
+// egressManagedPrefixName returns the name of the managed Public IP prefix of egress identity id
+// with the given length, "<id>-prefix-31" or "<id>-prefix-v6-127". The length is part of the name
+// so that a length change can create the new prefix while the old one is still attached.
+func egressManagedPrefixName(id string, ipv6 bool, length int) string {
+	if ipv6 {
+		return fmt.Sprintf("%s-prefix-v6-%d", id, length)
+	}
+	return fmt.Sprintf("%s-prefix-%d", id, length)
+}
+
+// egressReservedNames returns every name egress identity id reserves for the Public IPs and the
+// Public IP prefixes the controller may manage for it, in both IP families.
+func egressReservedNames(id string) (publicIPs, prefixes []string) {
+	for _, ipv6 := range []bool{false, true} {
+		for n := 1; n <= consts.ServiceEgressGatewayPublicIPCountMax; n++ {
+			publicIPs = append(publicIPs, egressManagedPublicIPName(id, ipv6, n))
+		}
+	}
+	for length := consts.ServiceEgressGatewayPublicIPPrefixLengthMin; length <= consts.ServiceEgressGatewayPublicIPPrefixLengthMax; length++ {
+		prefixes = append(prefixes, egressManagedPrefixName(id, false, length))
+	}
+	for length := consts.ServiceEgressGatewayPublicIPPrefixLengthIPv6Min; length <= consts.ServiceEgressGatewayPublicIPPrefixLengthIPv6Max; length++ {
+		prefixes = append(prefixes, egressManagedPrefixName(id, true, length))
+	}
+	return publicIPs, prefixes
+}
+
+// armSubResource is a reference to another ARM resource.
+type armSubResource struct {
+	ID string `json:"id"`
+}
+
+// azureNetworkResource is a NAT Gateway, Public IP or Public IP prefix as ARM returns it. The three
+// types share the struct; each fills the properties it has.
+//
+// It is read with `az rest` (armURL, at byoResourceAPIVersion), in ARM's shape: `az network ... show` prints the
+// properties flattened, outside `properties`, and its own API version leaves out a NAT Gateway's ServiceGateway link.
+type azureNetworkResource struct {
+	ID   string            `json:"id"`
+	Name string            `json:"name"`
+	Etag string            `json:"etag"`
+	Tags map[string]string `json:"tags"`
+	SKU  struct {
+		Name string `json:"name"`
+	} `json:"sku"`
+	Properties struct {
+		ProvisioningState string `json:"provisioningState"`
+		ResourceGUID      string `json:"resourceGuid"`
+
+		// NAT Gateway.
+		IdleTimeoutInMinutes *int             `json:"idleTimeoutInMinutes"`
+		PublicIPAddresses    []armSubResource `json:"publicIpAddresses"`
+		PublicIPAddressesV6  []armSubResource `json:"publicIpAddressesV6"`
+		PublicIPPrefixes     []armSubResource `json:"publicIpPrefixes"`
+		PublicIPPrefixesV6   []armSubResource `json:"publicIpPrefixesV6"`
+		ServiceGateway       *armSubResource  `json:"serviceGateway"`
+
+		// Public IP and Public IP prefix.
+		IPAddress        string          `json:"ipAddress"`
+		IPPrefix         string          `json:"ipPrefix"`
+		PrefixLength     int             `json:"prefixLength"`
+		AddressVersion   string          `json:"publicIPAddressVersion"`
+		AllocationMethod string          `json:"publicIPAllocationMethod"`
+		NatGateway       *armSubResource `json:"natGateway"`
+	} `json:"properties"`
+}
+
+// getAzureNetworkResource reads a network resource by ID; found is false when it does not exist.
+func getAzureNetworkResource(resourceID string) (resource azureNetworkResource, found bool, err error) {
+	out, err := runAz("rest", "--method", "get", "--url", armURL(resourceID))
+	if err != nil {
+		if strings.Contains(string(out), "NotFound") {
+			return azureNetworkResource{}, false, nil
+		}
+		return azureNetworkResource{}, false, fmt.Errorf("reading %s: %w", resourceID, err)
+	}
+	if err := json.Unmarshal(out, &resource); err != nil {
+		return azureNetworkResource{}, false, fmt.Errorf("parsing %s: %w", resourceID, err)
+	}
+	return resource, true, nil
+}
+
+// listAzureNetworkResources lists the network resources of one type of the cluster resource group;
+// collection is the type's segment in a resource ID, such as "publicIPPrefixes".
+func listAzureNetworkResources(collection string) ([]azureNetworkResource, error) {
+	url := fmt.Sprintf("https://management.azure.com/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/%s?api-version=%s",
+		subscriptionID, resourceGroupName, collection, byoResourceAPIVersion)
+	var resources []azureNetworkResource
+	for url != "" {
+		out, err := runAz("rest", "--method", "get", "--url", url)
+		if err != nil {
+			return nil, fmt.Errorf("listing %s: %w", collection, err)
+		}
+		var page struct {
+			Value    []azureNetworkResource `json:"value"`
+			NextLink string                 `json:"nextLink"`
+		}
+		if err := json.Unmarshal(out, &page); err != nil {
+			return nil, fmt.Errorf("parsing the list of %s: %w", collection, err)
+		}
+		resources = append(resources, page.Value...)
+		url = page.NextLink
+	}
+	return resources, nil
+}
+
+// tagValue returns the value of tag key, whose name compares case-insensitively as in Azure, or "".
+func tagValue(tags map[string]string, key string) string {
+	for k, v := range tags {
+		if strings.EqualFold(k, key) {
+			return v
+		}
+	}
+	return ""
+}
+
+// containsFold reports whether names contains name, ignoring case as Azure does for resource names.
+func containsFold(names []string, name string) bool {
+	for _, n := range names {
+		if strings.EqualFold(n, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameNamesFold reports whether got and want hold the same names, ignoring case and order.
+func sameNamesFold(got, want []string) bool {
+	fold := func(names []string) []string {
+		folded := make([]string, 0, len(names))
+		for _, name := range names {
+			folded = append(folded, strings.ToLower(name))
+		}
+		sort.Strings(folded)
+		return folded
+	}
+	return slices.Equal(fold(got), fold(want))
+}
+
+// egressReservedResourcesErr returns nil when the Public IPs and Public IP prefixes of the cluster
+// resource group that have a reserved name of egress identity egressName are exactly wantPublicIPs
+// and wantPrefixes (names). Every reserved name counts, owned or not: a spec that creates one itself
+// removes it before the AfterEach, so a surplus is a managed resource the controller failed to delete.
+func egressReservedResourcesErr(egressName string, wantPublicIPs, wantPrefixes []string) error {
+	reservedPublicIPs, reservedPrefixes := egressReservedNames(egressName)
+	for _, kind := range []struct {
+		collection     string
+		reserved, want []string
+	}{
+		{"publicIPAddresses", reservedPublicIPs, wantPublicIPs},
+		{"publicIPPrefixes", reservedPrefixes, wantPrefixes},
+	} {
+		resources, err := listAzureNetworkResources(kind.collection)
+		if err != nil {
+			return err
+		}
+		var got []string
+		for i := range resources {
+			if containsFold(kind.reserved, resources[i].Name) {
+				got = append(got, resources[i].Name)
+			}
+		}
+		if !sameNamesFold(got, kind.want) {
+			sort.Strings(got)
+			return fmt.Errorf("egress identity %s has managed %s %v, want %v", egressName, kind.collection, got, kind.want)
+		}
+	}
+	return nil
+}
+
+// egressIdentityGoneErr returns nil once egress identity egressName is unregistered from the Service
+// Gateway with no address left, and its NAT Gateway and every managed Public IP and Public IP prefix
+// it may have had (any reserved name, numbered Public IPs and prefixes included) are deleted, except
+// the numbered Public IPs and the prefixes kept (names), which are left at their reserved names. Its
+// base Public IPs ("<id>-pip", "<id>-pip-v6") must be gone in any case (natGatewayCleanupErr).
+func egressIdentityGoneErr(egressName string, kept ...string) error {
+	if err := natGatewayCleanupErr([]string{egressName}); err != nil {
+		return err
+	}
+	if got, err := countRegisteredEndpoints(egressName); err != nil {
+		return err
+	} else if got > 0 {
+		return fmt.Errorf("egress %s still has %d registered address(es)", egressName, got)
+	}
+	reservedPublicIPs, _ := egressReservedNames(egressName)
+	var keptPublicIPs, keptPrefixes []string
+	for _, name := range kept {
+		if containsFold(reservedPublicIPs, name) {
+			keptPublicIPs = append(keptPublicIPs, name)
+		} else {
+			keptPrefixes = append(keptPrefixes, name)
+		}
+	}
+	return egressReservedResourcesErr(egressName, keptPublicIPs, keptPrefixes)
+}
+
+// eventuallyEgressIdentityGone waits until egressIdentityGoneErr holds.
+func eventuallyEgressIdentityGone(egressName string) {
+	Eventually(func() error {
+		return egressIdentityGoneErr(egressName)
+	}, 8*time.Minute, defaultPollInterval).Should(Succeed(),
+		"egress identity %s must be unregistered and its NAT Gateway, Public IPs and prefixes deleted", egressName)
+}
+
+// egressManagedResourcesCleanedUpErr returns nil once the cluster resource group holds no numbered
+// managed Public IP ("<id>-pip-2".."<id>-pip-16", "<id>-pip-v6-2".."<id>-pip-v6-16") and no managed
+// Public IP prefix ("<id>-prefix-28".."<id>-prefix-31", "<id>-prefix-v6-124".."<id>-prefix-v6-127")
+// of any egress identity.
+//
+// These names exist only for egress identities with a configuration. The per-identity check
+// (egressIdentityGoneErr) covers only the identities a spec configured; this global check covers every
+// identity, in every spec's cleanup. Like egressIPv6PublicIPsCleanedUpErr it is global, but only a
+// resource carrying the ownership tag of the identity its name belongs to counts, since the controller
+// manages these names only with it.
+func egressManagedResourcesCleanedUpErr() error {
+	var leaked []string
+	for _, collection := range []string{"publicIPAddresses", "publicIPPrefixes"} {
+		resources, err := listAzureNetworkResources(collection)
+		if err != nil {
+			return err
+		}
+		for i := range resources {
+			if isEgressManagedLeftover(resources[i], collection == "publicIPPrefixes") {
+				leaked = append(leaked, resources[i].Name)
+			}
+		}
+	}
+	if len(leaked) > 0 {
+		sort.Strings(leaked)
+		return fmt.Errorf("managed egress Public IPs or Public IP prefixes still exist after cleanup (leaked): %v", leaked)
+	}
+	return nil
+}
+
+// isEgressManagedLeftover reports whether a Public IP, or a Public IP prefix when prefix is set, is a
+// numbered managed Public IP or a managed prefix of an egress identity: it carries the identity's
+// ownership tag under one of the identity's reserved names other than the base Public IP names
+// "<id>-pip" and "<id>-pip-v6", which the existing checks cover.
+func isEgressManagedLeftover(resource azureNetworkResource, prefix bool) bool {
+	identity := tagValue(resource.Tags, egressIdentityTagKey)
+	if identity == "" {
+		return false
+	}
+	publicIPs, prefixes := egressReservedNames(identity)
+	if prefix {
+		return containsFold(prefixes, resource.Name)
+	}
+	return containsFold(publicIPs, resource.Name) &&
+		!strings.EqualFold(resource.Name, egressManagedPublicIPName(identity, false, 1)) &&
+		!strings.EqualFold(resource.Name, egressManagedPublicIPName(identity, true, 1))
+}
+
+func TestIsEgressManagedLeftover(t *testing.T) {
+	owned := map[string]string{egressIdentityTagKey: "egi"}
+	for _, tc := range []struct {
+		name     string
+		resource string
+		tags     map[string]string
+		prefix   bool
+		want     bool
+	}{
+		{name: "numbered IPv4 Public IP", resource: "egi-pip-2", tags: owned, want: true},
+		{name: "last numbered IPv6 Public IP", resource: "egi-pip-v6-16", tags: owned, want: true},
+		{name: "IPv4 prefix", resource: "egi-prefix-31", tags: owned, prefix: true, want: true},
+		{name: "IPv6 prefix", resource: "egi-prefix-v6-124", tags: owned, prefix: true, want: true},
+		{name: "shortest IPv4 prefix", resource: "egi-prefix-28", tags: owned, prefix: true, want: true},
+		{name: "longest IPv6 prefix", resource: "egi-prefix-v6-127", tags: owned, prefix: true, want: true},
+		{name: "names and tag key in another case", resource: "EGI-PIP-3", tags: map[string]string{"K8S-Azure-Egress-Identity": "egi"}, want: true},
+		{name: "base IPv4 Public IP", resource: "egi-pip", tags: owned},
+		{name: "base IPv6 Public IP", resource: "egi-pip-v6", tags: owned},
+		{name: "base IPv4 Public IP in another case", resource: "EGI-PIP", tags: owned},
+		{name: "base IPv6 Public IP in another case", resource: "EGI-Pip-V6", tags: owned},
+		{name: "no ownership tag", resource: "egi-pip-2"},
+		{name: "another identity's tag", resource: "egi-pip-2", tags: map[string]string{egressIdentityTagKey: "other"}},
+		{name: "beyond the Public IP count", resource: "egi-pip-17", tags: owned},
+		{name: "prefix length out of range", resource: "egi-prefix-27", tags: owned, prefix: true},
+		{name: "prefix name as a Public IP", resource: "egi-prefix-31", tags: owned},
+		{name: "Public IP name as a prefix", resource: "egi-pip-2", tags: owned, prefix: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isEgressManagedLeftover(azureNetworkResource{Name: tc.resource, Tags: tc.tags}, tc.prefix); got != tc.want {
+				t.Errorf("isEgressManagedLeftover(%q, %v, prefix=%v) = %v; want %v", tc.resource, tc.tags, tc.prefix, got, tc.want)
+			}
+		})
+	}
+	// The first Public IP of each family keeps the name it had before configuration existed, and is reserved too.
+	publicIPs, _ := egressReservedNames("egi")
+	for ipv6, want := range map[bool]string{false: "egi-pip", true: "egi-pip-v6"} {
+		if got := egressManagedPublicIPName("egi", ipv6, 1); got != want || !containsFold(publicIPs, got) {
+			t.Errorf("egressManagedPublicIPName(egi, ipv6=%v, 1) = %q, reserved %v; want %q, reserved", ipv6, got, containsFold(publicIPs, got), want)
+		}
+	}
 }
 
 // verifyAzureResources verifies Public IP, Load Balancer, and Service Gateway for a given service
@@ -875,9 +1243,12 @@ func eventuallyAzureCleanup(timeout time.Duration) {
 		if err := addressLocationsCleanupErr(); err != nil {
 			return err
 		}
-		return egressIPv6PublicIPsCleanedUpErr()
+		if err := egressIPv6PublicIPsCleanedUpErr(); err != nil {
+			return err
+		}
+		return egressManagedResourcesCleanedUpErr()
 	}, timeout, defaultPollInterval).Should(Succeed(),
-		"Service Gateway, address locations and egress Public IPs should be free of test resources after cleanup")
+		"Service Gateway, address locations and egress Public IPs and prefixes should be free of test resources after cleanup")
 }
 
 // egressIPv6PublicIPsCleanedUpErr returns nil once no IPv6 egress Public IP remains in Azure.

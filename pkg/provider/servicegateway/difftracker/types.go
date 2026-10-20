@@ -18,11 +18,14 @@ package difftracker
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -70,6 +73,17 @@ const (
 	UnknownUpdateAction UpdateAction = iota
 	PartialUpdate
 	FullUpdate
+)
+
+// operationKind is the kind of run the ServiceUpdater dispatched for an operation.
+type operationKind int
+
+const (
+	operationNone                 operationKind = iota // no run in flight
+	operationCreate                                    // a creation
+	operationUpdate                                    // an update; for a managed egress identity an apply or an observe-and-clean
+	operationEgressResidueCleanup                      // the residue cleanup of a BYO egress identity
+	operationDelete                                    // a deletion
 )
 
 type SyncStatus int
@@ -121,16 +135,44 @@ type InboundConfig struct {
 	NamedTargetPorts []string
 }
 
-// OutboundConfig contains NAT Gateway configuration for outbound services
+// OutboundConfig contains NAT Gateway configuration for outbound services. A published value is never
+// modified: a change assigns a new value, and snapshots are taken with DeepCopy.
 type OutboundConfig struct {
 	// IPFamilies holds the address families this NAT Gateway must provide a public path for
 	// ("IPv4"/"IPv6"), decided once when the service is created. Empty means IPv4 only.
 	//
-	// There is no outbound update path (UpdateService returns early for a non-inbound config), so
-	// a NAT Gateway is never modified after creation and this set cannot change. It is therefore
-	// derived from the cluster's families rather than from the pods of one identity: a dual-stack
+	// It is derived from the cluster's families rather than from the pods of one identity: a dual-stack
 	// cluster can run single-stack pods, so the first pod does not predict the rest.
 	IPFamilies []string
+	// Egress is the NAT Gateway configuration: the desired one in ServiceOperationState.Config and the
+	// applied one in LastAppliedConfig.
+	Egress EgressConfig
+}
+
+// DeepCopy returns a copy of c that shares no memory with it, or nil for a nil c.
+func (c *OutboundConfig) DeepCopy() *OutboundConfig {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.IPFamilies = slices.Clone(c.IPFamilies)
+	return &out
+}
+
+// outboundEgress returns the NAT Gateway configuration of c; a nil c has the zero value.
+func outboundEgress(c *OutboundConfig) EgressConfig {
+	if c == nil {
+		return EgressConfig{}
+	}
+	return c.Egress
+}
+
+// outboundFamilies returns the IP families of c; a nil c has none, which means IPv4 only.
+func outboundFamilies(c *OutboundConfig) []string {
+	if c == nil {
+		return nil
+	}
+	return c.IPFamilies
 }
 
 // Equals returns true if two InboundConfigs describe the same desired LB shape.
@@ -242,6 +284,13 @@ type ServiceConfig struct {
 	// are empty for entries recovered from NRP without a Service object.
 	Namespace string
 	Name      string
+}
+
+// snapshot returns a copy of c with its outbound part deep-copied, so a snapshot of a published
+// configuration (dispatched, in flight or last applied) cannot change with it.
+func (c ServiceConfig) snapshot() ServiceConfig {
+	c.OutboundConfig = c.OutboundConfig.DeepCopy()
+	return c
 }
 
 // Validate checks if the ServiceConfig is valid
@@ -402,13 +451,153 @@ type ServiceOperationState struct {
 	CorrelationID string
 
 	// TriggeringPodNamespace and TriggeringPodName identify which pod triggered
-	// a NAT Gateway creation (outbound services only).
+	// a NAT Gateway creation (outbound services only). While that pod is a member of the
+	// egress identity with TriggeringPodUID, its vote seeds the creation configuration (creationConfigLocked).
 	TriggeringPodNamespace string
 	TriggeringPodName      string
+	// TriggeringPodUID is the UID of the triggering pod, so a same-name replacement pod is not taken for it.
+	// It is cleared when the identity is re-created after a completed deletion: its oldest member then seeds
+	// the creation configuration.
+	TriggeringPodUID string
 
 	// RecreateAfterDeletion is set when an UpdateService re-create arrives while the
 	// service is being deleted; the deletion-success path replays it as a fresh create.
 	RecreateAfterDeletion bool
+
+	// InFlightKind is the kind of the run the dispatcher started, recorded with InFlightConfig and
+	// Egress.DispatchedObservationGen and consumed by the run's completion, which branches on it rather than on the
+	// state the operation was moved to meanwhile. operationNone while no run is in flight.
+	InFlightKind operationKind
+
+	// Egress is what the operation of an egress identity knows about the effect of its runs on Azure.
+	Egress egressOperationState
+}
+
+// egressOperationState is what the operation of an egress identity knows about the effect of its runs on Azure.
+type egressOperationState struct {
+	// MutationStarted is set before the first Azure write of a managed outbound run, cleared on its completion.
+	MutationStarted bool
+	// NeedsObservation is set while Azure must be re-read and swept for this egress identity.
+	NeedsObservation bool
+	// ObservationGen counts how often NeedsObservation was set (requireObservation). A run clears the obligation
+	// only when the count is unchanged since its dispatch, so an obligation raised while it was in flight outlives it.
+	ObservationGen uint64
+	// DispatchedObservationGen is ObservationGen when the current or last run was dispatched.
+	DispatchedObservationGen uint64
+	// QuietUntil holds back managed outbound runs after a write whose outcome is unknown; retry resets keep it.
+	QuietUntil time.Time
+	// StartupBaseline is set by startup on an egress identity it found in Azure. Until a run decides the agreed
+	// configuration, a rejection of it is one the previous process already reported, so it is recorded without
+	// events. Cleared by that decision and by any vote change of the identity.
+	StartupBaseline bool
+	// LastKnownApplied is, while the applied configuration is egressUnknown, the one last known applied before it,
+	// which a configuration found applied later is announced against; nil when none was known, as for an identity
+	// this process adopted (4.5 rule 2).
+	LastKnownApplied *EgressConfig
+	// UnclearWrites are, while the applied configuration is egressUnknown, the configurations of the applies whose
+	// writes Azure did not answer clearly, newest first, without repeats and at most maxUnclearEgressWrites: an
+	// observation reports one the NAT Gateway satisfies, and finding one applied counts as a write of this process
+	// (4.5 rules 0 and 2).
+	UnclearWrites []EgressConfig
+}
+
+// maxUnclearEgressWrites bounds Egress.UnclearWrites. Each entry needs a write that Azure did not answer clearly and
+// the quiet period after it, so more than a few in a row before the applied configuration is known again are rare.
+const maxUnclearEgressWrites = 4
+
+// rememberUnclearWrite records cfg as the configuration of the latest apply whose write Azure did not answer clearly:
+// first in UnclearWrites, without an older repeat of it, keeping at most maxUnclearEgressWrites. It builds a new slice,
+// so a copy taken before is left as it was.
+func (e *egressOperationState) rememberUnclearWrite(cfg EgressConfig) {
+	writes := make([]EgressConfig, 0, maxUnclearEgressWrites)
+	writes = append(writes, cfg)
+	for _, w := range e.UnclearWrites {
+		if len(writes) == maxUnclearEgressWrites {
+			break
+		}
+		if w != cfg {
+			writes = append(writes, w)
+		}
+	}
+	e.UnclearWrites = writes
+}
+
+// requireObservation records that the NAT Gateway of the identity must be re-read and swept by a run. Every call is a
+// new obligation, which a run dispatched before it cannot settle.
+func (e *egressOperationState) requireObservation() {
+	e.NeedsObservation = true
+	e.ObservationGen++
+}
+
+// noteDispatched records, for the run being dispatched, the obligations raised so far: the ones it can settle.
+func (e *egressOperationState) noteDispatched() {
+	e.DispatchedObservationGen = e.ObservationGen
+}
+
+// raisedSinceDispatch reports whether an obligation was raised after the current or last run was dispatched, so that
+// the run cannot settle it.
+func (e *egressOperationState) raisedSinceDispatch() bool {
+	return e.ObservationGen != e.DispatchedObservationGen
+}
+
+// egressMode is how the NAT Gateway of an egress identity is provided.
+type egressMode int
+
+const (
+	egressModeUnknown egressMode = iota // not resolved yet: the identity's creation resolves it
+	egressModeManaged                   // created and configured by this controller
+	egressModeBYO                       // the user's NAT Gateway: only linked, accepts no configuration
+)
+
+// egressRejection is an egress configuration that was refused when it was applied.
+type egressRejection struct {
+	Config EgressConfig
+	Reason string
+	// Retryable is set when the refusal can clear without a configuration change.
+	Retryable bool
+}
+
+// egressOutcome is what an outbound run reports with its completion.
+type egressOutcome struct {
+	Mode egressMode
+	// Applied is the configuration the settled NAT Gateway satisfies; nil for BYO or when not determined.
+	Applied *EgressConfig
+	// NATWritten is set when the run's NAT Gateway PUT applied Applied, rather than finding it satisfied.
+	NATWritten bool
+	// Rejected is a refused configuration; it may come with Applied when a creation fell back to the default.
+	Rejected *egressRejection
+	// CommitUnknown is set when the run ended with a write that Azure may still apply.
+	CommitUnknown bool
+	// Swept is set when every reserved name was read settled and every needed delete was conclusive.
+	Swept bool
+}
+
+// egressPodRef identifies the pod an egress membership call is about.
+type egressPodRef struct {
+	Namespace, Name string
+	UID             types.UID
+	Created         time.Time
+}
+
+// key returns the "namespace/name" key of the pod.
+func (p egressPodRef) key() string {
+	return p.Namespace + "/" + p.Name
+}
+
+// voteFor returns vote as the pod's vote for identity: its identity, pod UID and creation time are the pod's.
+func (p egressPodRef) voteFor(identity string, vote egressVote) egressVote {
+	vote.Identity, vote.PodUID, vote.PodCreated = identity, p.UID, p.Created
+	return vote
+}
+
+// egressAddress is a pod address accepted for egress, with the node location of its IP family.
+type egressAddress struct {
+	IP, Location string
+}
+
+// valid reports whether a names both the address and its location.
+func (a egressAddress) valid() bool {
+	return a.IP != "" && a.Location != ""
 }
 
 // PendingEndpointUpdate represents endpoints waiting for their service to be created
@@ -476,6 +665,10 @@ type DiffTracker struct {
 	// Such gateways are only linked and unlinked, never created or deleted. Guarded by mu.
 	byoNATGateways map[string]string
 
+	// egress holds the votes, modes, rejections and pending pod events of the egress identities, and the members
+	// startup admitted until the pod informer reconciles them. Guarded by mu.
+	egress egressTrackerState
+
 	// Communication channels
 	serviceUpdaterTrigger   chan bool
 	locationsUpdaterTrigger chan bool
@@ -492,6 +685,9 @@ type DiffTracker struct {
 	initCompletionChecker  chan struct{}
 	pendingUpdaterTriggers int32 // Atomic counter for in-flight updater triggers
 	initCompletionOnce     sync.Once
+	// initPlanning is set while startup is still enqueueing its work: initialization cannot complete before
+	// every piece of it is enqueued, however fast the work enqueued first completes. Guarded by mu.
+	initPlanning bool
 
 	// Updater references (started during initialization, kept running)
 	serviceUpdater   *ServiceUpdater
@@ -500,6 +696,35 @@ type DiffTracker struct {
 	// logger is the component logger, backed by klog via pkg/log. It is supplied
 	// to New and enriched with WithName("difftracker").
 	logger logr.Logger
+}
+
+// egressTrackerState is what the engine knows about egress identities beyond their operations. Guarded by dt.mu.
+type egressTrackerState struct {
+	// votes holds the NAT Gateway configuration vote of every egress member pod.
+	votes *egressVotes
+	// mode, rejected and warned are keyed by egress identity: how its NAT Gateway is provided, the configuration
+	// rejected terminally for it, and the retryable rejection already warned about.
+	mode     map[string]egressMode
+	rejected map[string]egressRejection
+	warned   map[string]egressRejection
+	// pendingEvents holds the egress pod events raised before a recorder was published, oldest first, until
+	// SetEventRecorder emits them.
+	pendingEvents []egressEvent
+	// admitted holds, by pod key, trimmed copies of the pods startup admitted as members (seedEgressVotes,
+	// admittedEgressPod), until the ADD of that key reconciles them (reconcileEgressPodAdd), or until
+	// removeUnlistedEgressPods removes those whose key the pod informer's synced store, listed consistently
+	// (egressPodListOptions), does not hold.
+	admitted map[string]*v1.Pod
+}
+
+// forgetRejections forgets the rejections of identity, terminal and warned, whose configuration forget selects.
+func (e *egressTrackerState) forgetRejections(identity string, forget func(EgressConfig) bool) {
+	if rejection, ok := e.rejected[identity]; ok && forget(rejection.Config) {
+		delete(e.rejected, identity)
+	}
+	if rejection, ok := e.warned[identity]; ok && forget(rejection.Config) {
+		delete(e.warned, identity)
+	}
 }
 
 // --------------------------------------------------------------------------------

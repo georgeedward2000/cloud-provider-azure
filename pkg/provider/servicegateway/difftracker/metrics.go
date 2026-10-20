@@ -251,19 +251,6 @@ var (
 		[]string{"reason"},
 	)
 
-	// outboundServiceUpdatesSkippedTotal counts outbound (egress) service updates that the updater
-	// drops because there is no NRP update operation for an egress identity. The service keeps its
-	// previously applied Azure configuration, so this is the only signal that a requested outbound
-	// spec change was not applied.
-	outboundServiceUpdatesSkippedTotal = metrics.NewCounter(
-		&metrics.CounterOpts{
-			Subsystem:      diffTrackerSubsystem,
-			Name:           "outbound_service_updates_skipped_total",
-			Help:           "Total count of outbound service updates dropped because they cannot be applied",
-			StabilityLevel: metrics.ALPHA,
-		},
-	)
-
 	// initializationDurationSeconds reports how long SLB controller initialization took.
 	initializationDurationSeconds = metrics.NewGauge(
 		&metrics.GaugeOpts{
@@ -365,7 +352,6 @@ func RegisterMetrics() {
 		legacyregistry.MustRegister(podFinalizerAddFailedTotal)
 		legacyregistry.MustRegister(podFinalizerRemoveFailedTotal)
 		legacyregistry.MustRegister(serviceOperationsParkedTotal)
-		legacyregistry.MustRegister(outboundServiceUpdatesSkippedTotal)
 		legacyregistry.MustRegister(locationSyncTerminalErrorsTotal)
 		legacyregistry.MustRegister(locationSyncAbandonedTotal)
 		legacyregistry.MustRegister(deleteSubstepFailuresTotal)
@@ -587,12 +573,6 @@ func operationLabelForState(state ResourceState) string {
 	default:
 		return "create"
 	}
-}
-
-// recordOutboundServiceUpdateSkipped counts an outbound service update that was dropped because it
-// cannot be applied to an existing egress identity.
-func recordOutboundServiceUpdateSkipped() {
-	outboundServiceUpdatesSkippedTotal.Inc()
 }
 
 // recordInitializationDuration records how long initialization took

@@ -20,16 +20,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
@@ -1083,12 +1093,17 @@ func TestReconcileEgressPodUpdate_SolePodIPReplacementKeepsNATGateway(t *testing
 func TestEgressPodUpdateActions(t *testing.T) {
 	now := metav1.Now()
 
+	idle := func(minutes string) map[string]string {
+		return map[string]string{consts.PodAnnotationServiceEgressGatewayIdleTimeout: minutes}
+	}
+
 	tests := []struct {
 		name       string
 		oldPod     *v1.Pod
 		newPod     *v1.Pod
 		wantRemove bool
 		wantAdd    bool
+		wantVote   bool
 	}{
 		{
 			name:       "Label change from A to B with IPs",
@@ -1207,13 +1222,86 @@ func TestEgressPodUpdateActions(t *testing.T) {
 			newPod:  newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
 			wantAdd: true,
 		},
+		{
+			name:     "Egress annotations alone change: the vote is replaced",
+			oldPod:   newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:   withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), idle("10")),
+			wantVote: true,
+		},
+		{
+			name:     "Egress annotation value changes on a Pending pod with IPs",
+			oldPod:   withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodPending, nil), idle("10")),
+			newPod:   withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodPending, nil), idle("20")),
+			wantVote: true,
+		},
+		{
+			name:     "Egress annotations removed: the pod votes for the default",
+			oldPod:   withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), idle("10")),
+			newPod:   newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			wantVote: true,
+		},
+		{
+			name:     "Egress label value changes case only while the annotations change: same identity, vote replaced",
+			oldPod:   newTestPod("default", "test", "Egress-A", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:   withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), idle("10")),
+			wantVote: true,
+		},
+		{
+			name:   "Other annotations change: nothing to do",
+			oldPod: newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod: withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+				map[string]string{"example.com/other": "x", "kubernetes.azure.com/other": "y"}),
+		},
+		{
+			name:       "Egress annotations change with the addresses: the re-registration carries the vote",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.2", "10.0.1.2", v1.PodRunning, nil), idle("10")),
+			wantRemove: true,
+			wantAdd:    true,
+		},
+		{
+			name:       "Egress annotations change with a label move: the move carries the vote",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     withAnnotations(newTestPod("default", "test", "egress-b", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), idle("10")),
+			wantRemove: true,
+			wantAdd:    true,
+		},
+		{
+			name:       "Egress annotations change as the pod becomes invalid: the removal withdraws the vote",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod:     withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil), idle("10")),
+			wantRemove: true,
+		},
+		{
+			name:    "Egress annotations change as the pod regains validity: the add carries the vote",
+			oldPod:  newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodUnknown, nil),
+			newPod:  withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), idle("10")),
+			wantAdd: true,
+		},
+		{
+			name:   "Egress annotations change on a pod without IPs: no member, nothing to do",
+			oldPod: newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil),
+			newPod: withAnnotations(newTestPod("default", "test", "egress-a", "", "", v1.PodPending, nil), idle("10")),
+		},
+		{
+			name:       "Egress annotations change on an invalid pod with IPs: the idempotent removal, no vote",
+			oldPod:     newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil),
+			newPod:     withAnnotations(newTestPod("default", "test", "egress-a", "10.0.0.1", "10.0.1.1", v1.PodFailed, nil), idle("10")),
+			wantRemove: true,
+		},
+		{
+			name:   "Egress annotations change on a pod without an egress label value: nothing to do",
+			oldPod: newTestPod("default", "test", "", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil),
+			newPod: withAnnotations(newTestPod("default", "test", "", "10.0.0.1", "10.0.1.1", v1.PodRunning, nil), idle("10")),
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			needsRemove, needsAdd, _ := egressPodUpdateActions(tt.oldPod, tt.newPod)
+			needsRemove, needsAdd, needsVote, _ := egressPodUpdateActions(tt.oldPod, tt.newPod)
 			assert.Equal(t, tt.wantRemove, needsRemove, "needsRemove")
 			assert.Equal(t, tt.wantAdd, needsAdd, "needsAdd")
+			assert.Equal(t, tt.wantVote, needsVote, "needsVote")
 		})
 	}
 }
@@ -1238,14 +1326,16 @@ func TestEgressPodUpdateActions_NodeLocationChange(t *testing.T) {
 	}
 
 	t.Run("secondary-family node IP change re-registers", func(t *testing.T) {
-		needsRemove, needsAdd, _ := egressPodUpdateActions(dsPod(v6NodeOld), dsPod(v6NodeNew))
+		needsRemove, needsAdd, needsVote, _ := egressPodUpdateActions(dsPod(v6NodeOld), dsPod(v6NodeNew))
 		assert.True(t, needsRemove)
 		assert.True(t, needsAdd)
+		assert.False(t, needsVote, "the re-registration carries the vote")
 	})
 	t.Run("secondary-family node IP appearing re-registers", func(t *testing.T) {
-		needsRemove, needsAdd, _ := egressPodUpdateActions(dsPod(""), dsPod(v6NodeNew))
+		needsRemove, needsAdd, needsVote, _ := egressPodUpdateActions(dsPod(""), dsPod(v6NodeNew))
 		assert.True(t, needsRemove)
 		assert.True(t, needsAdd)
+		assert.False(t, needsVote, "the re-registration carries the vote")
 	})
 }
 func TestPodInformerDeleteFunc(t *testing.T) {
@@ -1553,53 +1643,1573 @@ func TestPodInformerRemovePod_ReleasesFinalizerWhenLabelValueEmptied(t *testing.
 }
 
 // TestPodInformerRemovePod_QueuesRetryWhenFinalizerRemovalFails pins that a transient apiserver
-// error on a direct finalizer removal is retried rather than lost.
+// error on a direct finalizer removal is retried rather than lost, for a labelled pod without IPs and
+// for a pod whose egress label value was emptied: a finalizer-only record pinned to the pod's UID, for
+// the pod's identity (none without a label value), which the next pending-deletion check retries.
 //
 // These paths run only once the engine has proved there is nothing to drain, so no pending record
 // exists and the informer will not re-drive the pod: a resync delivers an unchanged object and is
 // skipped. Without a queued record the pod stays Terminating until the CCM restarts, blocking node
 // drain and namespace deletion. The successful removal is the control: it must queue nothing.
 func TestPodInformerRemovePod_QueuesRetryWhenFinalizerRemovalFails(t *testing.T) {
-	newPodObj := func() *v1.Pod {
-		return &v1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "egress-pod", Namespace: "default", UID: types.UID("pod-uid"),
-				Labels:            map[string]string{consts.PodLabelServiceEgressGateway: "team-egress"},
-				Finalizers:        []string{ServiceGatewayPodCleanupFinalizer},
-				DeletionTimestamp: ptr.To(metav1.Now()),
+	for _, tc := range []struct {
+		name, label string
+		// status is the pod's status: no IPs for the labelled pod, so the engine takes the "nothing to drain" path.
+		status v1.PodStatus
+	}{
+		{name: "labelled pod without IPs", label: "team-egress", status: v1.PodStatus{Phase: v1.PodRunning}},
+		{name: "pod whose egress label value was emptied",
+			status: v1.PodStatus{Phase: v1.PodRunning, PodIP: "10.244.0.5", HostIP: "10.0.0.1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "egress-pod", Namespace: "default", UID: types.UID("pod-uid"),
+					Labels:            map[string]string{consts.PodLabelServiceEgressGateway: tc.label},
+					Finalizers:        []string{ServiceGatewayPodCleanupFinalizer},
+					DeletionTimestamp: ptr.To(metav1.Now()),
+				},
+				Status: tc.status,
+			}
+			run := func(t *testing.T, removalFails bool) (*DiffTracker, *fake.Clientset, *atomic.Bool) {
+				t.Helper()
+				kube := fake.NewSimpleClientset(pod.DeepCopy())
+				failing := &atomic.Bool{}
+				failing.Store(removalFails)
+				kube.PrependReactor("update", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return failing.Load(), nil, errors.New("apiserver unavailable")
+				})
+				dt := newTestDiffTracker()
+				dt.kubeClient = kube
+				dt.podInformerRemovePod(pod.DeepCopy())
+				return dt, kube, failing
+			}
+
+			failed, kube, failing := run(t, true)
+			failed.mu.Lock()
+			pending, queued := failed.pendingPodDeletions["default/egress-pod"]
+			failed.mu.Unlock()
+			if !assert.True(t, queued, "a failed finalizer removal must be queued for retry, not dropped") {
+				return
+			}
+			assert.Equal(t, &PendingPodDeletion{Namespace: "default", Name: "egress-pod", UID: "pod-uid", ServiceUID: tc.label,
+				Timestamp: pending.Timestamp}, pending, "a finalizer-only record pinned to the pod UID, never waiting on a drain")
+			assert.True(t, apiHasFinalizer(t, kube, pod))
+
+			failing.Store(false)
+			assert.False(t, failed.CheckPendingPodDeletions(context.Background()), "the retry completes")
+			assert.False(t, apiHasFinalizer(t, kube, pod), "the retry removes the finalizer")
+			assert.False(t, failed.HasPendingPodDeletion("default", "egress-pod", ""), "and the record")
+
+			ok, _, _ := run(t, false)
+			assert.False(t, ok.HasPendingPodDeletion("default", "egress-pod", ""), "control: a successful removal queues nothing")
+		})
+	}
+}
+
+// ================================================================================================
+// Egress membership (3.2) and the pod events that change it, each one engine call (4.1)
+// ================================================================================================
+
+// membershipNodeV6 is the IPv6 address of the dual-stack node memberNode of the membership pods.
+const membershipNodeV6 = "fd00::a"
+
+// withAnnotations sets the annotations of pod and returns it.
+func withAnnotations(pod *v1.Pod, annotations map[string]string) *v1.Pod {
+	pod.Annotations = annotations
+	return pod
+}
+
+// podWith returns a copy of pod changed by mutate.
+func podWith(pod *v1.Pod, mutate func(*v1.Pod)) *v1.Pod {
+	changed := pod.DeepCopy()
+	mutate(changed)
+	return changed
+}
+
+// onIPv4OnlyNode moves pod to a node that exposes only its IPv4 address.
+func onIPv4OnlyNode(pod *v1.Pod) {
+	pod.Status.HostIPs = []v1.HostIP{{IP: pod.Status.HostIP}}
+}
+
+// membershipPod returns the Running egress pod ns/<name> of memberPod(name) (its UID and creation time) labelled
+// egress, carrying the cleanup finalizer and the egress annotations ann, on the dual-stack node memberNode, with the
+// addresses ips (memberIP(name) when none).
+func membershipPod(name, egress string, ann map[string]string, ips ...string) *v1.Pod {
+	ref := memberPod(name)
+	if len(ips) == 0 {
+		ips = []string{memberIP(ref)}
+	}
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ref.Namespace, Name: ref.Name, UID: ref.UID, CreationTimestamp: metav1.NewTime(ref.Created),
+			Labels:      map[string]string{consts.PodLabelServiceEgressGateway: egress},
+			Annotations: ann,
+			Finalizers:  []string{ServiceGatewayPodCleanupFinalizer},
+		},
+		Status: v1.PodStatus{Phase: v1.PodRunning, HostIP: memberNode,
+			HostIPs: []v1.HostIP{{IP: memberNode}, {IP: membershipNodeV6}}},
+	}
+	return withPodIPs(pod, ips...)
+}
+
+// annotationsA, annotationsB and invalidAnnotations are egress annotations voting for consensusA, for consensusB
+// and invalidly, on an identity whose NAT Gateway serves IPv4 only.
+func annotationsA() map[string]string {
+	return map[string]string{
+		consts.PodAnnotationServiceEgressGatewayIdleTimeout:   "10",
+		consts.PodAnnotationServiceEgressGatewayPublicIPCount: "2",
+	}
+}
+
+func annotationsB() map[string]string {
+	return map[string]string{
+		consts.PodAnnotationServiceEgressGatewayIdleTimeout:          "20",
+		consts.PodAnnotationServiceEgressGatewayPublicIPPrefixLength: "31",
+	}
+}
+
+func invalidAnnotations() map[string]string {
+	return map[string]string{consts.PodAnnotationServiceEgressGatewayIdleTimeout: "ten"}
+}
+
+// podEventsRecorder records the events emitted on pods as "<reason> <namespace>/<name>".
+type podEventsRecorder struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (r *podEventsRecorder) Event(object runtime.Object, _, reason, _ string) {
+	name := "?"
+	if accessor, err := meta.Accessor(object); err == nil {
+		name = accessor.GetNamespace() + "/" + accessor.GetName()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, reason+" "+name)
+}
+
+func (r *podEventsRecorder) Eventf(object runtime.Object, eventType, reason, messageFmt string, args ...interface{}) {
+	r.Event(object, eventType, reason, fmt.Sprintf(messageFmt, args...))
+}
+
+func (r *podEventsRecorder) AnnotatedEventf(object runtime.Object, _ map[string]string, eventType, reason, messageFmt string, args ...interface{}) {
+	r.Eventf(object, eventType, reason, messageFmt, args...)
+}
+
+// take returns the events recorded since the last call.
+func (r *podEventsRecorder) take() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	events := r.events
+	r.events = nil
+	return events
+}
+
+// newMembershipTracker returns a real engine on a fake API server holding pods, whose egress identity
+// memberIdentity is a created managed one, in NRP, with the IPv4 default configuration applied, and the recorder of
+// the events it emits.
+func newMembershipTracker(t *testing.T, pods ...*v1.Pod) (*DiffTracker, *fake.Clientset, *podEventsRecorder) {
+	t.Helper()
+	objects := make([]runtime.Object, 0, len(pods))
+	for _, pod := range pods {
+		objects = append(objects, pod.DeepCopy())
+	}
+	kube := fake.NewSimpleClientset(objects...)
+	dt := seededDT(t, gomock.NewController(t), kube,
+		K8sState{Services: utilsets.NewString(), Egresses: utilsets.NewString(), Nodes: map[string]Node{}},
+		NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(), Locations: map[string]NRPLocation{}})
+	trackManagedEgressIdentity(dt, memberIdentity, consensusApplied)
+	recorder := &podEventsRecorder{}
+	dt.SetEventRecorder(recorder)
+	return dt, kube, recorder
+}
+
+// egressAddressesOf returns the addresses of identity, live or buffered, as "address@location", sorted.
+func egressAddressesOf(dt *DiffTracker, identity string) []string {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	var addresses []string
+	for location, node := range dt.K8sResources.Nodes {
+		for address, pod := range node.Pods {
+			if pod.PublicOutboundIdentity != "" && strings.EqualFold(pod.PublicOutboundIdentity, identity) {
+				addresses = append(addresses, address+"@"+location)
+			}
+		}
+	}
+	for _, pod := range dt.pendingPods[identity] {
+		addresses = append(addresses, pod.Address+"@"+pod.Location)
+	}
+	slices.Sort(addresses)
+	return addresses
+}
+
+// noEgressOperation is the state egressStateOf reports for an identity without an operation.
+const noEgressOperation ResourceState = -1
+
+// egressStateOf returns the state of the operation of identity; noEgressOperation without one.
+func egressStateOf(dt *DiffTracker, identity string) ResourceState {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	if op, ok := dt.pendingServiceOps[identity]; ok {
+		return op.State
+	}
+	return noEgressOperation
+}
+
+// egressVoteView is what a test compares of a registered vote: the parse error only as present or not.
+type egressVoteView struct {
+	Identity       string
+	Config         EgressConfig
+	Invalid        bool
+	HasAnnotations bool
+	PodUID         types.UID
+	PodCreated     time.Time
+}
+
+// registeredVoteOf returns the registered vote of the pod podKey.
+func registeredVoteOf(dt *DiffTracker, podKey string) (egressVoteView, bool) {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	vote, ok := dt.egress.votes.get(podKey)
+	if !ok {
+		return egressVoteView{}, false
+	}
+	return egressVoteView{Identity: vote.Identity, Config: vote.Config, Invalid: vote.Invalid != "",
+		HasAnnotations: vote.HasAnnotations, PodUID: vote.PodUID, PodCreated: vote.PodCreated}, true
+}
+
+// expectedVote returns the vote view of the membership pod name for identity: cfg, or invalid when cfg is nil.
+func expectedVote(name, identity string, cfg *EgressConfig, hasAnnotations bool) egressVoteView {
+	ref := memberPod(name)
+	view := egressVoteView{Identity: identity, Invalid: cfg == nil, HasAnnotations: hasAnnotations, PodUID: ref.UID, PodCreated: ref.Created}
+	if cfg != nil {
+		view.Config = *cfg
+	}
+	return view
+}
+
+// apiHasFinalizer reports whether the API server's pod still carries the cleanup finalizer.
+func apiHasFinalizer(t *testing.T, kube *fake.Clientset, pod *v1.Pod) bool {
+	t.Helper()
+	got, err := kube.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+	if !assert.NoError(t, err) {
+		return false
+	}
+	return hasFinalizer(got.Finalizers, ServiceGatewayPodCleanupFinalizer)
+}
+
+// TestEgressMembership pins the membership predicate (3.2): the identity is the lower-cased label value and the
+// accepted addresses are the pod's addresses whose IP family has a node location, so a partial dual-stack pod keeps
+// the families that have one; the pod is a member iff one is accepted.
+func TestEgressMembership(t *testing.T) {
+	base := func(mutate func(*v1.Pod)) *v1.Pod {
+		return podWith(membershipPod("p1", memberIdentity, nil, "10.244.1.1"), mutate)
+	}
+	v4 := egressAddress{IP: "10.244.1.1", Location: memberNode}
+	v6 := egressAddress{IP: "fd00::1", Location: membershipNodeV6}
+	now := metav1.Now()
+
+	cases := []struct {
+		name         string
+		pod          *v1.Pod
+		wantIdentity string
+		wantAccepted []egressAddress
+		wantReason   string // a substring; empty: no reason
+	}{
+		{name: "a Running pod is a member with its address under its node", pod: base(func(*v1.Pod) {}),
+			wantIdentity: memberIdentity, wantAccepted: []egressAddress{v4}},
+		{name: "a Pending pod with addresses is a member", pod: base(func(p *v1.Pod) { p.Status.Phase = v1.PodPending }),
+			wantIdentity: memberIdentity, wantAccepted: []egressAddress{v4}},
+		{name: "the identity is the label value, lower-cased",
+			pod:          base(func(p *v1.Pod) { p.Labels[consts.PodLabelServiceEgressGateway] = "Team-EGRESS" }),
+			wantIdentity: "team-egress", wantAccepted: []egressAddress{v4}},
+		{name: "a dual-stack pod on a dual-stack node is a member with both families",
+			pod:          base(func(p *v1.Pod) { withPodIPs(p, "10.244.1.1", "fd00::1") }),
+			wantIdentity: memberIdentity, wantAccepted: []egressAddress{v4, v6}},
+		{name: "partial dual-stack: on a node without IPv6 the pod keeps its IPv4 family",
+			pod:          base(func(p *v1.Pod) { withPodIPs(p, "10.244.1.1", "fd00::1"); onIPv4OnlyNode(p) }),
+			wantIdentity: memberIdentity, wantAccepted: []egressAddress{v4}, wantReason: `No same-family node IP for pod address "fd00::1"`},
+		{name: "no address with a node location of its family: no member",
+			pod:          base(func(p *v1.Pod) { withPodIPs(p, "fd00::1"); onIPv4OnlyNode(p) }),
+			wantIdentity: memberIdentity, wantReason: `No same-family node IP for pod address "fd00::1"`},
+		{name: "addresses and node locations are canonical",
+			pod: base(func(p *v1.Pod) {
+				withPodIPs(p, "FD00:0:0:0:0:0:0:1")
+				p.Status.HostIPs = []v1.HostIP{{IP: memberNode}, {IP: "FD00:0:0:0:0:0:0:A"}}
+			}),
+			wantIdentity: memberIdentity, wantAccepted: []egressAddress{v6}},
+		{name: "a malformed address is skipped, the others are accepted",
+			pod:          base(func(p *v1.Pod) { withPodIPs(p, "10.244.1.1", "bogus") }),
+			wantIdentity: memberIdentity, wantAccepted: []egressAddress{v4}, wantReason: `Malformed PodIP "bogus"`},
+		{name: "a pod not bound to a node name but with addresses is a member",
+			pod:          base(func(p *v1.Pod) { p.Spec.NodeName = "" }),
+			wantIdentity: memberIdentity, wantAccepted: []egressAddress{v4}},
+		{name: "a pod without an egress label value is no member",
+			pod:        base(func(p *v1.Pod) { p.Labels[consts.PodLabelServiceEgressGateway] = "" }),
+			wantReason: "no egress label value"},
+		{name: "a pod without the egress label is no member", pod: base(func(p *v1.Pod) { p.Labels = nil }),
+			wantReason: "no egress label value"},
+		{name: "a pod being deleted is no member", pod: base(func(p *v1.Pod) { p.DeletionTimestamp = &now }),
+			wantIdentity: memberIdentity, wantReason: "being deleted"},
+		{name: "a Succeeded pod is no member", pod: base(func(p *v1.Pod) { p.Status.Phase = v1.PodSucceeded }),
+			wantIdentity: memberIdentity, wantReason: "phase Succeeded"},
+		{name: "a Failed pod is no member", pod: base(func(p *v1.Pod) { p.Status.Phase = v1.PodFailed }),
+			wantIdentity: memberIdentity, wantReason: "phase Failed"},
+		{name: "a pod in phase Unknown is no member", pod: base(func(p *v1.Pod) { p.Status.Phase = v1.PodUnknown }),
+			wantIdentity: memberIdentity, wantReason: "phase Unknown"},
+		{name: "a pod without a HostIP is no member", pod: base(func(p *v1.Pod) { p.Status.HostIP = "" }),
+			wantIdentity: memberIdentity, wantReason: "no HostIP or PodIP"},
+		{name: "a pod without a PodIP is no member", pod: base(func(p *v1.Pod) { p.Status.PodIP, p.Status.PodIPs = "", nil }),
+			wantIdentity: memberIdentity, wantReason: "no HostIP or PodIP"},
+		{name: "a malformed HostIP: no member", pod: base(func(p *v1.Pod) { p.Status.HostIP = "bad-host" }),
+			wantIdentity: memberIdentity, wantReason: `Malformed HostIP "bad-host"`},
+		{name: "only malformed addresses: no member", pod: base(func(p *v1.Pod) { withPodIPs(p, "bogus") }),
+			wantIdentity: memberIdentity, wantReason: "no valid PodIP"},
+		{name: "an identity that is no valid resource name: no member",
+			pod:          base(func(p *v1.Pod) { p.Labels[consts.PodLabelServiceEgressGateway] = "../evil" }),
+			wantIdentity: "../evil", wantReason: `Invalid egress gateway label "../evil"`},
+		{name: "the reserved identity: no member",
+			pod:          base(func(p *v1.Pod) { p.Labels[consts.PodLabelServiceEgressGateway] = "Default-NatGW" }),
+			wantIdentity: "default-natgw", wantReason: `Egress gateway label "default-natgw" is reserved`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			identity, accepted, reason := egressMembership(tc.pod)
+			assert.Equal(t, tc.wantIdentity, identity, "identity")
+			assert.Equal(t, tc.wantAccepted, accepted, "accepted addresses")
+			if tc.wantReason == "" {
+				assert.Empty(t, reason)
+			} else {
+				assert.Contains(t, reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestEgressMembership_RuntimeAndStartupAgree pins that the pod informer and startup admit the same pods with the
+// same addresses and votes: both decide with egressMembership and parse the annotations alike.
+func TestEgressMembership_RuntimeAndStartupAgree(t *testing.T) {
+	now := metav1.Now()
+	pods := map[string]*v1.Pod{
+		"member voting A":                 membershipPod("p1", memberIdentity, annotationsA()),
+		"member with invalid annotations": membershipPod("p1", memberIdentity, invalidAnnotations()),
+		"member with an upper-case label": membershipPod("p1", "Team-EGRESS", nil),
+		"dual-stack member":               membershipPod("p1", memberIdentity, nil, "10.244.1.1", "fd00::1"),
+		"partial dual-stack member":       podWith(membershipPod("p1", memberIdentity, annotationsB(), "10.244.1.1", "fd00::1"), onIPv4OnlyNode),
+		"no address with a node location": podWith(membershipPod("p1", memberIdentity, nil, "fd00::1"), onIPv4OnlyNode),
+		"pod being deleted":               podWith(membershipPod("p1", memberIdentity, nil), func(p *v1.Pod) { p.DeletionTimestamp = &now }),
+		"failed pod":                      podWith(membershipPod("p1", memberIdentity, nil), func(p *v1.Pod) { p.Status.Phase = v1.PodFailed }),
+		"malformed HostIP":                podWith(membershipPod("p1", memberIdentity, nil), func(p *v1.Pod) { p.Status.HostIP = "bad" }),
+		"reserved identity":               membershipPod("p1", DefaultOutboundNATGatewayName, nil),
+		"invalid identity":                membershipPod("p1", "../evil", nil),
+	}
+	for name, pod := range pods {
+		t.Run(name, func(t *testing.T) {
+			identity, accepted, _ := egressMembership(pod)
+			var want []string
+			for _, address := range accepted {
+				want = append(want, address.IP+"@"+address.Location)
+			}
+			slices.Sort(want)
+
+			// The pod informer, on an engine whose identity is in NRP so the addresses register live.
+			runtimeTracker := seededDT(t, gomock.NewController(t), fake.NewSimpleClientset(pod.DeepCopy()),
+				K8sState{Services: utilsets.NewString(), Egresses: utilsets.NewString(), Nodes: map[string]Node{}},
+				NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(identity), Locations: map[string]NRPLocation{}})
+			runtimeTracker.podInformerAddPod(pod.DeepCopy())
+			runtimeVote, runtimeVoted := registeredVoteOf(runtimeTracker, "ns/p1")
+
+			// Startup: the listing admits the addresses and the votes are seeded once the tracker exists.
+			k8s := newK8sStateForSeeders()
+			list, err := processK8sEgresses(context.Background(), fake.NewSimpleClientset(pod.DeepCopy()), &k8s)
+			if !assert.NoError(t, err) {
+				return
+			}
+			startupTracker := seededDT(t, gomock.NewController(t), fake.NewSimpleClientset(), k8s,
+				NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(identity), Locations: map[string]NRPLocation{}})
+			startupTracker.seedEgressVotes(list)
+			startupVote, startupVoted := registeredVoteOf(startupTracker, "ns/p1")
+
+			assert.Equal(t, want, egressAddressesOf(runtimeTracker, identity), "the pod informer registers the accepted addresses")
+			assert.Equal(t, want, egressAddressesOf(startupTracker, identity), "startup admits the accepted addresses")
+			assert.Equal(t, len(accepted) > 0, runtimeVoted, "a member pod votes, at runtime")
+			assert.Equal(t, runtimeVoted, startupVoted, "a member pod votes, at startup")
+			assert.Equal(t, runtimeVote, startupVote, "the pod votes alike at runtime and at startup")
+			assert.Equal(t, len(accepted) > 0, k8s.Egresses.Has(identity), "startup desires the identity of a member")
+		})
+	}
+}
+
+// TestPodInformer_EgressMembershipRows pins every row of 4.1 through the real informer handlers: each pod event is
+// one engine call, the votes stay those of the members (I1) and the engine alone reports the events of a vote. A
+// live pod that stays an egress pod keeps its finalizer through a move or an address change, also out of every
+// identity (I12); a pod that is deleted or loses its egress label has it released once its addresses drained.
+func TestPodInformer_EgressMembershipRows(t *testing.T) {
+	const (
+		otherIdentity     = "other-egress"
+		collidingIdentity = "11111111-2222-3333-4444-555555555555"
+		label             = consts.PodLabelServiceEgressGateway
+	)
+	now := metav1.Now()
+	p1A := membershipPod("p1", memberIdentity, annotationsA())
+	p2A := membershipPod("p2", memberIdentity, annotationsA())
+	p1Address := memberIP(memberPod("p1")) + "@" + memberNode
+	p2Address := memberIP(memberPod("p2")) + "@" + memberNode
+	cfgA, cfgB := consensusA, consensusB
+	voteA := func(name, identity string) egressVoteView { return expectedVote(name, identity, &cfgA, true) }
+
+	add := func(pod *v1.Pod) func(*DiffTracker) {
+		return func(dt *DiffTracker) { dt.podInformerAddPod(pod) }
+	}
+	update := func(oldPod, newPod *v1.Pod) func(*DiffTracker) {
+		return func(dt *DiffTracker) { dt.reconcileEgressPodUpdate(oldPod, newPod) }
+	}
+	remove := func(obj interface{}) func(*DiffTracker) {
+		return func(dt *DiffTracker) {
+			if pod, ok := podFromDeleteObj(obj); ok {
+				dt.podInformerRemovePod(pod)
+			}
+		}
+	}
+	relabel := func(pod *v1.Pod, identity string) *v1.Pod {
+		return podWith(pod, func(p *v1.Pod) { p.Labels[label] = identity })
+	}
+	lostAddresses := func(pod *v1.Pod) *v1.Pod {
+		return podWith(pod, func(p *v1.Pod) { withPodIPs(p, "fd00::1"); onIPv4OnlyNode(p) })
+	}
+
+	cases := []struct {
+		name        string
+		api         []*v1.Pod // the pods of the API server; nil: p1A and p2A
+		setup       func(dt *DiffTracker)
+		members     []*v1.Pod // added through the ADD handler
+		beforeEvent func(t *testing.T, kube *fake.Clientset)
+		event       func(dt *DiffTracker)
+
+		wantVotes     map[string]egressVoteView // pod key -> registered vote; pods not listed have none
+		wantAddresses map[string][]string       // identity -> addresses, live or buffered
+		wantStates    map[string]ResourceState  // identity -> operation state
+		wantDesired   map[string]EgressConfig   // identity -> desired configuration
+		wantRecord    bool                      // ns/p1 has a finalizer-removal record
+		wantEvents    []string
+		wantFinalizer string // ns/p1 after the drains: "kept", "absent", or "" not checked
+	}{
+		{
+			name:      "a pod becomes a member: its addresses and its vote are added in one call",
+			event:     add(p1A.DeepCopy()),
+			wantVotes: map[string]egressVoteView{"ns/p1": voteA("p1", memberIdentity)}, wantAddresses: map[string][]string{memberIdentity: {p1Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantDesired: map[string]EgressConfig{memberIdentity: consensusA},
+			wantFinalizer: "kept",
+		},
+		{
+			name:          "a pod with invalid annotations is a member with an invalid vote, which the engine reports",
+			event:         add(membershipPod("p1", memberIdentity, invalidAnnotations())),
+			wantVotes:     map[string]egressVoteView{"ns/p1": expectedVote("p1", memberIdentity, nil, true)},
+			wantAddresses: map[string][]string{memberIdentity: {p1Address}}, wantStates: map[string]ResourceState{memberIdentity: StateCreated},
+			wantEvents: []string{"InvalidEgressConfig ns/p1"}, wantFinalizer: "kept",
+		},
+		{
+			name:    "a pod joining with another configuration: the engine reports the conflict",
+			members: []*v1.Pod{p1A},
+			event:   add(membershipPod("p2", memberIdentity, annotationsB())),
+			wantVotes: map[string]egressVoteView{"ns/p1": voteA("p1", memberIdentity),
+				"ns/p2": expectedVote("p2", memberIdentity, &cfgB, true)},
+			wantAddresses: map[string][]string{memberIdentity: {p1Address, p2Address}}, wantStates: map[string]ResourceState{memberIdentity: StateCreated},
+			wantEvents: []string{"EgressConfigConflict ns/p2"}, wantFinalizer: "kept",
+		},
+		{
+			name:      "the identity is the lower-cased label value",
+			event:     add(membershipPod("p1", "Team-EGRESS", annotationsA())),
+			wantVotes: map[string]egressVoteView{"ns/p1": voteA("p1", "team-egress")}, wantAddresses: map[string][]string{"team-egress": {p1Address}},
+			wantStates: map[string]ResourceState{"team-egress": StateNotStarted}, wantFinalizer: "kept",
+		},
+		{
+			name:          "a pod without an accepted address is no member: nothing is registered and it gets no finalizer",
+			api:           []*v1.Pod{podWith(p1A, func(p *v1.Pod) { p.Finalizers = nil })},
+			event:         add(podWith(lostAddresses(p1A), func(p *v1.Pod) { p.Finalizers = nil })),
+			wantAddresses: map[string][]string{memberIdentity: nil}, wantStates: map[string]ResourceState{memberIdentity: StateCreated},
+			wantEvents: []string{"ServiceGatewayNoNodeLocation ns/p1"}, wantFinalizer: "absent",
+		},
+		{
+			name:          "annotation-only update: the vote is replaced",
+			members:       []*v1.Pod{p1A},
+			event:         update(p1A, withAnnotations(p1A.DeepCopy(), annotationsB())),
+			wantVotes:     map[string]egressVoteView{"ns/p1": expectedVote("p1", memberIdentity, &cfgB, true)},
+			wantAddresses: map[string][]string{memberIdentity: {p1Address}},
+			wantStates:    map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantDesired: map[string]EgressConfig{memberIdentity: consensusB},
+			wantFinalizer: "kept",
+		},
+		{
+			name:    "annotation-only update to invalid annotations: an invalid vote, which the engine reports",
+			members: []*v1.Pod{p1A, p2A},
+			event:   update(p1A, withAnnotations(p1A.DeepCopy(), invalidAnnotations())),
+			wantVotes: map[string]egressVoteView{"ns/p1": expectedVote("p1", memberIdentity, nil, true),
+				"ns/p2": voteA("p2", memberIdentity)},
+			wantAddresses: map[string][]string{memberIdentity: {p1Address, p2Address}},
+			wantStates:    map[string]ResourceState{memberIdentity: StateCreated}, wantDesired: map[string]EgressConfig{memberIdentity: consensusApplied},
+			wantEvents: []string{"InvalidEgressConfig ns/p1"}, wantFinalizer: "kept",
+		},
+		{
+			name:      "IP change keeping accepted addresses: the pod is re-registered and keeps its vote",
+			members:   []*v1.Pod{p1A},
+			event:     update(p1A, podWith(p1A, func(p *v1.Pod) { withPodIPs(p, "10.244.1.9") })),
+			wantVotes: map[string]egressVoteView{"ns/p1": voteA("p1", memberIdentity)}, wantAddresses: map[string][]string{memberIdentity: {"10.244.1.9@" + memberNode}},
+			wantStates: map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantFinalizer: "kept",
+		},
+		{
+			name:          "IP change leaving no accepted address, sole pod: the live pod leaves and the identity is deleted",
+			members:       []*v1.Pod{p1A},
+			event:         update(p1A, lostAddresses(p1A)),
+			wantAddresses: map[string][]string{memberIdentity: nil}, wantStates: map[string]ResourceState{memberIdentity: StateDeletionPending},
+			wantFinalizer: "kept",
+		},
+		{
+			name:      "IP change leaving no accepted address, one of two pods: the identity stays",
+			members:   []*v1.Pod{p1A, p2A},
+			event:     update(p1A, lostAddresses(p1A)),
+			wantVotes: map[string]egressVoteView{"ns/p2": voteA("p2", memberIdentity)}, wantAddresses: map[string][]string{memberIdentity: {p2Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantFinalizer: "kept",
+		},
+		{
+			name:          "label move to a valid identity: the addresses and the vote move",
+			members:       []*v1.Pod{p1A},
+			event:         update(p1A, relabel(p1A, otherIdentity)),
+			wantVotes:     map[string]egressVoteView{"ns/p1": voteA("p1", otherIdentity)},
+			wantAddresses: map[string][]string{memberIdentity: nil, otherIdentity: {p1Address}},
+			wantStates:    map[string]ResourceState{memberIdentity: StateDeletionPending, otherIdentity: StateNotStarted},
+			wantFinalizer: "kept",
+		},
+		{
+			name:          "label move to an identity that is no valid name: the pod is not accepted there and its vote is withdrawn",
+			members:       []*v1.Pod{p1A},
+			event:         update(p1A, relabel(p1A, "../evil")),
+			wantAddresses: map[string][]string{memberIdentity: nil}, wantStates: map[string]ResourceState{memberIdentity: StateDeletionPending},
+			wantEvents: []string{"ServiceGatewayInvalidEgressLabel ns/p1"}, wantFinalizer: "kept",
+		},
+		{
+			name:          "label move with no accepted address left: the vote is withdrawn",
+			members:       []*v1.Pod{p1A},
+			event:         update(p1A, lostAddresses(relabel(p1A, otherIdentity))),
+			wantAddresses: map[string][]string{memberIdentity: nil, otherIdentity: nil},
+			wantStates:    map[string]ResourceState{memberIdentity: StateDeletionPending, otherIdentity: noEgressOperation},
+			wantEvents:    []string{"ServiceGatewayNoNodeLocation ns/p1"}, wantFinalizer: "kept",
+		},
+		{
+			name:          "label move to an identity colliding with an inbound service: the vote is withdrawn",
+			setup:         func(dt *DiffTracker) { trackInboundService(dt, collidingIdentity) },
+			members:       []*v1.Pod{p1A},
+			event:         update(p1A, relabel(p1A, collidingIdentity)),
+			wantAddresses: map[string][]string{memberIdentity: nil, collidingIdentity: nil},
+			wantStates:    map[string]ResourceState{memberIdentity: StateDeletionPending, collidingIdentity: StateCreated},
+			wantFinalizer: "kept",
+		},
+		{
+			name:    "label move of a pod replaced meanwhile: the add is skipped and the replaced pod's vote withdrawn",
+			members: []*v1.Pod{p1A},
+			beforeEvent: func(t *testing.T, kube *fake.Clientset) {
+				assert.NoError(t, kube.CoreV1().Pods("ns").Delete(context.Background(), "p1", metav1.DeleteOptions{}))
+				_, err := kube.CoreV1().Pods("ns").Create(context.Background(),
+					podWith(p1A, func(p *v1.Pod) { p.UID = "p1-replacement" }), metav1.CreateOptions{})
+				assert.NoError(t, err)
 			},
-			// No IPs, so the engine takes the "nothing to drain" path.
-			Status: v1.PodStatus{Phase: v1.PodRunning},
+			event:         update(p1A, relabel(p1A, otherIdentity)),
+			wantAddresses: map[string][]string{memberIdentity: nil, otherIdentity: nil},
+			wantStates:    map[string]ResourceState{memberIdentity: StateDeletionPending, otherIdentity: noEgressOperation},
+		},
+		{
+			name:          "label value removed: the pod is removed",
+			members:       []*v1.Pod{p1A},
+			event:         update(p1A, relabel(p1A, "")),
+			wantAddresses: map[string][]string{memberIdentity: nil}, wantStates: map[string]ResourceState{memberIdentity: StateDeletionPending},
+			wantRecord: true, wantFinalizer: "kept",
+		},
+		{
+			name:          "label key removed from a live pod, deleted with its last labelled state: drained",
+			members:       []*v1.Pod{p1A},
+			event:         remove(p1A.DeepCopy()),
+			wantAddresses: map[string][]string{memberIdentity: nil}, wantStates: map[string]ResourceState{memberIdentity: StateDeletionPending},
+			wantRecord: true, wantFinalizer: "kept",
+		},
+		{
+			name:          "label key removed from a live pod, deleted without the label: drained from the identity its vote names",
+			members:       []*v1.Pod{p1A},
+			event:         remove(podWith(p1A, func(p *v1.Pod) { delete(p.Labels, label) })),
+			wantAddresses: map[string][]string{memberIdentity: nil}, wantStates: map[string]ResourceState{memberIdentity: StateDeletionPending},
+			wantRecord: true, wantFinalizer: "kept",
+		},
+		{
+			name:      "label value emptied unseen, then deleted: drained from the identity its vote names",
+			members:   []*v1.Pod{p1A, p2A},
+			event:     remove(podWith(relabel(p1A, ""), func(p *v1.Pod) { p.DeletionTimestamp = &now })),
+			wantVotes: map[string]egressVoteView{"ns/p2": voteA("p2", memberIdentity)}, wantAddresses: map[string][]string{memberIdentity: {p2Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantRecord: true, wantFinalizer: "absent",
+		},
+		{
+			name:      "unlabelled delete with our finalizer of a pod that is no member: its finalizer is released at once",
+			members:   []*v1.Pod{p2A},
+			event:     remove(podWith(relabel(p1A, ""), func(p *v1.Pod) { p.DeletionTimestamp = &now })),
+			wantVotes: map[string]egressVoteView{"ns/p2": voteA("p2", memberIdentity)}, wantAddresses: map[string][]string{memberIdentity: {p2Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantFinalizer: "absent",
+		},
+		{
+			name:      "DeletedFinalStateUnknown: the pod is removed from its identity",
+			members:   []*v1.Pod{p1A, p2A},
+			event:     remove(cache.DeletedFinalStateUnknown{Key: "ns/p1", Obj: p1A.DeepCopy()}),
+			wantVotes: map[string]egressVoteView{"ns/p2": voteA("p2", memberIdentity)}, wantAddresses: map[string][]string{memberIdentity: {p2Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantRecord: true, wantFinalizer: "absent",
+		},
+		{
+			name:      "pod terminating: removed, its finalizer held until its addresses drain",
+			members:   []*v1.Pod{p1A, p2A},
+			event:     update(p1A, podWith(p1A, func(p *v1.Pod) { p.DeletionTimestamp = &now })),
+			wantVotes: map[string]egressVoteView{"ns/p2": voteA("p2", memberIdentity)}, wantAddresses: map[string][]string{memberIdentity: {p2Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantRecord: true, wantFinalizer: "absent",
+		},
+		{
+			name:      "pod regaining validity with its addresses: added again with its vote",
+			event:     update(podWith(p1A, func(p *v1.Pod) { p.Status.Phase = v1.PodUnknown }), p1A.DeepCopy()),
+			wantVotes: map[string]egressVoteView{"ns/p1": voteA("p1", memberIdentity)}, wantAddresses: map[string][]string{memberIdentity: {p1Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantFinalizer: "kept",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := tc.api
+			if api == nil {
+				api = []*v1.Pod{p1A, p2A}
+			}
+			dt, kube, recorder := newMembershipTracker(t, api...)
+			if tc.setup != nil {
+				tc.setup(dt)
+			}
+			for _, member := range tc.members {
+				assert.True(t, dt.podInformerAddPod(member.DeepCopy()), "member %s/%s", member.Namespace, member.Name)
+			}
+			recorder.take()
+			if tc.beforeEvent != nil {
+				tc.beforeEvent(t, kube)
+			}
+
+			tc.event(dt)
+
+			votes := map[string]egressVoteView{}
+			for _, podKey := range []string{"ns/p1", "ns/p2"} {
+				if vote, ok := registeredVoteOf(dt, podKey); ok {
+					votes[podKey] = vote
+				}
+			}
+			assert.Equal(t, orEmpty(tc.wantVotes), votes, "votes")
+			for identity, want := range tc.wantAddresses {
+				assert.Equal(t, want, egressAddressesOf(dt, identity), "addresses of %s", identity)
+			}
+			for identity, want := range tc.wantStates {
+				assert.Equal(t, want, egressStateOf(dt, identity), "operation of %s", identity)
+			}
+			for identity, want := range tc.wantDesired {
+				assert.Equal(t, want, desiredEgressOf(dt, identity), "desired configuration of %s", identity)
+			}
+			assert.Equal(t, tc.wantRecord, dt.HasPendingPodDeletion("ns", "p1", "p1-uid"), "finalizer-removal record of ns/p1")
+			assert.Equal(t, tc.wantEvents, recorder.take(), "events")
+			assertEgressInvariants(t, dt)
+
+			if tc.wantFinalizer != "" {
+				dt.CheckPendingPodDeletions(context.Background())
+				assert.Equal(t, tc.wantFinalizer == "kept", apiHasFinalizer(t, kube, p1A), "cleanup finalizer of ns/p1")
+			}
+		})
+	}
+}
+
+// TestPodInformer_LivePodLeavingItsIdentity pins the sole member pod whose addresses change to ones without a node
+// location of their family (1 -> 0): its identity is deleted as after any last pod, the live pod keeps its
+// finalizer, and its later deletion releases it through the removal path, whether the identity's deletion was
+// dispatched or not yet, or already completed.
+func TestPodInformer_LivePodLeavingItsIdentity(t *testing.T) {
+	now := metav1.Now()
+	member := membershipPod("p1", memberIdentity, annotationsA())
+	left := podWith(member, func(p *v1.Pod) { withPodIPs(p, "fd00::1"); onIPv4OnlyNode(p) })
+	terminating := podWith(left, func(p *v1.Pod) { p.DeletionTimestamp = &now })
+
+	cases := []struct {
+		name string
+		// deletion moves the identity's deletion on before the pod is deleted.
+		deletion func(dt *DiffTracker)
+	}{
+		{name: "the pod is deleted before the identity's deletion is dispatched", deletion: func(*DiffTracker) {}},
+		{name: "the pod is deleted while the identity's deletion is in progress", deletion: func(dt *DiffTracker) {
+			dt.pendingServiceOps[memberIdentity].State = StateDeletionInProgress
+		}},
+		{name: "the pod is deleted after the identity was deleted", deletion: func(dt *DiffTracker) {
+			delete(dt.pendingServiceOps, memberIdentity)
+			delete(dt.pendingServiceDeletions, memberIdentity)
+			dt.NRPResources.NATGateways.Delete(memberIdentity)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dt, kube, _ := newMembershipTracker(t, member)
+			assert.True(t, dt.podInformerAddPod(member.DeepCopy()))
+
+			dt.reconcileEgressPodUpdate(member, left)
+
+			assert.Equal(t, StateDeletionPending, egressStateOf(dt, memberIdentity), "the identity is deleted after its last pod")
+			assert.Empty(t, votersOf(dt), "the pod is no member")
+			assert.Empty(t, egressAddressesOf(dt, memberIdentity), "the pod's addresses are drained")
+			assert.False(t, dt.HasPendingPodDeletion("ns", "p1", ""), "a live pod gets no finalizer-removal record")
+			dt.CheckPendingPodDeletions(context.Background())
+			assert.NoError(t, dt.RemoveLastPodFinalizers(context.Background(), memberIdentity))
+			assert.True(t, apiHasFinalizer(t, kube, member), "the live pod keeps its finalizer")
+			assertEgressInvariants(t, dt)
+
+			dt.mu.Lock()
+			tc.deletion(dt)
+			dt.mu.Unlock()
+			dt.reconcileEgressPodUpdate(left, terminating)
+
+			assert.False(t, apiHasFinalizer(t, kube, member), "the pod's deletion releases its finalizer")
+			assertEgressInvariants(t, dt)
+		})
+	}
+}
+
+// TestPodInformer_PartialDualStackMemberLosingFamilies pins a dual-stack member losing the node location of one
+// family and then its last accepted address (2 -> 1 -> 0): with one family left it stays a member with its vote,
+// without the identity being scheduled for deletion; with none left it leaves the identity as a live pod; and when an
+// accepted address comes back before the deletion was dispatched, the identity is revived.
+func TestPodInformer_PartialDualStackMemberLosingFamilies(t *testing.T) {
+	dualStack := membershipPod("p1", memberIdentity, annotationsA(), "10.244.1.1", "fd00::1")
+	ipv4Left := podWith(dualStack, onIPv4OnlyNode)
+	noneLeft := podWith(ipv4Left, func(p *v1.Pod) { withPodIPs(p, "fd00::1") })
+	back := podWith(noneLeft, func(p *v1.Pod) { withPodIPs(p, "10.244.1.1") })
+
+	dt, kube, _ := newMembershipTracker(t, dualStack)
+	assert.True(t, dt.podInformerAddPod(dualStack.DeepCopy()))
+	assert.Equal(t, []string{"10.244.1.1@" + memberNode, "fd00::1@" + membershipNodeV6}, egressAddressesOf(dt, memberIdentity))
+
+	steps := []struct {
+		name          string
+		oldPod        *v1.Pod
+		newPod        *v1.Pod
+		wantAddresses []string
+		wantMember    bool
+		wantDeleted   bool
+	}{
+		{name: "2 -> 1: the IPv4 family stays", oldPod: dualStack, newPod: ipv4Left,
+			wantAddresses: []string{"10.244.1.1@" + memberNode}, wantMember: true},
+		{name: "1 -> 0: the live pod leaves the identity", oldPod: ipv4Left, newPod: noneLeft, wantDeleted: true},
+		{name: "0 -> 1 before the deletion is dispatched: the identity is revived", oldPod: noneLeft, newPod: back,
+			wantAddresses: []string{"10.244.1.1@" + memberNode}, wantMember: true},
+	}
+	for _, step := range steps {
+		dt.reconcileEgressPodUpdate(step.oldPod, step.newPod)
+
+		assert.Equal(t, step.wantAddresses, egressAddressesOf(dt, memberIdentity), "%s: addresses", step.name)
+		vote, voted := registeredVoteOf(dt, "ns/p1")
+		assert.Equal(t, step.wantMember, voted, "%s: membership", step.name)
+		if voted {
+			assert.Equal(t, expectedVote("p1", memberIdentity, &consensusA, true), vote, "%s: vote", step.name)
+		}
+		state := egressStateOf(dt, memberIdentity)
+		assert.Equal(t, step.wantDeleted, state == StateDeletionPending || state == StateDeletionInProgress, "%s: operation %s", step.name, state)
+		assert.False(t, dt.HasPendingPodDeletion("ns", "p1", ""), "%s: a live pod gets no finalizer-removal record", step.name)
+		assert.True(t, apiHasFinalizer(t, kube, dualStack), "%s: the live pod keeps its finalizer", step.name)
+		assertEgressInvariants(t, dt)
+	}
+}
+
+// TestPodInformer_VotesParsedForTheIdentitysFamilies pins the parse context of a vote: the IP families of the
+// identity's NAT Gateway, decided when its operation was created, else the cluster's, which a new operation and the
+// re-creation of an identity being deleted take, so every member of an identity votes in the same terms, when it joins
+// and when its annotations change, and pods without annotations agree on its default.
+func TestPodInformer_VotesParsedForTheIdentitysFamilies(t *testing.T) {
+	ipv4Default := defaultEgressConfig(egressParseContext{})
+	dualStackDefault := defaultEgressConfig(egressParseContext{WantsIPv6: true})
+
+	cases := []struct {
+		name string
+		// operation tracks the identity's operation; nil: none.
+		operation func(dt *DiffTracker)
+		// ipv6 is set when the votes are parsed for a NAT Gateway that serves IPv6.
+		ipv6      bool
+		wantState ResourceState
+	}{
+		{
+			name: "an identity created IPv4-only on a cluster that now has IPv6 keeps IPv4 terms",
+			operation: func(dt *DiffTracker) {
+				trackManagedEgressIdentity(dt, memberIdentity, ipv4Default).Config.OutboundConfig.IPFamilies = ipv4Families()
+			},
+			wantState: StateCreated,
+		},
+		{
+			name: "a dual-stack identity",
+			operation: func(dt *DiffTracker) {
+				trackManagedEgressIdentity(dt, memberIdentity, dualStackDefault).Config.OutboundConfig.IPFamilies = dualStackFamilies()
+			},
+			ipv6: true, wantState: StateCreated,
+		},
+		{
+			name: "an identity known only from NRP, deleted after its last pod, takes the cluster's families as its re-creation",
+			operation: func(dt *DiffTracker) {
+				dt.mu.Lock()
+				defer dt.mu.Unlock()
+				dt.markOutboundServiceForDeletionLocked(memberIdentity)
+			},
+			ipv6: true, wantState: StateDeletionPending,
+		},
+		{
+			name: "an identity created IPv4-only whose deletion is in progress takes the cluster's families, as its re-creation",
+			operation: func(dt *DiffTracker) {
+				op := trackManagedEgressIdentity(dt, memberIdentity, ipv4Default)
+				op.Config.OutboundConfig.IPFamilies = ipv4Families()
+				op.State = StateDeletionInProgress
+			},
+			ipv6: true, wantState: StateDeletionInProgress,
+		},
+		{name: "a new identity takes the cluster's families", ipv6: true, wantState: noEgressOperation},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := egressParseContext{WantsIPv6: tc.ipv6}
+			pod := membershipPod("p1", memberIdentity, nil)
+			dt := seededDT(t, gomock.NewController(t), fake.NewSimpleClientset(pod.DeepCopy()),
+				K8sState{Services: utilsets.NewString(), Egresses: utilsets.NewString(), Nodes: map[string]Node{}},
+				NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(memberIdentity), Locations: map[string]NRPLocation{}})
+			dt.seedClusterAddressFamilies(map[string][]string{"node": {memberNode, membershipNodeV6}})
+			if tc.operation != nil {
+				tc.operation(dt)
+			}
+
+			assert.True(t, dt.podInformerAddPod(pod.DeepCopy()))
+
+			vote, ok := registeredVoteOf(dt, "ns/p1")
+			assert.True(t, ok)
+			assert.Equal(t, defaultEgressConfig(pc), vote.Config)
+			assert.False(t, vote.HasAnnotations)
+			if tc.wantState != StateDeletionPending {
+				assert.Equal(t, tc.wantState, egressStateOf(dt, memberIdentity), "a pod without annotations agrees with the applied default")
+			}
+
+			dt.reconcileEgressPodUpdate(pod, withAnnotations(pod.DeepCopy(), annotationsA()))
+
+			want, _, err := parseEgressConfig(annotationsA(), pc)
+			assert.NoError(t, err)
+			vote, _ = registeredVoteOf(dt, "ns/p1")
+			assert.Equal(t, want, vote.Config, "a change of the annotations alone is parsed in the same terms")
+		})
+	}
+}
+
+// TestPodInformer_PodJoiningADeletionVotesForTheReCreation: a pod joining an identity whose deletion is in progress
+// waits for its re-creation, which takes the cluster's IP families, not those of the NAT Gateway being deleted. Its
+// vote is parsed for the re-creation's families, so the re-created identity is created with its agreed default.
+func TestPodInformer_PodJoiningADeletionVotesForTheReCreation(t *testing.T) {
+	pod := membershipPod("p1", memberIdentity, nil)
+	dt := seededDT(t, gomock.NewController(t), fake.NewSimpleClientset(pod.DeepCopy()),
+		K8sState{Services: utilsets.NewString(), Egresses: utilsets.NewString(), Nodes: map[string]Node{}},
+		NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(), Locations: map[string]NRPLocation{}})
+	dt.seedClusterAddressFamilies(map[string][]string{"node": {memberNode, membershipNodeV6}})
+	trackManagedEgressIdentity(dt, memberIdentity, defaultEgressConfig(egressParseContext{})).State = StateDeletionInProgress
+	assert.True(t, dt.podInformerAddPod(pod.DeepCopy()))
+
+	dt.OnServiceCreationComplete(memberIdentity, true, nil)
+	dispatchWithoutRunning(t, dt)
+
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	op := dt.pendingServiceOps[memberIdentity]
+	if !assert.NotNil(t, op) || !assert.Equal(t, StateCreationInProgress, op.State, "control: the identity is re-created") {
+		return
+	}
+	assert.Equal(t, dualStackFamilies(), op.Config.OutboundConfig.IPFamilies)
+	dualStackDefault := defaultEgressConfig(dt.egressParseContextFor(dualStackFamilies()))
+	agreed, ok := dt.egress.votes.agreed(memberIdentity)
+	assert.True(t, ok)
+	assert.Equal(t, dualStackDefault, agreed, "the vote is cast for the re-created identity")
+	assert.Equal(t, dualStackDefault, outboundEgress(op.InFlightConfig.OutboundConfig), "the creation configuration")
+}
+
+// ipv6ArrivingNodeLister is a Node lister whose cache starts exposing IPv6 right after its first List: that List
+// answers with the nodes it listed and returns once released, after the test added an IPv6 node.
+type ipv6ArrivingNodeLister struct {
+	corelisters.NodeLister
+	listed, release chan struct{}
+	once            sync.Once
+}
+
+func (l *ipv6ArrivingNodeLister) List(selector labels.Selector) ([]*v1.Node, error) {
+	nodes, err := l.NodeLister.List(selector)
+	l.once.Do(func() {
+		close(l.listed)
+		<-l.release
+	})
+	return nodes, err
+}
+
+// TestPodInformerAddPod_VoteParsedForTheFamiliesOfItsOperation: the Node cache starts exposing IPv6 while a pod
+// creates its identity, right after the identity's IP families were first looked up. The pod's vote is parsed in
+// the critical section that registers it, once the operation decided its families, so it is parsed for those and
+// the operation is created with it, whichever families the cluster has by then.
+func TestPodInformerAddPod_VoteParsedForTheFamiliesOfItsOperation(t *testing.T) {
+	node := func(name, ip string) *v1.Node {
+		return &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: v1.NodeStatus{Addresses: []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: ip}}}}
+	}
+	pod := membershipPod("p1", memberIdentity, nil)
+	dt := newProviderDiffTracker(t, gomock.NewController(t), fake.NewSimpleClientset(pod.DeepCopy()))
+	nodes := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	assert.NoError(t, nodes.Add(node("ipv4", memberNode)))
+	lister := &ipv6ArrivingNodeLister{NodeLister: corelisters.NewNodeLister(nodes), listed: make(chan struct{}), release: make(chan struct{})}
+	dt.SetNodeLister(lister)
+
+	added := make(chan bool)
+	go func() { added <- dt.podInformerAddPod(pod.DeepCopy()) }()
+	<-lister.listed
+	assert.NoError(t, nodes.Add(node("ipv6", membershipNodeV6)))
+	close(lister.release)
+	assert.True(t, <-added)
+
+	assert.Equal(t, dualStackFamilies(), dt.outboundIPFamilies(), "control: the cluster exposes IPv6 now")
+	dispatchWithoutRunning(t, dt)
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	op := dt.pendingServiceOps[memberIdentity]
+	if !assert.NotNil(t, op) || !assert.NotNil(t, op.InFlightConfig, "control: the creation is dispatched") {
+		return
+	}
+	want := defaultEgressConfig(dt.egressParseContextFor(op.Config.OutboundConfig.IPFamilies))
+	vote, _ := dt.egress.votes.get("ns/p1")
+	assert.Equal(t, want, vote.Config, "the vote is parsed for the families of its operation, %v", op.Config.OutboundConfig.IPFamilies)
+	assert.Equal(t, want, outboundEgress(op.InFlightConfig.OutboundConfig), "the operation is created with it")
+}
+
+// TestParseEgressVote pins the vote the pod informer casts for a pod: parsed for the IP families of its parse context
+// from the pod's egress annotations, which it keeps alone (none when the pod has none), so that the engine parses it
+// again for other families exactly as the informer parses the pod for them.
+func TestParseEgressVote(t *testing.T) {
+	ipv4 := egressParseContext{NetworkSubscription: "sub", NodeResourceGroup: "mc-rg"}
+	dual := egressParseContext{WantsIPv6: true, NetworkSubscription: "sub", NodeResourceGroup: "mc-rg"}
+	unrelated := map[string]string{"example.com/team": "a", "kubernetes.azure.com/other": "b", consts.PodLabelServiceEgressGateway: "c"}
+	with := func(annotations ...map[string]string) map[string]string {
+		merged := map[string]string{}
+		for _, a := range annotations {
+			maps.Copy(merged, a)
+		}
+		return merged
+	}
+	ipv6Settings := map[string]string{consts.PodAnnotationServiceEgressGatewayPublicIPCountIPv6: "2"}
+	unknown := map[string]string{consts.PodAnnotationServiceEgressGatewayPrefix + "bogus": "1"}
+
+	cases := []struct {
+		name            string
+		annotations     map[string]string
+		wantAnnotations map[string]string
+	}{
+		{name: "no annotations"},
+		{name: "no egress annotation", annotations: unrelated},
+		{name: "egress annotations among others", annotations: with(unrelated, annotationsA()), wantAnnotations: annotationsA()},
+		{name: "IPv6 settings", annotations: with(unrelated, ipv6Settings), wantAnnotations: ipv6Settings},
+		{name: "an unknown egress annotation, which makes the vote invalid", annotations: with(unrelated, unknown, annotationsA()),
+			wantAnnotations: with(unknown, annotationsA())},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := withAnnotations(membershipPod("p1", memberIdentity, nil), tc.annotations)
+			for _, pc := range []egressParseContext{ipv4, dual} {
+				vote := parseEgressVote(pod, pc)
+
+				assert.Equal(t, tc.wantAnnotations, vote.Annotations, "IPv6 %t: the egress annotations alone are kept", pc.WantsIPv6)
+				assert.Equal(t, pc.WantsIPv6, vote.ParsedForIPv6)
+				cfg, hasAnnotations, err := parseEgressConfig(pod.Annotations, pc)
+				assert.Equal(t, hasAnnotations, vote.HasAnnotations)
+				if err != nil {
+					assert.Equal(t, err.Error(), vote.Invalid)
+				} else {
+					assert.Empty(t, vote.Invalid)
+					assert.Equal(t, cfg, vote.Config)
+				}
+				for _, other := range []egressParseContext{ipv4, dual} {
+					assert.Equal(t, parseEgressVote(pod, other), vote.reparsed(other), "IPv6 %t, parsed again for IPv6 %t",
+						pc.WantsIPv6, other.WantsIPv6)
+				}
+			}
+		})
+	}
+}
+
+// ================================================================================================
+// Startup admission reconciled by the pod informer (4.6): the informer starts after startup admitted the members of
+// its own listing, and reconciles what became of them meanwhile
+// ================================================================================================
+
+// newAdmittedTracker returns a real engine on a fake API server holding api, whose egress identity memberIdentity is a
+// created managed one, in NRP, with the IPv4 default configuration applied, once startup admitted the members among
+// listed as InitializeFromCluster does (processK8sEgresses, seedEgressVotes), and the recorder of the events it emits.
+func newAdmittedTracker(t *testing.T, listed, api []*v1.Pod) (*DiffTracker, *fake.Clientset, *podEventsRecorder) {
+	t.Helper()
+	objects := func(pods []*v1.Pod) []runtime.Object {
+		out := make([]runtime.Object, 0, len(pods))
+		for _, pod := range pods {
+			out = append(out, pod.DeepCopy())
+		}
+		return out
+	}
+	k8s := newK8sStateForSeeders()
+	listing, err := processK8sEgresses(context.Background(), fake.NewSimpleClientset(objects(listed)...), &k8s)
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+	kube := fake.NewSimpleClientset(objects(api)...)
+	dt := seededDT(t, gomock.NewController(t), kube, k8s,
+		NRPState{LoadBalancers: utilsets.NewString(), NATGateways: utilsets.NewString(), Locations: map[string]NRPLocation{}})
+	trackManagedEgressIdentity(dt, memberIdentity, consensusApplied)
+	dt.seedEgressVotes(listing)
+	recorder := &podEventsRecorder{}
+	dt.SetEventRecorder(recorder)
+	return dt, kube, recorder
+}
+
+// registeredVotesOf returns the registered votes of the pods podKeys, by pod key; a pod without a vote is not listed.
+func registeredVotesOf(dt *DiffTracker, podKeys ...string) map[string]egressVoteView {
+	votes := map[string]egressVoteView{}
+	for _, podKey := range podKeys {
+		if vote, ok := registeredVoteOf(dt, podKey); ok {
+			votes[podKey] = vote
 		}
 	}
+	return votes
+}
 
-	run := func(t *testing.T, removalFails bool) *DiffTracker {
-		t.Helper()
-		pod := newPodObj()
-		kube := fake.NewSimpleClientset(pod)
-		if removalFails {
-			kube.PrependReactor("update", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
-				return true, nil, errors.New("apiserver unavailable")
+// TestReconcileEgressPodAdd_ReconcilesThePodStartupAdmitted pins the first ADD of a pod that startup admitted as a
+// member (4.6): the informer, which starts after startup, reports the pod as it is now, and what became of it meanwhile
+// is applied as the update from the pod as startup admitted it. A member that is no longer one (evicted, completed with
+// or without its addresses, terminating, label value emptied, no accepted address left) leaves the identity it was
+// admitted to with its vote and the addresses it was admitted with, and that identity is evaluated again; a member
+// moved to another identity leaves it too, keeping its finalizer, and joins the other one where it is a member; a
+// member whose address changed keeps only its new one; a member replaced by a same-name pod is removed before the
+// replacement, a new pod, is added, also when the replacement is gone again and is not added: no delete will report
+// the admitted pod. An unchanged member keeps its vote, raises no event and gets its cleanup finalizer.
+func TestReconcileEgressPodAdd_ReconcilesThePodStartupAdmitted(t *testing.T) {
+	now := metav1.Now()
+	p1A := membershipPod("p1", memberIdentity, annotationsA())
+	p2B := membershipPod("p2", memberIdentity, annotationsB())
+	p1IP := memberIP(memberPod("p1"))
+	p1Address := p1IP + "@" + memberNode
+	p2Address := memberIP(memberPod("p2")) + "@" + memberNode
+	cfgA, cfgB := consensusA, consensusB
+	voteA := expectedVote("p1", memberIdentity, &cfgA, true)
+	voteB := expectedVote("p2", memberIdentity, &cfgB, true)
+	relabel := func(identity string) func(*v1.Pod) {
+		return func(p *v1.Pod) { p.Labels[consts.PodLabelServiceEgressGateway] = identity }
+	}
+	withoutFinalizer := podWith(p1A, func(p *v1.Pod) { p.Finalizers = nil })
+	replacement := podWith(p1A, func(p *v1.Pod) { p.UID += "-replacement"; withPodIPs(p, "10.244.1.7") })
+	replacementVote := voteA
+	replacementVote.PodUID = replacement.UID
+	// left is the identity once ns/p1 left it: ns/p2 alone votes B, which is applied.
+	left := struct {
+		votes     map[string]egressVoteView
+		addresses map[string][]string
+		states    map[string]ResourceState
+	}{
+		votes:     map[string]egressVoteView{"ns/p2": voteB},
+		addresses: map[string][]string{memberIdentity: {p2Address}},
+		states:    map[string]ResourceState{memberIdentity: StateUpdateInProgress},
+	}
+
+	cases := []struct {
+		name     string
+		admitted *v1.Pod // ns/p1 as startup admitted it; nil: p1A
+		listed   *v1.Pod // ns/p1 as the informer first lists it, as the API server holds it
+		gone     bool    // the API server no longer holds ns/p1 when its ADD is handled
+
+		wantVotes     map[string]egressVoteView
+		wantAddresses map[string][]string // identity -> addresses, live or buffered
+		wantStates    map[string]ResourceState
+		wantDesired   EgressConfig // of memberIdentity
+		wantDrained   []string     // the addresses of the finalizer-removal record of the admitted ns/p1
+		wantEvents    []string
+		wantFinalizer bool // ns/p1 of the API server, once the drains are checked
+	}{
+		{
+			name:      "an unchanged member keeps its vote and its address and raises no event",
+			listed:    p1A,
+			wantVotes: map[string]egressVoteView{"ns/p1": voteA, "ns/p2": voteB}, wantAddresses: map[string][]string{memberIdentity: {p1Address, p2Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateCreated}, wantDesired: consensusApplied, wantFinalizer: true,
+		},
+		{
+			name:     "a member created while the CCM was down gets its cleanup finalizer and raises no event",
+			admitted: withoutFinalizer, listed: withoutFinalizer,
+			wantVotes: map[string]egressVoteView{"ns/p1": voteA, "ns/p2": voteB}, wantAddresses: map[string][]string{memberIdentity: {p1Address, p2Address}},
+			wantStates: map[string]ResourceState{memberIdentity: StateCreated}, wantDesired: consensusApplied, wantFinalizer: true,
+		},
+		{
+			// Admitted without the cleanup finalizer (created while the CCM was down): the new vote is cast by the add,
+			// which also gives the pod its finalizer.
+			name:          "a member whose egress annotations changed casts its new vote",
+			admitted:      withoutFinalizer,
+			listed:        withAnnotations(withoutFinalizer.DeepCopy(), annotationsB()),
+			wantVotes:     map[string]egressVoteView{"ns/p1": expectedVote("p1", memberIdentity, &cfgB, true), "ns/p2": voteB},
+			wantAddresses: map[string][]string{memberIdentity: {p1Address, p2Address}},
+			wantStates:    map[string]ResourceState{memberIdentity: StateUpdateInProgress}, wantDesired: consensusB, wantFinalizer: true,
+		},
+		{
+			name:      "an evicted member leaves its identity, and the vote of the member left is applied",
+			listed:    podWith(p1A, func(p *v1.Pod) { p.Status.Phase = v1.PodFailed }),
+			wantVotes: left.votes, wantAddresses: left.addresses, wantStates: left.states, wantDesired: consensusB,
+			wantDrained: []string{p1IP},
+		},
+		{
+			name: "a completed member whose addresses were cleared leaves with the addresses it was admitted with",
+			listed: podWith(p1A, func(p *v1.Pod) {
+				p.Status.Phase, p.Status.PodIP, p.Status.PodIPs = v1.PodSucceeded, "", nil
+			}),
+			wantVotes: left.votes, wantAddresses: left.addresses, wantStates: left.states, wantDesired: consensusB,
+			wantDrained: []string{p1IP},
+		},
+		{
+			name:      "a terminating member leaves its identity",
+			listed:    podWith(p1A, func(p *v1.Pod) { p.DeletionTimestamp = &now }),
+			wantVotes: left.votes, wantAddresses: left.addresses, wantStates: left.states, wantDesired: consensusB,
+			wantDrained: []string{p1IP},
+		},
+		{
+			name:      "a member whose egress label value was emptied leaves its identity",
+			listed:    podWith(p1A, relabel("")),
+			wantVotes: left.votes, wantAddresses: left.addresses, wantStates: left.states, wantDesired: consensusB,
+			wantDrained: []string{p1IP},
+		},
+		{
+			name:      "a member left without an accepted address leaves its identity as a live pod and keeps its finalizer",
+			listed:    podWith(p1A, func(p *v1.Pod) { withPodIPs(p, "fd00::1"); onIPv4OnlyNode(p) }),
+			wantVotes: left.votes, wantAddresses: left.addresses, wantStates: left.states, wantDesired: consensusB,
+			wantFinalizer: true,
+		},
+		{
+			name:          "a member moved to another identity joins it and leaves the one it was admitted to",
+			listed:        podWith(p1A, relabel(otherIdentity)),
+			wantVotes:     map[string]egressVoteView{"ns/p1": expectedVote("p1", otherIdentity, &cfgA, true), "ns/p2": voteB},
+			wantAddresses: map[string][]string{memberIdentity: {p2Address}, otherIdentity: {p1Address}},
+			wantStates:    map[string]ResourceState{memberIdentity: StateUpdateInProgress, otherIdentity: StateNotStarted},
+			wantDesired:   consensusB, wantFinalizer: true,
+		},
+		{
+			name:      "a member moved to an identity it is no member of leaves the one it was admitted to and keeps its finalizer",
+			listed:    podWith(p1A, relabel("../evil")),
+			wantVotes: left.votes, wantAddresses: left.addresses, wantStates: left.states, wantDesired: consensusB,
+			wantEvents: []string{"ServiceGatewayInvalidEgressLabel ns/p1"}, wantFinalizer: true,
+		},
+		{
+			name:          "a member whose address changed is registered with its new address only",
+			listed:        podWith(p1A, func(p *v1.Pod) { withPodIPs(p, "10.244.1.9") }),
+			wantVotes:     map[string]egressVoteView{"ns/p1": voteA, "ns/p2": voteB},
+			wantAddresses: map[string][]string{memberIdentity: {p2Address, "10.244.1.9@" + memberNode}},
+			wantStates:    map[string]ResourceState{memberIdentity: StateCreated}, wantDesired: consensusApplied, wantFinalizer: true,
+		},
+		{
+			name:          "a member replaced by a same-name pod is removed before the replacement, a new pod, is added",
+			listed:        replacement,
+			wantVotes:     map[string]egressVoteView{"ns/p1": replacementVote, "ns/p2": voteB},
+			wantAddresses: map[string][]string{memberIdentity: {p2Address, "10.244.1.7@" + memberNode}},
+			wantStates:    map[string]ResourceState{memberIdentity: StateCreated}, wantDesired: consensusApplied,
+			wantDrained: []string{p1IP}, wantEvents: []string{"EgressConfigConflict ns/p1"}, wantFinalizer: true,
+		},
+		{
+			name:   "a member replaced by a same-name pod that is gone again when added is removed all the same",
+			listed: replacement, gone: true,
+			wantVotes: left.votes, wantAddresses: left.addresses, wantStates: left.states, wantDesired: consensusB,
+			wantDrained: []string{p1IP},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			admitted := tc.admitted
+			if admitted == nil {
+				admitted = p1A
+			}
+			api := []*v1.Pod{tc.listed, p2B}
+			if tc.gone {
+				api = api[1:]
+			}
+			dt, kube, recorder := newAdmittedTracker(t, []*v1.Pod{admitted, p2B}, api)
+
+			dt.reconcileEgressPodAdd(tc.listed.DeepCopy())
+			dt.reconcileEgressPodAdd(p2B.DeepCopy())
+
+			assert.Equal(t, tc.wantVotes, registeredVotesOf(dt, "ns/p1", "ns/p2"), "votes")
+			for identity, want := range tc.wantAddresses {
+				assert.Equal(t, want, egressAddressesOf(dt, identity), "addresses of %s", identity)
+			}
+			for identity, want := range tc.wantStates {
+				assert.Equal(t, want, egressStateOf(dt, identity), "operation of %s", identity)
+			}
+			dt.mu.Lock()
+			desired := desiredEgressOf(dt, memberIdentity)
+			var drained []string
+			if record, ok := dt.pendingPodDeletions["ns/p1"]; ok && record.UID == string(admitted.UID) {
+				drained = record.Addresses
+			}
+			dt.mu.Unlock()
+			assert.Equal(t, tc.wantDesired, desired, "desired configuration of %s", memberIdentity)
+			assert.Equal(t, tc.wantDrained, drained, "finalizer-removal record of the admitted ns/p1")
+			assert.Equal(t, tc.wantEvents, recorder.take(), "events")
+			assertEgressInvariants(t, dt)
+
+			dt.CheckPendingPodDeletions(context.Background())
+			if !tc.gone {
+				assert.Equal(t, tc.wantFinalizer, apiHasFinalizer(t, kube, tc.listed), "cleanup finalizer of ns/p1")
+			}
+		})
+	}
+}
+
+// TestSetUpPodInformer_RemovesThePodsStartupAdmittedThatItDoesNotList pins the reconciliation of startup admission once
+// the informer's store holds its listing (4.6): a member that startup admitted and that the informer does not list, as
+// it was deleted or left the informer's selection before the informer started, leaves the identity it was admitted to,
+// with its vote and the addresses it was admitted with, each only where it still holds it, so the vote of the members
+// left is applied, or the identity is deleted after its last member. A same-name replacement and a new pod holding its
+// address are members and keep their votes and addresses. A pod out of the selection has its cleanup finalizer released
+// once its address drained, also when a new pod takes the address after its removal. Unchanged members raise no event,
+// and the admitted pods are forgotten.
+func TestSetUpPodInformer_RemovesThePodsStartupAdmittedThatItDoesNotList(t *testing.T) {
+	p1A := membershipPod("p1", memberIdentity, annotationsA())
+	p2B := membershipPod("p2", memberIdentity, annotationsB())
+	p1IP := memberIP(memberPod("p1"))
+	p1Address := p1IP + "@" + memberNode
+	p2Address := memberIP(memberPod("p2")) + "@" + memberNode
+	cfgA, cfgB := consensusA, consensusB
+	voteA := expectedVote("p1", memberIdentity, &cfgA, true)
+	voteB := expectedVote("p2", memberIdentity, &cfgB, true)
+	unselected := func(pod *v1.Pod) *v1.Pod {
+		return podWith(pod, func(p *v1.Pod) { delete(p.Labels, consts.PodLabelServiceEgressGateway) })
+	}
+	replacement := podWith(membershipPod("p1", memberIdentity, annotationsB()), func(p *v1.Pod) {
+		p.UID += "-replacement"
+		withPodIPs(p, "10.244.1.7")
+	})
+	replacementVote := expectedVote("p1", memberIdentity, &cfgB, true)
+	replacementVote.PodUID = replacement.UID
+	// p9 is a new pod that got the address of ns/p1.
+	p9 := membershipPod("p9", memberIdentity, annotationsB(), p1IP)
+	completed := podWith(p1A, func(p *v1.Pod) { p.Status.Phase = v1.PodSucceeded })
+	applied := consensusApplied
+
+	cases := []struct {
+		name string
+		api  []*v1.Pod // what the API server holds and the informer lists of it; startup admitted p1A and p2B
+
+		wantVotes     map[string]egressVoteView
+		wantAddresses []string // of memberIdentity
+		wantState     ResourceState
+		wantDesired   *EgressConfig // nil: not checked
+		wantEvents    []string
+		// the addresses of the finalizer-removal record of the admitted ns/p1; nil: not checked
+		wantDrained   []string
+		wantFinalizer bool // ns/p1 of the API server, once the drains are checked, when it holds one
+	}{
+		{
+			name: "unchanged members keep their votes and their addresses and raise no event",
+			api:  []*v1.Pod{p1A, p2B}, wantVotes: map[string]egressVoteView{"ns/p1": voteA, "ns/p2": voteB},
+			wantAddresses: []string{p1Address, p2Address}, wantState: StateCreated, wantDesired: &applied, wantFinalizer: true,
+		},
+		{
+			name: "a member deleted before the informer started leaves, and the vote of the member left is applied",
+			api:  []*v1.Pod{p2B}, wantVotes: map[string]egressVoteView{"ns/p2": voteB},
+			wantAddresses: []string{p2Address}, wantState: StateUpdateInProgress, wantDesired: &cfgB, wantDrained: []string{p1IP},
+		},
+		{
+			name:      "members all deleted before the informer started leave, and their identity is deleted after the last",
+			wantVotes: map[string]egressVoteView{}, wantState: StateDeletionPending,
+		},
+		{
+			name: "a member replaced by a same-name pod leaves; the replacement, with another UID, stays",
+			api:  []*v1.Pod{replacement, p2B}, wantVotes: map[string]egressVoteView{"ns/p1": replacementVote, "ns/p2": voteB},
+			wantAddresses: []string{p2Address, "10.244.1.7@" + memberNode}, wantState: StateUpdateInProgress, wantDesired: &cfgB,
+			wantFinalizer: true,
+		},
+		{
+			// ns/p9 joins once ns/p1 left: it agrees with ns/p2.
+			name: "a deleted member whose address a new pod holds leaves; the new pod keeps the address",
+			api:  []*v1.Pod{p9, p2B}, wantVotes: map[string]egressVoteView{"ns/p9": expectedVote("p9", memberIdentity, &cfgB, true), "ns/p2": voteB},
+			wantAddresses: []string{p1Address, p2Address}, wantState: StateUpdateInProgress, wantDesired: &cfgB,
+			wantDrained: []string{p1IP},
+		},
+		{
+			name: "a member out of the informer's selection leaves, and its cleanup finalizer is released once drained",
+			api:  []*v1.Pod{unselected(p1A), p2B}, wantVotes: map[string]egressVoteView{"ns/p2": voteB},
+			wantAddresses: []string{p2Address}, wantState: StateUpdateInProgress, wantDesired: &cfgB, wantDrained: []string{p1IP},
+		},
+		{
+			name:          "a completed member out of the selection leaves before a new pod takes its address, and its cleanup finalizer is released once drained",
+			api:           []*v1.Pod{unselected(completed), p9, p2B},
+			wantVotes:     map[string]egressVoteView{"ns/p9": expectedVote("p9", memberIdentity, &cfgB, true), "ns/p2": voteB},
+			wantAddresses: []string{p1Address, p2Address}, wantState: StateUpdateInProgress, wantDesired: &cfgB,
+			wantDrained: []string{p1IP},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dt, kube, recorder := newAdmittedTracker(t, []*v1.Pod{p1A, p2B}, tc.api)
+			// The handler's API reads (AddPodFinalizer) wait until SetUpPodInformer returned, so that the removal of the
+			// unlisted pods always comes before the ADDs of the members: no timing decides the events.
+			release := make(chan struct{})
+			kube.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+				<-release
+				return false, nil, nil
 			})
+			stop := make(chan struct{})
+			defer close(stop)
+
+			err := dt.SetUpPodInformer(stop)
+			close(release)
+			if !assert.NoError(t, err) {
+				return
+			}
+			// The handler processes the listing after SetUpPodInformer returned: wait until it reached the end state.
+			var events []string
+			assert.Eventually(t, func() bool {
+				events = append(events, recorder.take()...)
+				dt.mu.Lock()
+				forgotten := len(dt.egress.admitted) == 0
+				dt.mu.Unlock()
+				return forgotten && reflect.DeepEqual(tc.wantVotes, registeredVotesOf(dt, "ns/p1", "ns/p2", "ns/p9")) &&
+					slices.Equal(tc.wantAddresses, egressAddressesOf(dt, memberIdentity)) && slices.Equal(tc.wantEvents, events)
+			}, 10*time.Second, 10*time.Millisecond, "the handler processes the informer's listing")
+
+			assert.Equal(t, tc.wantVotes, registeredVotesOf(dt, "ns/p1", "ns/p2", "ns/p9"), "votes")
+			assert.Equal(t, tc.wantAddresses, egressAddressesOf(dt, memberIdentity), "addresses")
+			assert.Equal(t, tc.wantState, egressStateOf(dt, memberIdentity), "operation")
+			dt.mu.Lock()
+			if tc.wantDesired != nil {
+				assert.Equal(t, *tc.wantDesired, desiredEgressOf(dt, memberIdentity), "desired configuration")
+			}
+			assert.Empty(t, dt.egress.admitted, "the admitted pods are forgotten")
+			var drained []string
+			if record, ok := dt.pendingPodDeletions["ns/p1"]; ok && record.UID == string(p1A.UID) {
+				drained = record.Addresses
+			}
+			dt.mu.Unlock()
+			if tc.wantDrained != nil {
+				assert.Equal(t, tc.wantDrained, drained, "the removal of the admitted ns/p1 waits for its address to drain")
+			}
+			assert.Equal(t, tc.wantEvents, append(events, recorder.take()...), "events")
+			assertEgressInvariants(t, dt)
+
+			dt.CheckPendingPodDeletions(context.Background())
+			if got, err := kube.CoreV1().Pods("ns").Get(context.Background(), "p1", metav1.GetOptions{}); err == nil {
+				assert.Equal(t, tc.wantFinalizer, hasPodFinalizer(got), "cleanup finalizer of ns/p1")
+			}
+		})
+	}
+}
+
+// TestSetUpPodInformer_DoesNotWaitForTheHandler pins that startup does not wait for the informer's handler, whose ADDs
+// each read the pod from the API server (AddPodFinalizer), and that a member startup admitted that the informer's store
+// holds is left to its own ADD, however late: it is never taken for unlisted. Once its ADD came through, the unchanged
+// members keep their votes and addresses, raise no event and are forgotten.
+func TestSetUpPodInformer_DoesNotWaitForTheHandler(t *testing.T) {
+	p1A := membershipPod("p1", memberIdentity, annotationsA())
+	p2B := membershipPod("p2", memberIdentity, annotationsB())
+	cfgA, cfgB := consensusA, consensusB
+	dt, kube, recorder := newAdmittedTracker(t, []*v1.Pod{p1A, p2B}, []*v1.Pod{p1A, p2B})
+	// The handler's API reads are held until the test releases them; the informer's store syncs regardless.
+	release := make(chan struct{})
+	kube.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		<-release
+		return false, nil, nil
+	})
+	stop := make(chan struct{})
+	defer close(stop)
+
+	returned := make(chan error, 1)
+	go func() { returned <- dt.SetUpPodInformer(stop) }()
+	select {
+	case err := <-returned:
+		assert.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("SetUpPodInformer waited for the handler's API reads")
+	}
+
+	wantVotes := map[string]egressVoteView{
+		"ns/p1": expectedVote("p1", memberIdentity, &cfgA, true),
+		"ns/p2": expectedVote("p2", memberIdentity, &cfgB, true),
+	}
+	wantAddresses := []string{memberIP(memberPod("p1")) + "@" + memberNode, memberIP(memberPod("p2")) + "@" + memberNode}
+	assert.Equal(t, wantVotes, registeredVotesOf(dt, "ns/p1", "ns/p2"), "the listed members keep their votes while their ADDs wait")
+	assert.Equal(t, wantAddresses, egressAddressesOf(dt, memberIdentity), "and their addresses")
+	assert.False(t, dt.HasPendingPodDeletion("ns", "p1", ""), "ns/p1 is not removed")
+	assert.False(t, dt.HasPendingPodDeletion("ns", "p2", ""), "ns/p2 is not removed")
+
+	close(release)
+	assert.Eventually(t, func() bool {
+		dt.mu.Lock()
+		defer dt.mu.Unlock()
+		return len(dt.egress.admitted) == 0
+	}, 10*time.Second, 10*time.Millisecond, "the listed members are reconciled by their ADDs and forgotten")
+	assert.Equal(t, wantVotes, registeredVotesOf(dt, "ns/p1", "ns/p2"), "votes after the ADDs")
+	assert.Equal(t, wantAddresses, egressAddressesOf(dt, memberIdentity), "addresses after the ADDs")
+	assert.Equal(t, StateCreated, egressStateOf(dt, memberIdentity))
+	assert.Empty(t, recorder.take(), "unchanged members raise no event")
+}
+
+// TestEgressPodListOptions pins the requests of the pod informer (egressPodListOptions): each selects the pods with the
+// egress label key, and its first list, which the reflector makes with resourceVersion "0" and the API server may serve
+// from a stale watch cache, is made consistent, so that the informer's store is never older than startup's listing
+// (4.6). Any other resource version, and every other option, is kept as the reflector set it.
+func TestEgressPodListOptions(t *testing.T) {
+	timeout := ptr.To[int64](300)
+	cases := []struct {
+		name                string
+		options             metav1.ListOptions // as the reflector sets them
+		wantResourceVersion string             // "": a consistent read
+	}{
+		{
+			name:    "the first list, from resourceVersion 0, is made consistent",
+			options: metav1.ListOptions{ResourceVersion: "0", Limit: 500},
+		},
+		{
+			name:    "a consistent list, once a resource version was unavailable, is kept",
+			options: metav1.ListOptions{Limit: 500},
+		},
+		{
+			name:                "a relist from the last resource version seen is kept",
+			options:             metav1.ListOptions{ResourceVersion: "123"},
+			wantResourceVersion: "123",
+		},
+		{
+			name:    "a continued list is kept",
+			options: metav1.ListOptions{Continue: "next", Limit: 500},
+		},
+		{
+			name:                "a watch from the resource version of the list is kept",
+			options:             metav1.ListOptions{ResourceVersion: "123", AllowWatchBookmarks: true, TimeoutSeconds: timeout},
+			wantResourceVersion: "123",
+		},
+		{
+			name: "a watch list, which starts from a consistent snapshot, is kept",
+			options: metav1.ListOptions{ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+				SendInitialEvents: ptr.To(true), AllowWatchBookmarks: true, TimeoutSeconds: timeout},
+		},
+		{
+			name: "a watch list from the last resource version seen is kept",
+			options: metav1.ListOptions{ResourceVersion: "123", ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+				SendInitialEvents: ptr.To(true), AllowWatchBookmarks: true, TimeoutSeconds: timeout},
+			wantResourceVersion: "123",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := *tc.options.DeepCopy()
+			egressPodListOptions(&got)
+
+			want := *tc.options.DeepCopy()
+			want.LabelSelector = consts.PodLabelServiceEgressGateway
+			want.ResourceVersion = tc.wantResourceVersion
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+// TestSetUpPodInformer_ListsConsistently pins that the first list of the pod informer, which the reflector makes with
+// resourceVersion "0", reaches the API server as a consistent list of the pods with the egress label key
+// (egressPodListOptions), so that the informer's store is never older than startup's listing (4.6).
+func TestSetUpPodInformer_ListsConsistently(t *testing.T) {
+	dt, kube, _ := newAdmittedTracker(t, nil, nil)
+	kube.ClearActions()
+	stop := make(chan struct{})
+	defer close(stop)
+
+	if !assert.NoError(t, dt.SetUpPodInformer(stop)) {
+		return
+	}
+
+	var lists []metav1.ListOptions
+	for _, action := range kube.Actions() {
+		if list, ok := action.(k8stesting.ListActionImpl); ok && list.Matches("list", "pods") {
+			lists = append(lists, list.ListOptions)
 		}
-		dt := newTestDiffTracker()
-		dt.kubeClient = kube
-		dt.podInformerRemovePod(pod)
-		return dt
 	}
-
-	failed := run(t, true)
-	failed.mu.Lock()
-	pending, queued := failed.pendingPodDeletions["default/egress-pod"]
-	failed.mu.Unlock()
-	if assert.True(t, queued, "a failed finalizer removal must be queued for retry, not dropped") {
-		assert.Equal(t, "pod-uid", pending.UID, "the record must pin the pod UID so a replacement is not stripped")
-		assert.False(t, pending.IsLastPod, "a finalizer-only retry must not wait on a NAT Gateway deletion")
+	if assert.NotEmpty(t, lists, "the pod informer lists the pods") {
+		assert.Equal(t, consts.PodLabelServiceEgressGateway, lists[0].LabelSelector, "label selector of its first list")
+		assert.Empty(t, lists[0].ResourceVersion, "resource version of its first list: a consistent read")
 	}
+}
 
-	ok := run(t, false)
-	ok.mu.Lock()
-	_, queuedOnSuccess := ok.pendingPodDeletions["default/egress-pod"]
-	ok.mu.Unlock()
-	assert.False(t, queuedOnSuccess, "control: a successful removal queues nothing")
+// TestRemoveUnlistedEgressPods pins the removal of the members startup admitted that the informer's store does not
+// hold, by itself: a dual-stack member leaves its identity with both its addresses, and the removal of its finalizer
+// waits for both to drain; a member out of the selection whose address a new pod holds has nothing to drain: its
+// finalizer-only record, of the pod as admitted, triggers the LocationsUpdater, which alone checks the pending
+// deletions, and the check releases its cleanup finalizer. A member the store holds is left to its ADD.
+func TestRemoveUnlistedEgressPods(t *testing.T) {
+	p1IP := memberIP(memberPod("p1"))
+	p2B := membershipPod("p2", memberIdentity, annotationsB())
+	p2Address := memberIP(memberPod("p2")) + "@" + memberNode
+	onlyP2 := func(podKey string) bool { return podKey == "ns/p2" }
+
+	t.Run("a dual-stack member leaves with both its addresses", func(t *testing.T) {
+		p1 := membershipPod("p1", memberIdentity, annotationsA(), p1IP, "fd00::1")
+		dt, _, _ := newAdmittedTracker(t, []*v1.Pod{p1, p2B}, nil)
+
+		dt.removeUnlistedEgressPods(onlyP2)
+
+		assert.Equal(t, []string{p2Address}, egressAddressesOf(dt, memberIdentity), "addresses")
+		dt.mu.Lock()
+		defer dt.mu.Unlock()
+		if record := dt.pendingPodDeletions["ns/p1"]; assert.NotNil(t, record, "finalizer-removal record of ns/p1") {
+			assert.ElementsMatch(t, []string{p1IP, "fd00::1"}, record.Addresses, "it waits for both addresses to drain")
+		}
+		assert.Equal(t, []string{"ns/p2"}, slices.Collect(maps.Keys(dt.egress.admitted)), "ns/p2 is left to its ADD")
+	})
+
+	t.Run("a member with nothing to drain has its cleanup finalizer released by its finalizer-only record", func(t *testing.T) {
+		p1A := membershipPod("p1", memberIdentity, annotationsA())
+		// ns/p1 left the informer's selection, and ns/p9, a new pod, holds its address.
+		unselected := podWith(p1A, func(p *v1.Pod) { delete(p.Labels, consts.PodLabelServiceEgressGateway) })
+		p9 := membershipPod("p9", memberIdentity, annotationsB(), p1IP)
+		dt, kube, _ := newAdmittedTracker(t, []*v1.Pod{p1A, p2B}, []*v1.Pod{unselected, p9, p2B})
+		dt.reconcileEgressPodAdd(p9)
+		drainTrigger(dt.locationsUpdaterTrigger)
+
+		dt.removeUnlistedEgressPods(onlyP2)
+
+		dt.mu.Lock()
+		record := dt.pendingPodDeletions["ns/p1"]
+		dt.mu.Unlock()
+		if assert.NotNil(t, record, "finalizer-removal record of ns/p1") {
+			want := PendingPodDeletion{Namespace: "ns", Name: "p1", UID: string(p1A.UID), ServiceUID: memberIdentity,
+				Timestamp: record.Timestamp}
+			assert.Equal(t, want, *record, "a ready record of ns/p1 as admitted, with nothing to drain")
+		}
+		assert.Len(t, dt.locationsUpdaterTrigger, 1, "the LocationsUpdater checks the record")
+
+		dt.CheckPendingPodDeletions(context.Background())
+		assert.False(t, apiHasFinalizer(t, kube, unselected), "the check releases the cleanup finalizer of ns/p1")
+	})
+}
+
+// TestReconcileEgressPodAdd_UnchangedDualStackMemberKeepsItsAddresses pins that the first ADD of an unchanged dual-stack
+// member startup admitted is no change: both its addresses stay registered throughout, also while the ADD reads the pod
+// from the API server (a re-registration would drain them meanwhile), and no event is raised.
+func TestReconcileEgressPodAdd_UnchangedDualStackMemberKeepsItsAddresses(t *testing.T) {
+	p1 := membershipPod("p1", memberIdentity, annotationsA(), memberIP(memberPod("p1")), "fd00::1")
+	p2B := membershipPod("p2", memberIdentity, annotationsB())
+	dt, kube, recorder := newAdmittedTracker(t, []*v1.Pod{p1, p2B}, []*v1.Pod{p1, p2B})
+	admitted := egressAddressesOf(dt, memberIdentity)
+	if !assert.Len(t, admitted, 3, "control: both addresses of ns/p1 and the address of ns/p2 are admitted") {
+		return
+	}
+	var duringRead []string
+	kube.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.GetAction).GetName() == "p1" {
+			duringRead = egressAddressesOf(dt, memberIdentity)
+		}
+		return false, nil, nil
+	})
+
+	dt.reconcileEgressPodAdd(p1)
+
+	assert.Equal(t, admitted, duringRead, "the addresses while the ADD reads the pod")
+	assert.Equal(t, admitted, egressAddressesOf(dt, memberIdentity), "the addresses after the ADD")
+	assert.Empty(t, recorder.take(), "no event")
 }

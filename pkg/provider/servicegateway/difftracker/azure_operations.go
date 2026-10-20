@@ -65,14 +65,8 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/errutils"
 )
 
-// createOrUpdatePIP creates or updates a public IP address
-func (dt *DiffTracker) createOrUpdatePIP(ctx context.Context, pipResourceGroup string, pip *armnetwork.PublicIPAddress) error {
-	_, err := dt.createOrUpdatePIPWithResponse(ctx, pipResourceGroup, pip)
-	return err
-}
-
-// createOrUpdatePIPWithResponse creates or updates a public IP address and returns the response
-// containing the allocated IP address. Use this when you need the IP address after PIP creation.
+// createOrUpdatePIPWithResponse creates or updates a public IP address and returns it as Azure
+// returned it, with the allocated IP address.
 func (dt *DiffTracker) createOrUpdatePIPWithResponse(ctx context.Context, pipResourceGroup string, pip *armnetwork.PublicIPAddress) (*armnetwork.PublicIPAddress, error) {
 	if pip == nil {
 		return nil, fmt.Errorf("createOrUpdatePIPWithResponse: pip is nil")
@@ -151,21 +145,6 @@ func (dt *DiffTracker) createOrUpdateNatGateway(ctx context.Context, natGatewayR
 	return nil
 }
 
-// deleteNatGateway deletes a NAT gateway
-func (dt *DiffTracker) deleteNatGateway(ctx context.Context, natGatewayResourceGroup string, natGatewayName string) error {
-	if natGatewayName == "" {
-		return fmt.Errorf("deleteNatGateway: NAT gateway name is empty")
-	}
-	dt.logger.V(2).Info("Deleting NAT Gateway", "natGateway", natGatewayName, "resourceGroup", natGatewayResourceGroup)
-
-	err := dt.networkClientFactory.GetNatGatewayClient().Delete(ctx, natGatewayResourceGroup, natGatewayName)
-	if _, err := errutils.CheckResourceExistsFromAzcoreError(err); err != nil {
-		return fmt.Errorf("deleting NAT Gateway %q in resource group %q: %w", natGatewayName, natGatewayResourceGroup, err)
-	}
-
-	return nil
-}
-
 // getNatGateway reads a NAT Gateway. exists is false (with a nil error) when it is not found.
 func (dt *DiffTracker) getNatGateway(ctx context.Context, resourceGroup, name string) (natGateway *armnetwork.NatGateway, exists bool, err error) {
 	natGateway, err = dt.networkClientFactory.GetNatGatewayClient().Get(ctx, resourceGroup, name, nil)
@@ -176,12 +155,6 @@ func (dt *DiffTracker) getNatGateway(ctx context.Context, resourceGroup, name st
 		return nil, false, fmt.Errorf("getting NAT Gateway %q in resource group %q: %w", name, resourceGroup, err)
 	}
 	return natGateway, true, nil
-}
-
-// disassociateNatGatewayFromServiceGateway removes the NAT gateway association from the Service Gateway
-// This should be called before deleting the NAT gateway to properly clean up the references
-func (dt *DiffTracker) disassociateNatGatewayFromServiceGateway(ctx context.Context, serviceGatewayName string, natGatewayName string) error {
-	return dt.unlinkNatGateway(ctx, serviceGatewayName, natGatewayName, dt.config.ResourceGroup, natGatewayName)
 }
 
 // getNatGatewayByID reads a NAT Gateway by resource ID. exists is false (with a nil error) when it is not found.

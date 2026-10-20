@@ -119,17 +119,19 @@ func (s *ServiceUpdater) resolveBYONATGateway(ctx context.Context, identity, pod
 
 // createBYOOutboundService validates a BYO NAT Gateway, links it to the Service Gateway
 // and registers the egress identity with it. Failures are retried with backoff, so a gateway the
-// owner fixes (or grants access to) is picked up without recreating the pods.
+// owner fixes (or grants access to) is picked up without recreating the pods. Every completion reports
+// the BYO mode: the identity's NAT Gateway is resolved, whether or not it can be used yet.
 func (s *ServiceUpdater) createBYOOutboundService(ctx context.Context, identity string, config *OutboundConfig, natGateway *armnetwork.NatGateway,
 	correlationID, podNS, podName string) {
 	dt := s.diffTracker
 	natGatewayID := derefString(natGateway.ID)
 	serviceGatewayID := dt.config.ServiceGatewayResourceID()
+	byo := &egressOutcome{Mode: egressModeBYO}
 
 	reject := func(problem string) {
 		dt.recordPodEvent(ctx, podNS, podName, v1.EventTypeWarning, egressNATGatewayRejectedReason,
 			fmt.Sprintf("Egress identity %q cannot use NAT Gateway %q: %s.", identity, natGatewayID, problem))
-		s.onComplete(identity, false, fmt.Errorf("BYO NAT Gateway %q: %s", natGatewayID, problem))
+		s.completeOutbound(identity, false, fmt.Errorf("BYO NAT Gateway %q: %s", natGatewayID, problem), byo)
 	}
 
 	var families []string
@@ -142,7 +144,7 @@ func (s *ServiceUpdater) createBYOOutboundService(ctx context.Context, identity 
 	}
 	user, err := dt.otherServiceUsing(ctx, identity, natGatewayID)
 	if err != nil {
-		s.onComplete(identity, false, err)
+		s.completeOutbound(identity, false, err, byo)
 		return
 	}
 	if user != "" {
@@ -151,7 +153,7 @@ func (s *ServiceUpdater) createBYOOutboundService(ctx context.Context, identity 
 	}
 	parsed, err := arm.ParseResourceID(natGatewayID)
 	if err != nil {
-		s.onComplete(identity, false, fmt.Errorf("parsing NAT Gateway ID %q: %w", natGatewayID, err))
+		s.completeOutbound(identity, false, fmt.Errorf("parsing NAT Gateway ID %q: %w", natGatewayID, err), byo)
 		return
 	}
 
@@ -170,27 +172,29 @@ func (s *ServiceUpdater) createBYOOutboundService(ctx context.Context, identity 
 						"Grant the cluster identity write access to the NAT Gateway.", identity, natGatewayID))
 			}
 			s.logger.V(4).Info("Could not link BYO NAT Gateway to Service Gateway", "serviceUID", identity, "correlationID", correlationID, "natGateway", natGatewayID, "err", err)
-			s.onComplete(identity, false, fmt.Errorf("failed to link NAT Gateway: %w", err))
+			s.completeOutbound(identity, false, fmt.Errorf("failed to link NAT Gateway: %w", err), byo)
 			return
 		}
 	}
 
 	if err := dt.updateNRPSGWServices(ctx, dt.config.ServiceGatewayResourceName, byoOutboundServicesDTO(identity, natGatewayID, dt.config)); err != nil {
 		s.logger.V(4).Info("Could not register outbound service with ServiceGateway", "serviceUID", identity, "correlationID", correlationID, "err", err)
-		s.onComplete(identity, false, fmt.Errorf("failed to register with ServiceGateway: %w", err))
+		s.completeOutbound(identity, false, fmt.Errorf("failed to register with ServiceGateway: %w", err), byo)
 		return
 	}
 
 	dt.UpdateNRPNATGateways(SyncServicesReturnType{Additions: newIgnoreCaseSetFromSlice([]string{identity})})
 	dt.recordPodEvent(ctx, podNS, podName, v1.EventTypeNormal, egressNATGatewayLinkedReason,
 		fmt.Sprintf("Egress identity %q uses BYO NAT Gateway %q.", identity, natGatewayID))
-	s.onComplete(identity, true, nil)
+	s.completeOutbound(identity, true, nil, byo)
 	s.logger.V(2).Info("Created outbound service with BYO NAT Gateway", "serviceUID", identity, "natGateway", natGatewayID, "correlationID", correlationID)
 }
 
 // deleteBYOOutboundService unlinks a BYO NAT Gateway and unregisters the egress identity.
 // The gateway and its Public IPs are left in place. The identity is only unregistered once the
-// gateway is unlinked, so a failed unlink is retried rather than leaving the link behind.
+// gateway is unlinked, so a failed unlink is retried rather than leaving the link behind. When the
+// identity is owed the cleanup of the residue of its managed past, the same run does it once the
+// identity is unregistered (byoDeletionResidue).
 func (s *ServiceUpdater) deleteBYOOutboundService(ctx context.Context, identity, natGatewayID, correlationID string) {
 	dt := s.diffTracker
 	if parsed, err := arm.ParseResourceID(natGatewayID); err == nil {
@@ -199,7 +203,7 @@ func (s *ServiceUpdater) deleteBYOOutboundService(ctx context.Context, identity,
 			// the last egress pod in Terminating. The leftover link only affects the BYO gateway.
 			if !isAccessDeniedOrLocked(err) {
 				s.logger.V(4).Info("Could not unlink BYO NAT Gateway", "serviceUID", identity, "correlationID", correlationID, "natGateway", natGatewayID, "err", err)
-				s.onComplete(identity, false, fmt.Errorf("failed to unlink NAT Gateway: %w", err))
+				s.completeOutbound(identity, false, fmt.Errorf("failed to unlink NAT Gateway: %w", err), &egressOutcome{})
 				return
 			}
 			recordDeleteSubstepFailure(deleteStepDisassociateNAT)
@@ -211,17 +215,19 @@ func (s *ServiceUpdater) deleteBYOOutboundService(ctx context.Context, identity,
 		var respErr *azcore.ResponseError
 		if !errors.As(err, &respErr) || respErr.StatusCode != http.StatusNotFound {
 			s.logger.V(4).Info("Could not unregister outbound service from ServiceGateway", "serviceUID", identity, "correlationID", correlationID, "err", err)
-			s.onComplete(identity, false, fmt.Errorf("failed to unregister from ServiceGateway: %w", err))
+			s.completeOutbound(identity, false, fmt.Errorf("failed to unregister from ServiceGateway: %w", err), &egressOutcome{})
 			return
 		}
 	}
 
-	s.finishOutboundDeletion(ctx, identity, correlationID, nil)
+	s.finishOutboundDeletion(identity, correlationID, nil, s.byoDeletionResidue(identity, correlationID))
 }
 
 // otherServiceUsing returns the Service Gateway service other than identity that uses natGatewayID,
-// or "" (also when the Service Gateway is gone).
+// or "" (also when the Service Gateway is gone). The read has a budget of its own.
 func (dt *DiffTracker) otherServiceUsing(ctx context.Context, identity, natGatewayID string) (string, error) {
+	ctx, cancel := egressReadContext(ctx)
+	defer cancel()
 	services, err := dt.networkClientFactory.GetServiceGatewayClient().GetServices(ctx, dt.config.ResourceGroup, dt.config.ServiceGatewayResourceName)
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
@@ -379,8 +385,9 @@ var errNATGatewayNotOwned = errors.New("a NAT Gateway or Service Gateway service
 
 // clusterNATGatewayExists reports whether the cluster resource group holds a NAT Gateway named
 // identity, and returns errNATGatewayNotOwned when it does but this controller did not create it.
+// Each of its reads has a budget of its own.
 func (dt *DiffTracker) clusterNATGatewayExists(ctx context.Context, identity string) (bool, error) {
-	natGateway, exists, err := dt.getNatGateway(ctx, dt.config.ResourceGroup, identity)
+	natGateway, exists, err := dt.getEgressNAT(ctx, identity)
 	if err != nil || !exists {
 		return false, err
 	}
