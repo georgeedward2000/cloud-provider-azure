@@ -19,6 +19,7 @@ package difftracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
@@ -54,6 +56,590 @@ func newTestDiffTracker() *DiffTracker {
 		pendingPodDeletions:     make(map[string]*PendingPodDeletion),
 		serviceUpdaterTrigger:   make(chan bool, 1),
 		locationsUpdaterTrigger: make(chan bool, 1),
+	}
+}
+
+func TestParseEgressIdleTimeout(t *testing.T) {
+	key := consts.PodAnnotationServiceEgressGatewayIdleTimeout
+	rg := consts.PodAnnotationServiceEgressGatewayResourceGroup
+	for _, test := range []struct {
+		name        string
+		annotations map[string]string
+		want        int32
+		wantError   bool
+	}{
+		{name: "default", want: 4},
+		{name: "selector only", annotations: map[string]string{rg: "customer-rg"}, want: 4},
+		{name: "selector validation belongs to BYO", annotations: map[string]string{rg: ""}, want: 4},
+		{name: "unrelated annotation", annotations: map[string]string{"example.com/other": "value"}, want: 4},
+		{name: "minimum", annotations: map[string]string{key: "4"}, want: 4},
+		{name: "maximum", annotations: map[string]string{key: "120"}, want: 120},
+		{name: "canonical integer", annotations: map[string]string{key: " 012 "}, want: 12},
+		{name: "empty", annotations: map[string]string{key: ""}, wantError: true},
+		{name: "blank", annotations: map[string]string{key: "  "}, wantError: true},
+		{name: "zero", annotations: map[string]string{key: "0"}, wantError: true},
+		{name: "below minimum", annotations: map[string]string{key: "3"}, wantError: true},
+		{name: "above maximum", annotations: map[string]string{key: "121"}, wantError: true},
+		{name: "negative", annotations: map[string]string{key: "-4"}, wantError: true},
+		{name: "fraction", annotations: map[string]string{key: "4.5"}, wantError: true},
+		{name: "overflow", annotations: map[string]string{key: "2147483648"}, wantError: true},
+		{name: "unknown configuration", annotations: map[string]string{key: "10", consts.PodLabelServiceEgressGateway + "-typo": "value"}, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseEgressIdleTimeout(test.annotations)
+			if test.wantError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestEgressVoteConsensus(t *testing.T) {
+	pod := func(name, value string) *v1.Pod {
+		p := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: name, UID: types.UID(name)}}
+		if value != "" {
+			p.Annotations = map[string]string{consts.PodAnnotationServiceEgressGatewayIdleTimeout: value}
+		}
+		return p
+	}
+	selectorOnly := pod("byo", "")
+	selectorOnly.Annotations = map[string]string{consts.PodAnnotationServiceEgressGatewayResourceGroup: "customer-rg"}
+	dualStack := pod("dual", "12")
+	dualStack.Status.PodIPs = []v1.PodIP{{IP: "10.0.0.2"}, {IP: "fd00::2"}}
+	for _, test := range []struct {
+		name      string
+		pods      []*v1.Pod
+		want      int32
+		conflict  bool
+		wantError bool
+	}{
+		{name: "no members"},
+		{name: "default member", pods: []*v1.Pod{pod("a", "")}, want: 4},
+		{name: "explicit and implicit default", pods: []*v1.Pod{pod("a", ""), pod("b", "4")}, want: 4},
+		{name: "equal spellings", pods: []*v1.Pod{pod("a", "12"), pod("b", " 012 ")}, want: 12},
+		{name: "each pod is one member", pods: []*v1.Pod{dualStack, pod("other", "12")}, want: 12},
+		{name: "selector is not a vote", pods: []*v1.Pod{selectorOnly, pod("managed", "4")}, want: 4},
+		{name: "different values", pods: []*v1.Pod{pod("a", "12"), pod("b", "20")}, conflict: true, wantError: true},
+		{name: "unannotated member votes default", pods: []*v1.Pod{pod("a", "12"), pod("b", "")}, conflict: true, wantError: true},
+		{name: "invalid member blocks change", pods: []*v1.Pod{pod("a", "12"), pod("b", "invalid")}, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var votes egressConfigVotes
+			for _, pod := range test.pods {
+				minutes, err := parseEgressIdleTimeout(pod.Annotations)
+				votes.set(pod.Namespace+"/"+pod.Name, egressPodVote{
+					UID: pod.UID, Identity: "payments", Config: egressConfig{IdleTimeoutMinutes: minutes}, Invalid: err != nil,
+				})
+			}
+			got, err := votes.agreed("payments")
+			if test.wantError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, test.conflict, errors.Is(err, errEgressConfigConflict))
+			assert.Equal(t, test.want, got.IdleTimeoutMinutes)
+		})
+	}
+}
+
+func TestEgressVoteCountersLifecycle(t *testing.T) {
+	var votes egressConfigVotes
+	c12, c20 := egressConfig{IdleTimeoutMinutes: 12}, egressConfig{IdleTimeoutMinutes: 20}
+	vote := func(uid, identity string, cfg egressConfig) egressPodVote {
+		return egressPodVote{UID: types.UID(uid), Identity: identity, Config: cfg}
+	}
+	a, b, c := vote("a", "payments", c12), vote("b", "payments", c12), vote("c", "payments", c20)
+	votes.set("ns/a", a)
+	votes.set("ns/b", b)
+	votes.set("ns/c", c)
+	group := votes.byIdentity["payments"]
+	assert.Equal(t, 3, group.pods)
+	assert.Equal(t, map[egressConfig]int{c12: 2, c20: 1}, group.configurations)
+	_, err := votes.agreed("payments")
+	assert.ErrorIs(t, err, errEgressConfigConflict)
+
+	c.Config = c12
+	votes.set("ns/c", c)
+	assert.Equal(t, map[egressConfig]int{c12: 3}, group.configurations)
+	config, err := votes.agreed("payments")
+	assert.NoError(t, err)
+	assert.Equal(t, c12, config)
+	_, changed := votes.set("ns/c", c)
+	assert.False(t, changed, "duplicate updates and resyncs must not count a pod twice")
+	assert.Equal(t, 3, group.pods)
+
+	b.Invalid = true
+	votes.set("ns/b", b)
+	assert.Equal(t, 3, group.pods, "invalid configurations remain members")
+	assert.Equal(t, 1, group.invalid)
+	assert.Equal(t, map[egressConfig]int{c12: 2}, group.configurations)
+	_, err = votes.agreed("payments")
+	assert.ErrorIs(t, err, errInvalidEgressVotes)
+	b.Invalid = false
+	votes.set("ns/b", b)
+	assert.Equal(t, 0, group.invalid)
+
+	c.Identity, c.Config = "shipping", c20
+	old, changed := votes.set("ns/c", c)
+	assert.True(t, changed)
+	assert.Equal(t, "payments", old)
+	assert.Equal(t, map[egressConfig]int{c12: 2}, group.configurations)
+	assert.Equal(t, map[egressConfig]int{c20: 1}, votes.byIdentity["shipping"].configurations)
+	a.UID, a.Config = "a-replacement", c20
+	votes.set("ns/a", a)
+	_, changed = votes.remove("ns/a", "a")
+	assert.False(t, changed, "a stale deletion cannot remove a replacement's vote")
+	assert.Equal(t, 2, group.pods)
+	assert.Equal(t, map[egressConfig]int{c12: 1, c20: 1}, group.configurations)
+	_, changed = votes.remove("ns/a", a.UID)
+	assert.True(t, changed)
+	assert.Equal(t, map[egressConfig]int{c12: 1}, group.configurations)
+	votes.remove("ns/b", b.UID)
+	assert.NotContains(t, votes.byIdentity, "payments")
+	votes.remove("ns/c", c.UID)
+	assert.Nil(t, votes.byPod, "empty trackers must release their map storage")
+	assert.Nil(t, votes.byIdentity)
+	config, err = votes.agreed("payments")
+	assert.NoError(t, err)
+	assert.Zero(t, config.IdleTimeoutMinutes, "zero pods never select a configuration")
+}
+
+func TestEgressVoteCounterRequiresEveryMember(t *testing.T) {
+	var votes egressConfigVotes
+	cfg := egressConfig{IdleTimeoutMinutes: 12}
+	votes.set("ns/pod", egressPodVote{UID: "pod", Identity: "payments", Config: cfg})
+	votes.byIdentity["payments"].pods++
+	_, err := votes.agreed("payments")
+	assert.Error(t, err, "one nonzero bucket is not sufficient if a member is unaccounted for")
+}
+
+func TestEgressVoteCounterReusesSingleMemberStorage(t *testing.T) {
+	var votes egressConfigVotes
+	vote := egressPodVote{UID: "pod", Identity: "payments", Config: egressConfig{IdleTimeoutMinutes: 12}}
+	votes.set("ns/pod", vote)
+	group := votes.byIdentity["payments"]
+	allocations := testing.AllocsPerRun(1000, func() {
+		vote.Config.IdleTimeoutMinutes = 32 - vote.Config.IdleTimeoutMinutes
+		votes.set("ns/pod", vote)
+	})
+	assert.Same(t, group, votes.byIdentity["payments"], "a config update must not recreate the identity's state")
+	assert.Zero(t, allocations, "steady-state vote changes must not allocate new identity maps")
+	assert.Equal(t, 1, group.pods)
+	assert.Len(t, group.configurations, 1)
+}
+
+func FuzzEgressVoteCounters(f *testing.F) {
+	f.Add([]byte{0, 0, 1, 0, 1, 0, 2, 1, 0, 1, 3, 0, 0, 1, 1, 2})
+	f.Add([]byte{0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 1, 2})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 2048 {
+			data = data[:2048]
+		}
+		var votes egressConfigVotes
+		want := make(map[string]egressPodVote)
+		for i := 0; i+3 < len(data); i += 4 {
+			key := fmt.Sprintf("ns/pod-%d", data[i]%16)
+			uid := types.UID(fmt.Sprintf("uid-%d", data[i+2]%8))
+			switch data[i+3] % 4 {
+			case 0, 1:
+				vote := egressPodVote{
+					UID: uid, Identity: fmt.Sprintf("identity-%d", data[i+1]%4),
+					Config:  egressConfig{IdleTimeoutMinutes: int32(4 + data[i+2]%117)},
+					Invalid: data[i+3]%4 == 1,
+				}
+				votes.set(key, vote)
+				want[key] = vote
+			case 2:
+				votes.remove(key, uid)
+				if current, ok := want[key]; ok && current.UID == uid {
+					delete(want, key)
+				}
+			case 3:
+				votes.set(key, egressPodVote{})
+				delete(want, key)
+			}
+			if !assert.Equal(t, len(want), len(votes.byPod)) {
+				t.FailNow()
+			}
+			counts := make(map[string]map[egressConfig]int)
+			totals, invalid := make(map[string]int), make(map[string]int)
+			for pod, vote := range want {
+				assert.Equal(t, vote, votes.byPod[pod])
+				totals[vote.Identity]++
+				if vote.Invalid {
+					invalid[vote.Identity]++
+				} else {
+					if counts[vote.Identity] == nil {
+						counts[vote.Identity] = make(map[egressConfig]int)
+					}
+					counts[vote.Identity][vote.Config]++
+				}
+			}
+			assert.Equal(t, len(totals), len(votes.byIdentity))
+			for identity, total := range totals {
+				group := votes.byIdentity[identity]
+				if !assert.NotNil(t, group) {
+					t.FailNow()
+				}
+				assert.Equal(t, total, group.pods)
+				assert.Equal(t, invalid[identity], group.invalid)
+				assert.Equal(t, len(counts[identity]), len(group.configurations))
+				for config, count := range group.configurations {
+					assert.Positive(t, count)
+					assert.Equal(t, counts[identity][config], count)
+				}
+				config, err := votes.agreed(identity)
+				if invalid[identity] == 0 && len(counts[identity]) == 1 {
+					assert.NoError(t, err)
+					assert.Equal(t, total, counts[identity][config])
+				} else {
+					assert.Error(t, err)
+				}
+			}
+		}
+	})
+}
+
+func BenchmarkEgressVoteCounters(b *testing.B) {
+	for _, members := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprint(members), func(b *testing.B) {
+			var votes egressConfigVotes
+			for i := 0; i < members; i++ {
+				key := fmt.Sprintf("ns/pod-%d", i)
+				votes.set(key, egressPodVote{UID: types.UID(key), Identity: "payments",
+					Config: egressConfig{IdleTimeoutMinutes: 12}})
+			}
+			key := "ns/pod-0"
+			vote := votes.byPod[key]
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				vote.Config.IdleTimeoutMinutes = 32 - vote.Config.IdleTimeoutMinutes
+				votes.set(key, vote)
+				_, _ = votes.agreed("payments")
+			}
+		})
+	}
+}
+
+type egressIdleTestInformer struct {
+	cache.SharedIndexInformer
+	synced bool
+}
+
+func (i *egressIdleTestInformer) HasSynced() bool { return i.synced }
+
+func newEgressIdleTestInformer(t *testing.T, pods ...*v1.Pod) *egressIdleTestInformer {
+	t.Helper()
+	informer := cache.NewSharedIndexInformer(&cache.ListWatch{}, &v1.Pod{}, 0, nil)
+	for _, pod := range pods {
+		if err := informer.GetStore().Add(pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &egressIdleTestInformer{SharedIndexInformer: informer, synced: true}
+}
+
+func seedEgressIdleTestVotes(t *testing.T, dt *DiffTracker) {
+	t.Helper()
+	dt.egressVotesReady = false
+	for _, object := range dt.egressPodInformer.GetStore().List() {
+		dt.observeEgressConfigPod(object.(*v1.Pod), false)
+	}
+	dt.egressVotesReady = true
+}
+
+func egressIdleTestPod(name, identity, timeout string) *v1.Pod {
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test", Name: name, UID: types.UID(name),
+			Labels: map[string]string{consts.PodLabelServiceEgressGateway: identity},
+		},
+		Status: v1.PodStatus{
+			Phase: v1.PodRunning, HostIP: "10.0.0.1", PodIP: "10.0.0.2",
+			PodIPs: []v1.PodIP{{IP: "10.0.0.2"}},
+		},
+	}
+	if timeout != "" {
+		pod.Annotations = map[string]string{consts.PodAnnotationServiceEgressGatewayIdleTimeout: timeout}
+	}
+	return pod
+}
+
+func TestEgressIdleMembers(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*v1.Pod)
+		want   bool
+	}{
+		{name: "running", change: func(*v1.Pod) {}, want: true},
+		{name: "pending with addresses", change: func(p *v1.Pod) { p.Status.Phase = v1.PodPending }, want: true},
+		{name: "completed", change: func(p *v1.Pod) { p.Status.Phase = v1.PodSucceeded }},
+		{name: "failed", change: func(p *v1.Pod) { p.Status.Phase = v1.PodFailed }},
+		{name: "deleting", change: func(p *v1.Pod) { now := metav1.Now(); p.DeletionTimestamp = &now }},
+		{name: "no host", change: func(p *v1.Pod) { p.Status.HostIP = "" }},
+		{name: "malformed host", change: func(p *v1.Pod) { p.Status.HostIP = "bad" }},
+		{name: "no address", change: func(p *v1.Pod) { p.Status.PodIP = ""; p.Status.PodIPs = nil }},
+		{name: "malformed address", change: func(p *v1.Pod) {
+			p.Status.PodIP = "bad"
+			p.Status.PodIPs = []v1.PodIP{{IP: "bad"}}
+		}},
+		{name: "no matching node family", change: func(p *v1.Pod) {
+			p.Status.PodIP = "fd00::2"
+			p.Status.PodIPs = []v1.PodIP{{IP: "fd00::2"}}
+		}},
+		{name: "dual family is one pod", change: func(p *v1.Pod) {
+			p.Status.PodIPs = append(p.Status.PodIPs, v1.PodIP{IP: "fd00::2"})
+			p.Status.HostIPs = []v1.HostIP{{IP: "10.0.0.1"}, {IP: "fd00::1"}}
+		}, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := egressIdleTestPod("member", "PAYMENTS", "12")
+			test.change(pod)
+			dt := newTestDiffTracker()
+			dt.egressPodInformer = newEgressIdleTestInformer(t, pod, egressIdleTestPod("foreign", "another", "30"))
+			seedEgressIdleTestVotes(t, dt)
+			dt.pendingPods["payments"] = []PendingPodUpdate{{PodKey: "test/member", PodUID: string(pod.UID),
+				Location: "10.0.0.1", Address: "10.0.0.2"}}
+			members, err := dt.egressConfigMembers("payments")
+			assert.NoError(t, err)
+			if test.want {
+				assert.Len(t, members, 1)
+				assert.Equal(t, pod, members[0])
+				if assert.Contains(t, dt.egressVotes.byIdentity, "payments") {
+					assert.Equal(t, 1, dt.egressVotes.byIdentity["payments"].pods)
+				}
+				config, voteErr := dt.egressVotes.agreed("payments")
+				assert.NoError(t, voteErr)
+				assert.Equal(t, egressConfig{IdleTimeoutMinutes: 12}, config)
+				assert.Equal(t, pod.UID, dt.egressVotes.byPod["test/member"].UID)
+			} else {
+				assert.Empty(t, members)
+				assert.NotContains(t, dt.egressVotes.byIdentity, "payments")
+				assert.NotContains(t, dt.egressVotes.byPod, "test/member")
+			}
+		})
+	}
+}
+
+func TestEgressIdleMembersFollowCacheReplacementAndDeletion(t *testing.T) {
+	pod := egressIdleTestPod("member", "payments", "12")
+	informer := newEgressIdleTestInformer(t, pod)
+	dt := newTestDiffTracker()
+	dt.egressPodInformer = informer
+	seedEgressIdleTestVotes(t, dt)
+	dt.pendingPods["payments"] = []PendingPodUpdate{{PodKey: "test/member", PodUID: string(pod.UID),
+		Location: pod.Status.HostIP, Address: pod.Status.PodIP}}
+	replacement := pod.DeepCopy()
+	replacement.UID = "replacement"
+	replacement.Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] = "30"
+	assert.NoError(t, informer.GetStore().Update(replacement))
+	dt.observeEgressConfigPod(replacement, false)
+	members, err := dt.egressConfigMembers("payments")
+	assert.NoError(t, err)
+	assert.Len(t, members, 1)
+	assert.Equal(t, replacement.UID, members[0].UID)
+	config, err := dt.egressVotes.agreed("payments")
+	assert.NoError(t, err)
+	assert.Equal(t, int32(30), config.IdleTimeoutMinutes)
+	assert.NoError(t, informer.GetStore().Delete(replacement))
+	dt.observeEgressConfigPod(replacement, false)
+	members, err = dt.egressConfigMembers("payments")
+	assert.NoError(t, err)
+	assert.Empty(t, members)
+}
+
+func TestEgressVoteCacheCoherence(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		change    func(*v1.Pod)
+		remove    bool
+		add       bool
+		wantError bool
+	}{
+		{name: "unchanged", change: func(*v1.Pod) {}},
+		{name: "equivalent spelling", change: func(p *v1.Pod) {
+			p.Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] = " 012 "
+		}},
+		{name: "unrelated metadata", change: func(p *v1.Pod) { p.Annotations["other"] = "value" }},
+		{name: "configuration changed", change: func(p *v1.Pod) {
+			p.Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] = "20"
+		}, wantError: true},
+		{name: "invalid configuration", change: func(p *v1.Pod) {
+			p.Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] = "invalid"
+		}, wantError: true},
+		{name: "replacement", change: func(p *v1.Pod) { p.UID = "replacement" }, wantError: true},
+		{name: "terminal", change: func(p *v1.Pod) { p.Status.Phase = v1.PodSucceeded }, wantError: true},
+		{name: "relabel", change: func(p *v1.Pod) { p.Labels[consts.PodLabelServiceEgressGateway] = "shipping" }, wantError: true},
+		{name: "removed", remove: true, wantError: true},
+		{name: "unprocessed new member", add: true, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := egressIdleTestPod("member", "payments", "12")
+			dt := newTestDiffTracker()
+			informer := newEgressIdleTestInformer(t, pod, egressIdleTestPod("other", "unrelated", "20"))
+			dt.egressPodInformer = informer
+			seedEgressIdleTestVotes(t, dt)
+			switch {
+			case test.remove:
+				assert.NoError(t, informer.GetStore().Delete(pod))
+			case test.add:
+				assert.NoError(t, informer.GetStore().Add(egressIdleTestPod("new", "payments", "12")))
+			default:
+				current := pod.DeepCopy()
+				test.change(current)
+				assert.NoError(t, informer.GetStore().Update(current))
+			}
+			dt.mu.Lock()
+			err := dt.validateEgressVotesLocked("payments")
+			agreed, voteErr := dt.egressVotes.agreed("payments")
+			dt.mu.Unlock()
+			assert.Equal(t, test.wantError, err != nil, "coherence error: %v", err)
+			assert.NoError(t, voteErr)
+			assert.Equal(t, egressConfig{IdleTimeoutMinutes: 12}, agreed, "validation must not rebuild the counters")
+		})
+	}
+}
+
+func TestEgressVoteDefaultAnnotationOnBYOIsReportedWithoutChangingCounts(t *testing.T) {
+	pod := egressIdleTestPod("member", "payments", "")
+	pod.Annotations = map[string]string{consts.PodAnnotationServiceEgressGatewayResourceGroup: "customer"}
+	dt := newTestDiffTracker()
+	dt.setBYONATGatewayID("payments", "/subscriptions/sub/resourceGroups/customer/providers/Microsoft.Network/natGateways/payments")
+	informer := newEgressIdleTestInformer(t, pod)
+	dt.egressPodInformer = informer
+	recorder := record.NewFakeRecorder(10)
+	dt.SetEventRecorder(recorder)
+	seedEgressIdleTestVotes(t, dt)
+	assert.Empty(t, recorder.Events, "the selector is not a configuration annotation")
+	before, err := dt.egressVotes.agreed("payments")
+	assert.NoError(t, err)
+	explicit := pod.DeepCopy()
+	explicit.Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] = "4"
+	assert.NoError(t, informer.GetStore().Update(explicit))
+	dt.observeEgressConfigPod(explicit, false)
+	after, err := dt.egressVotes.agreed("payments")
+	assert.NoError(t, err)
+	assert.Equal(t, before, after)
+	assert.Equal(t, 1, dt.egressVotes.byIdentity["payments"].pods)
+	if assert.NotEmpty(t, recorder.Events) {
+		assert.Contains(t, <-recorder.Events, errBYOEgressConfig.Error())
+	}
+}
+
+func TestEgressIdleUpdateRetryBudgetDoesNotBlockDeletion(t *testing.T) {
+	for _, state := range []ResourceState{StateCreated, StateUpdateInProgress, StateDeletionPending, StateDeletionInProgress} {
+		t.Run(fmt.Sprint(state), func(t *testing.T) {
+			dt := newTestDiffTracker()
+			next := time.Now().Add(time.Hour)
+			op := &ServiceOperationState{
+				ServiceUID: "payments", Config: NewOutboundServiceConfig("payments", nil), State: state,
+				RetryCount: maxServiceRetries, RetriesExhausted: true, NextRetryAt: next,
+			}
+			dt.pendingServiceOps["payments"] = op
+			dt.mu.Lock()
+			dt.markOutboundServiceForDeletionLocked("payments")
+			dt.mu.Unlock()
+			if state == StateCreated || state == StateUpdateInProgress {
+				assert.Equal(t, 0, op.RetryCount)
+				assert.False(t, op.RetriesExhausted)
+				assert.True(t, op.NextRetryAt.IsZero())
+			} else {
+				assert.Equal(t, maxServiceRetries, op.RetryCount, "an attempted delete must not be mistaken for a revivable service")
+				assert.True(t, op.RetriesExhausted)
+				assert.Equal(t, next, op.NextRetryAt)
+			}
+		})
+	}
+}
+
+func TestQueueEgressIdleConfig(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		state     ResourceState
+		wantState ResourceState
+		dirty     bool
+		triggered bool
+	}{
+		{"creation queued", StateNotStarted, StateNotStarted, true, false},
+		{"creation active", StateCreationInProgress, StateCreationInProgress, true, false},
+		{"created", StateCreated, StateUpdateInProgress, true, true},
+		{"updating", StateUpdateInProgress, StateUpdateInProgress, true, true},
+		{"deletion pending", StateDeletionPending, StateDeletionPending, false, false},
+		{"deletion active", StateDeletionInProgress, StateDeletionInProgress, false, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dt := newTestDiffTracker()
+			dt.egressPodInformer = newEgressIdleTestInformer(t, egressIdleTestPod("pod", "payments", "12"))
+			seedEgressIdleTestVotes(t, dt)
+			op := &ServiceOperationState{ServiceUID: "payments", Config: NewOutboundServiceConfig("payments", nil), State: test.state}
+			dt.pendingServiceOps["payments"] = op
+			dt.queueEgressConfig("payments")
+			assert.Equal(t, test.wantState, op.State)
+			assert.Equal(t, test.dirty, op.EgressConfigDirty)
+			assert.Equal(t, test.triggered, len(dt.serviceUpdaterTrigger) != 0)
+		})
+	}
+	t.Run("recovered registration", func(t *testing.T) {
+		dt := newTestDiffTracker()
+		dt.egressPodInformer = newEgressIdleTestInformer(t)
+		seedEgressIdleTestVotes(t, dt)
+		dt.NRPResources.NATGateways.Insert("payments")
+		dt.queueEgressConfig("payments")
+		if assert.Contains(t, dt.pendingServiceOps, "payments") {
+			assert.False(t, dt.pendingServiceOps["payments"].Config.IsInbound)
+			assert.Equal(t, StateUpdateInProgress, dt.pendingServiceOps["payments"].State)
+		}
+	})
+	for _, kind := range []string{"inbound", "reserved", "unknown", "unsynced", "initializing"} {
+		t.Run("ignore "+kind, func(t *testing.T) {
+			dt := newTestDiffTracker()
+			informer := newEgressIdleTestInformer(t)
+			dt.egressPodInformer = informer
+			seedEgressIdleTestVotes(t, dt)
+			id := "payments"
+			switch kind {
+			case "inbound":
+				dt.NRPResources.LoadBalancers.Insert(id)
+			case "reserved":
+				dt.NRPResources.ReservedOutboundServices = utilsets.NewString(id)
+			case "unsynced":
+				informer.synced = false
+				dt.NRPResources.NATGateways.Insert(id)
+			case "initializing":
+				atomic.StoreInt32(&dt.isInitializing, 1)
+				dt.NRPResources.NATGateways.Insert(id)
+			}
+			dt.queueEgressConfig(id)
+			assert.Empty(t, dt.pendingServiceOps)
+			assert.Empty(t, dt.serviceUpdaterTrigger)
+		})
+	}
+}
+
+func TestEgressIdleCompletionReschedulesObservedChanges(t *testing.T) {
+	for _, dirty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dirty=%t", dirty), func(t *testing.T) {
+			dt := newTestDiffTracker()
+			cfg := NewOutboundServiceConfig("payments", nil)
+			op := &ServiceOperationState{
+				ServiceUID: "payments", Config: cfg, InFlightConfig: &cfg,
+				State: StateUpdateInProgress, EgressConfigDirty: dirty,
+			}
+			dt.pendingServiceOps["payments"] = op
+			dt.OnServiceCreationComplete("payments", true, nil)
+			want := StateCreated
+			if dirty {
+				want = StateUpdateInProgress
+			}
+			assert.Equal(t, want, op.State)
+			assert.Nil(t, op.InFlightConfig)
+			assert.Equal(t, dirty, len(dt.serviceUpdaterTrigger) != 0)
+		})
 	}
 }
 

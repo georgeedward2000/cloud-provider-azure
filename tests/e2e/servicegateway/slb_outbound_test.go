@@ -35,10 +35,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/cloud-provider-azure/tests/e2e/utils"
 )
@@ -48,6 +51,7 @@ const (
 	egressLabel = "kubernetes.azure.com/service-egress-gateway"
 
 	byoNATGatewayResourceGroupAnnotation = "kubernetes.azure.com/service-egress-gateway-resource-group"
+	egressIdleTimeoutAnnotation          = "kubernetes.azure.com/service-egress-gateway-idle-timeout"
 )
 
 var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTestLabel), func() {
@@ -94,6 +98,251 @@ var _ = Describe("Container Load Balancer Outbound (NAT Gateway)", Label(slbTest
 
 		cs = nil
 		ns = nil
+	})
+
+	Context("idle-timeout configuration by pod consensus", Label("SLB-EgressIdleTimeout"), func() {
+		startManaged := func(identity string, count int, annotations map[string]string, wanted int32) (string, egressIdleGatewayState) {
+			natID := byoNATGatewayARMID(resourceGroupName, identity)
+			resources := managedEgressConfigResourceIDs(identity)
+			DeferCleanup(func() { eventuallyResourcesDeleted(resources...) })
+			createEgressPodsWith(cs, ns.Name, identity, 0, count, annotations)
+			Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
+			eventuallyBYORegistered(cs, ns.Name, resourceGroupName, identity, natID, 4*time.Minute)
+			baseline := eventuallyEgressIdleTimeout(natID, wanted)
+			resources = append(resources, baseline.IPv4...)
+			resources = append(resources, baseline.IPv6...)
+			return natID, baseline
+		}
+
+		It("should create with defaults and normalize equivalent votes including the timeout boundaries", func() {
+			identity := "idle-default-" + ns.Name[len(ns.Name)-5:]
+			natID, baseline := startManaged(identity, 3, nil, 4)
+			for i, value := range []string{"4", "04", " 4 "} {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, i), &value)
+			}
+			Consistently(func() (egressIdleGatewayState, error) {
+				return readEgressIdleGateway(natID)
+			}, 30*time.Second, defaultPollInterval).Should(Equal(baseline), "equivalent default votes must not rewrite the NAT Gateway")
+			Expect(namespaceEventAbsentErr(cs, ns.Name, "InvalidEgressConfig")).To(Succeed())
+			Expect(namespaceEventAbsentErr(cs, ns.Name, "EgressConfigConflict")).To(Succeed())
+
+			for i, value := range []string{"120", "0120", " 120 "} {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, i), &value)
+			}
+			expectEgressIdleAddressesUnchanged(baseline, eventuallyEgressIdleTimeout(natID, 120))
+			for i := 0; i < 3; i++ {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, i), nil)
+			}
+			expectEgressIdleAddressesUnchanged(baseline, eventuallyEgressIdleTimeout(natID, 4))
+		})
+
+		It("should reject majority agreement and apply a rollout only once every pod agrees", func() {
+			identity := "idle-votes-" + ns.Name[len(ns.Name)-5:]
+			natID, baseline := startManaged(identity, 3, map[string]string{egressIdleTimeoutAnnotation: "12"}, 12)
+			twenty := "20"
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 0), &twenty)
+			eventuallyNamespaceEvent(cs, ns.Name, "EgressConfigConflict", time.Minute)
+			consistentlyEgressIdleTimeout(natID, 12, baseline)
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 1), &twenty)
+			consistentlyEgressIdleTimeout(natID, 12, baseline)
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 2), &twenty)
+			applied := eventuallyEgressIdleTimeout(natID, 20)
+			expectEgressIdleAddressesUnchanged(baseline, applied)
+
+			By("Adding an agreeing member without another NAT rewrite")
+			createEgressPodsWith(cs, ns.Name, identity, 3, 1, map[string]string{egressIdleTimeoutAnnotation: twenty})
+			Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
+			eventuallyBYORegistered(cs, ns.Name, resourceGroupName, identity, natID, 4*time.Minute)
+			Consistently(func() (egressIdleGatewayState, error) {
+				return readEgressIdleGateway(natID)
+			}, 30*time.Second, defaultPollInterval).Should(Equal(applied))
+		})
+
+		It("should keep invalid members in the denominator and recover after correction or removal", func() {
+			identity := "idle-invalid-" + ns.Name[len(ns.Name)-5:]
+			natID, baseline := startManaged(identity, 3, map[string]string{egressIdleTimeoutAnnotation: "12"}, 12)
+			invalid, twenty, thirty := "invalid", "20", "30"
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 0), &invalid)
+			eventuallyNamespaceEvent(cs, ns.Name, "InvalidEgressConfig", time.Minute)
+			for i := 1; i < 3; i++ {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, i), &twenty)
+			}
+			consistentlyEgressIdleTimeout(natID, 12, baseline)
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 0), &twenty)
+			expectEgressIdleAddressesUnchanged(baseline, eventuallyEgressIdleTimeout(natID, 20))
+
+			invalid = "121"
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 0), &invalid)
+			for i := 1; i < 3; i++ {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, i), &thirty)
+			}
+			consistentlyEgressIdleTimeout(natID, 20, baseline)
+			Expect(cs.CoreV1().Pods(ns.Name).Delete(context.TODO(), egressPodName(identity, 0), metav1.DeleteOptions{})).To(Succeed())
+			expectEgressIdleAddressesUnchanged(baseline, eventuallyEgressIdleTimeout(natID, 30))
+			eventuallyBYORegistered(cs, ns.Name, resourceGroupName, identity, natID, 4*time.Minute)
+		})
+
+		It("should transfer a relabelled pod's vote between identities without retaining or dropping it", func() {
+			suffix := ns.Name[len(ns.Name)-5:]
+			source, destination := "idle-from-"+suffix, "idle-to-"+suffix
+			sourceID, sourceBefore := startManaged(source, 2, map[string]string{egressIdleTimeoutAnnotation: "12"}, 12)
+			destinationID, destinationBefore := startManaged(destination, 2, map[string]string{egressIdleTimeoutAnnotation: "20"}, 20)
+			moving := egressPodName(source, 0)
+			thirty, forty, fifty := "30", "40", "50"
+			patchEgressIdleTimeout(cs, ns.Name, moving, &thirty)
+			eventuallyNamespaceEvent(cs, ns.Name, "EgressConfigConflict", time.Minute)
+			consistentlyEgressIdleTimeout(sourceID, 12, sourceBefore)
+			relabelEgressPod(cs, ns.Name, moving, destination, "")
+			eventuallyBYORegistered(cs, ns.Name, resourceGroupName, source, sourceID, 4*time.Minute)
+			eventuallyBYORegistered(cs, ns.Name, resourceGroupName, destination, destinationID, 4*time.Minute)
+
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(source, 1), &fifty)
+			expectEgressIdleAddressesUnchanged(sourceBefore, eventuallyEgressIdleTimeout(sourceID, 50))
+			for i := 0; i < 2; i++ {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(destination, i), &forty)
+			}
+			consistentlyEgressIdleTimeout(destinationID, 20, destinationBefore)
+			patchEgressIdleTimeout(cs, ns.Name, moving, &forty)
+			expectEgressIdleAddressesUnchanged(destinationBefore, eventuallyEgressIdleTimeout(destinationID, 40))
+		})
+
+		It("should count a same-name replacement pod once and discard the deleted UID's vote", func() {
+			identity := "idle-uid-" + ns.Name[len(ns.Name)-5:]
+			natID, baseline := startManaged(identity, 2, map[string]string{egressIdleTimeoutAnnotation: "12"}, 12)
+			name := egressPodName(identity, 0)
+			old, err := cs.CoreV1().Pods(ns.Name).Get(context.TODO(), name, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			twenty, forty := "20", "40"
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 1), &twenty)
+			eventuallyNamespaceEvent(cs, ns.Name, "EgressConfigConflict", time.Minute)
+			consistentlyEgressIdleTimeout(natID, 12, baseline)
+			Expect(cs.CoreV1().Pods(ns.Name).Delete(context.TODO(), name, metav1.DeleteOptions{})).To(Succeed())
+			Eventually(func() (bool, error) {
+				_, getErr := cs.CoreV1().Pods(ns.Name).Get(context.TODO(), name, metav1.GetOptions{})
+				if apierrors.IsNotFound(getErr) {
+					return true, nil
+				}
+				return false, getErr
+			}, 4*time.Minute, defaultPollInterval).Should(BeTrue())
+			expectEgressIdleAddressesUnchanged(baseline, eventuallyEgressIdleTimeout(natID, 20))
+
+			createEgressPodsWith(cs, ns.Name, identity, 0, 1, map[string]string{egressIdleTimeoutAnnotation: "30"})
+			Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
+			replacement, err := cs.CoreV1().Pods(ns.Name).Get(context.TODO(), name, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(replacement.UID).NotTo(Equal(old.UID))
+			eventuallyBYORegistered(cs, ns.Name, resourceGroupName, identity, natID, 4*time.Minute)
+			patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 1), &forty)
+			consistentlyEgressIdleTimeout(natID, 20, baseline)
+			patchEgressIdleTimeout(cs, ns.Name, name, &forty)
+			expectEgressIdleAddressesUnchanged(baseline, eventuallyEgressIdleTimeout(natID, 40))
+		})
+
+		It("should keep the RG selector separate from voting and never configure a BYO gateway", func() {
+			suffix := ns.Name[len(ns.Name)-5:]
+			rg := byoResourceGroup(suffix)
+			identity := "idle-byo-" + suffix
+			addresses := createBYOAddresses(cs, rg, identity)
+			natID := createBYONATGateway(rg, identity, addresses)
+			createBYOEgressPods(cs, ns.Name, identity, rg, 2)
+			Expect(utils.WaitPodsToBeReady(cs, ns.Name)).To(Succeed())
+			eventuallyBYORegistered(cs, ns.Name, rg, identity, natID, 4*time.Minute)
+			baseline := eventuallyEgressIdleTimeout(natID, 4)
+			Consistently(func() error {
+				return namespaceEventAbsentErr(cs, ns.Name, "InvalidEgressConfig")
+			}, 20*time.Second, defaultPollInterval).Should(Succeed(), "the RG annotation is not a configuration vote")
+
+			requested := "4"
+			for i := 0; i < 2; i++ {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, i), &requested)
+			}
+			eventuallyNamespaceEvent(cs, ns.Name, "InvalidEgressConfig", time.Minute)
+			requested = "12"
+			for i := 0; i < 2; i++ {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, i), &requested)
+			}
+			Consistently(func() (egressIdleGatewayState, error) {
+				return readEgressIdleGateway(natID)
+			}, 30*time.Second, defaultPollInterval).Should(Equal(baseline), "BYO configuration and ETag must remain unchanged")
+			expectNoManagedNATGateway(identity)
+			deleteEgressPods(cs, ns.Name, identity)
+			eventuallyBYOUnlinked(identity, natID)
+			expectBYOResourcesExist(natID, addresses)
+		})
+
+		It("should rebuild unchanged votes after restart without rewriting the NAT Gateway", func() {
+			if !IsCCMClusterConfigured() {
+				Skip("CCM cluster access is required for restart validation")
+			}
+			identity := "idle-restart-" + ns.Name[len(ns.Name)-5:]
+			natID, baseline := startManaged(identity, 2, map[string]string{egressIdleTimeoutAnnotation: "12"}, 12)
+			ccm, err := NewCCMClusterClient()
+			Expect(err).NotTo(HaveOccurred())
+			message := fmt.Sprintf("Egress identity %q has idle timeout 12 minutes", identity)
+			Eventually(func() bool {
+				return namespaceHasEventContaining(cs, ns.Name, "EgressConfigApplied", message)
+			}, 4*time.Minute, defaultPollInterval).Should(BeTrue())
+			ccmToRestore = ccm
+			Expect(scaleCCMDeployment(context.TODO(), ccm, 0)).To(Succeed())
+			Expect(waitForCCMFullyDown(context.TODO(), ccm, GetCCMRecoveryTimeout())).To(Succeed())
+			Expect(cs.CoreV1().Events(ns.Name).DeleteCollection(context.TODO(), metav1.DeleteOptions{},
+				metav1.ListOptions{FieldSelector: "reason=EgressConfigApplied"})).To(Succeed())
+			Expect(namespaceEventAbsentErr(cs, ns.Name, "EgressConfigApplied")).To(Succeed())
+			Expect(scaleCCMDeployment(context.TODO(), ccm, 1)).To(Succeed())
+			Expect(waitForCCMFullyUp(context.TODO(), ccm, GetCCMRecoveryTimeout())).To(Succeed())
+			ccmToRestore = nil
+			Eventually(func() bool {
+				return namespaceHasEventContaining(cs, ns.Name, "EgressConfigApplied", message)
+			}, 4*time.Minute, defaultPollInterval).Should(BeTrue(), "the restarted controller must reconcile before checking for no rewrite")
+			Consistently(func() (egressIdleGatewayState, error) {
+				return readEgressIdleGateway(natID)
+			}, 30*time.Second, defaultPollInterval).Should(Equal(baseline), "restart must not rewrite an already satisfied timeout")
+			eventuallyBYORegistered(cs, ns.Name, resourceGroupName, identity, natID, 4*time.Minute)
+		})
+
+		It("should reject conflicting or invalid startup votes and apply unanimous changes made during downtime", func() {
+			if !IsCCMClusterConfigured() {
+				Skip("CCM cluster access is required for restart validation")
+			}
+			identity := "idle-down-" + ns.Name[len(ns.Name)-5:]
+			natID, baseline := startManaged(identity, 3, map[string]string{egressIdleTimeoutAnnotation: "12"}, 12)
+			ccm, err := NewCCMClusterClient()
+			Expect(err).NotTo(HaveOccurred())
+			changeWhileDown := func(change func()) {
+				ccmToRestore = ccm
+				Expect(scaleCCMDeployment(context.TODO(), ccm, 0)).To(Succeed())
+				Expect(waitForCCMFullyDown(context.TODO(), ccm, GetCCMRecoveryTimeout())).To(Succeed())
+				change()
+				Expect(scaleCCMDeployment(context.TODO(), ccm, 1)).To(Succeed())
+				Expect(waitForCCMFullyUp(context.TODO(), ccm, GetCCMRecoveryTimeout())).To(Succeed())
+				ccmToRestore = nil
+			}
+			twenty, invalid := "20", "invalid"
+			changeWhileDown(func() {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 0), &twenty)
+			})
+			eventuallyNamespaceEvent(cs, ns.Name, "EgressConfigConflict", time.Minute)
+			consistentlyEgressIdleTimeout(natID, 12, baseline)
+
+			changeWhileDown(func() {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 1), &invalid)
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 2), &twenty)
+			})
+			eventuallyNamespaceEvent(cs, ns.Name, "InvalidEgressConfig", time.Minute)
+			consistentlyEgressIdleTimeout(natID, 12, baseline)
+
+			changeWhileDown(func() {
+				patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, 1), &twenty)
+			})
+			expectEgressIdleAddressesUnchanged(baseline, eventuallyEgressIdleTimeout(natID, 20))
+			changeWhileDown(func() {
+				for i := 0; i < 3; i++ {
+					patchEgressIdleTimeout(cs, ns.Name, egressPodName(identity, i), nil)
+				}
+			})
+			expectEgressIdleAddressesUnchanged(baseline, eventuallyEgressIdleTimeout(natID, 4))
+			eventuallyBYORegistered(cs, ns.Name, resourceGroupName, identity, natID, 4*time.Minute)
+		})
 	})
 
 	It("should create NAT gateway and PIP for pods with egress label", func() {
@@ -1902,6 +2151,136 @@ func grantEgressNetworkContributor(rg string, ids []string) {
 			"--role", "Network Contributor", "--scope", scope)
 		Expect(err).NotTo(HaveOccurred(), string(out))
 	}
+}
+
+type egressIdleGatewayState struct {
+	ID, ETag, State, Link string
+	Idle                  *int32
+	IPv4, IPv6            []string
+}
+
+func managedEgressConfigResourceIDs(identity string) []string {
+	prefix := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/", subscriptionID, resourceGroupName)
+	return []string{
+		prefix + "natGateways/" + identity,
+		prefix + "publicIPAddresses/" + identity + "-pip",
+		prefix + "publicIPAddresses/" + identity + "-pip-v6",
+	}
+}
+
+func namespaceEventAbsentErr(cs clientset.Interface, namespace, reason string) error {
+	events, err := cs.CoreV1().Events(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("listing events in %s: %w", namespace, err)
+	}
+	for _, event := range events.Items {
+		if event.Reason == reason {
+			return fmt.Errorf("unexpected %s event in %s: %s", reason, namespace, event.Message)
+		}
+	}
+	return nil
+}
+
+func TestNamespaceEventAbsentErr(t *testing.T) {
+	for _, test := range []struct {
+		name, reason string
+		listError    bool
+		wantError    bool
+	}{
+		{name: "no events"},
+		{name: "other event", reason: "Other"},
+		{name: "unexpected event", reason: "InvalidEgressConfig", wantError: true},
+		{name: "read failure is not absence", listError: true, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+			if test.reason != "" {
+				_, err := cs.CoreV1().Events("test").Create(context.TODO(), &v1.Event{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "event"}, Reason: test.reason,
+				}, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.listError {
+				cs.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("API unavailable")
+				})
+			}
+			if err := namespaceEventAbsentErr(cs, "test", "InvalidEgressConfig"); (err != nil) != test.wantError {
+				t.Fatalf("error=%v, want error=%v", err, test.wantError)
+			}
+		})
+	}
+}
+
+func readEgressIdleGateway(id string) (egressIdleGatewayState, error) {
+	var state egressIdleGatewayState
+	out, err := runAz("rest", "--method", "get", "--url", armURL(id), "--query",
+		"{ID:id,ETag:etag,State:properties.provisioningState,Idle:properties.idleTimeoutInMinutes,"+
+			"IPv4:properties.publicIpAddresses[].id,IPv6:properties.publicIpAddressesV6[].id,Link:properties.serviceGateway.id}", "-o", "json")
+	if err != nil {
+		return state, fmt.Errorf("reading egress NAT Gateway %s: %w: %s", id, err, out)
+	}
+	if err := json.Unmarshal(out, &state); err != nil {
+		return state, fmt.Errorf("decoding egress NAT Gateway %s: %w", id, err)
+	}
+	if !strings.EqualFold(state.ID, id) || state.ETag == "" || !strings.EqualFold(state.State, "Succeeded") {
+		return state, fmt.Errorf("NAT Gateway %s is not ready: ID=%q ETag=%q state=%q", id, state.ID, state.ETag, state.State)
+	}
+	if state.Idle == nil {
+		minutes := int32(4)
+		state.Idle = &minutes
+	}
+	slices.Sort(state.IPv4)
+	slices.Sort(state.IPv6)
+	return state, nil
+}
+
+func eventuallyEgressIdleTimeout(id string, wanted int32) egressIdleGatewayState {
+	var state egressIdleGatewayState
+	Eventually(func() error {
+		var err error
+		state, err = readEgressIdleGateway(id)
+		if err != nil {
+			return err
+		}
+		if *state.Idle != wanted {
+			return fmt.Errorf("NAT Gateway %s idle timeout is %d, want %d", id, *state.Idle, wanted)
+		}
+		return nil
+	}, 4*time.Minute, defaultPollInterval).Should(Succeed())
+	return state
+}
+
+func expectEgressIdleAddressesUnchanged(before, after egressIdleGatewayState) {
+	Expect(after.ID).To(Equal(before.ID))
+	Expect(after.IPv4).To(Equal(before.IPv4))
+	Expect(after.IPv6).To(Equal(before.IPv6))
+	Expect(after.Link).To(Equal(before.Link))
+}
+
+func consistentlyEgressIdleTimeout(id string, minutes int32, before egressIdleGatewayState) {
+	Consistently(func() error {
+		current, err := readEgressIdleGateway(id)
+		if err != nil {
+			return err
+		}
+		if *current.Idle != minutes || !slices.Equal(current.IPv4, before.IPv4) ||
+			!slices.Equal(current.IPv6, before.IPv6) || current.Link != before.Link {
+			return fmt.Errorf("NAT Gateway %s changed without unanimous valid votes", id)
+		}
+		return nil
+	}, 30*time.Second, defaultPollInterval).Should(Succeed())
+}
+
+func patchEgressIdleTimeout(cs clientset.Interface, namespace, name string, value *string) {
+	payload, err := json.Marshal(map[string]interface{}{"metadata": map[string]interface{}{
+		"annotations": map[string]interface{}{egressIdleTimeoutAnnotation: value},
+	}})
+	Expect(err).NotTo(HaveOccurred())
+	_, err = cs.CoreV1().Pods(namespace).Patch(context.TODO(), name, types.MergePatchType, payload, metav1.PatchOptions{})
+	Expect(err).NotTo(HaveOccurred(), "patching the idle timeout of %s/%s", namespace, name)
 }
 
 var resourceGroupInIDRegexp = regexp.MustCompile(`(?i)/resourceGroups/([^/]+)/`)

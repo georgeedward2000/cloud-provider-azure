@@ -25,6 +25,7 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
@@ -126,10 +127,8 @@ type OutboundConfig struct {
 	// IPFamilies holds the address families this NAT Gateway must provide a public path for
 	// ("IPv4"/"IPv6"), decided once when the service is created. Empty means IPv4 only.
 	//
-	// There is no outbound update path (UpdateService returns early for a non-inbound config), so
-	// a NAT Gateway is never modified after creation and this set cannot change. It is therefore
-	// derived from the cluster's families rather than from the pods of one identity: a dual-stack
-	// cluster can run single-stack pods, so the first pod does not predict the rest.
+	// Idle-timeout reconciliation does not change these families. They are derived from the
+	// cluster at creation rather than its first pod, which may be single-stack.
 	IPFamilies []string
 }
 
@@ -363,6 +362,10 @@ type ServiceOperationState struct {
 	// (a) populate LastAppliedConfig on success and (b) detect whether a newer
 	// Config arrived during the in-flight operation so we can reschedule.
 	InFlightConfig *ServiceConfig
+	// InFlightState identifies the dispatched operation even when pod events change State.
+	InFlightState ResourceState
+	// EgressConfigDirty requests another informer-backed reconciliation after the current operation.
+	EgressConfigDirty bool
 	// LastAppliedConfig is the configuration last successfully applied to Azure.
 	// Used by UpdateService to short-circuit no-op updates.
 	LastAppliedConfig *ServiceConfig
@@ -458,6 +461,10 @@ type DiffTracker struct {
 	// nodeLister is the provider's shared-informer-backed Node lister used to resolve EndpointSlice
 	// node names to InternalIPs. Guarded by mu.
 	nodeLister corelisters.NodeLister
+	// egressPodInformer is the existing filtered informer used for current pod objects.
+	egressPodInformer cache.SharedIndexInformer
+	egressVotes       egressConfigVotes
+	egressVotesReady  bool
 
 	// eventRecorder emits Service Gateway pod events; set post-init before the egress informer starts.
 	eventRecorder record.EventRecorder

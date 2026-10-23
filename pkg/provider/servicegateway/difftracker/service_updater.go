@@ -298,6 +298,7 @@ func (s *ServiceUpdater) processBatch() {
 				continue
 			}
 			opState.State = StateCreationInProgress
+			opState.InFlightState = StateCreationInProgress
 			opState.OperationStartedAt = time.Now()
 			configSnapshot := opState.Config
 			opState.InFlightConfig = &configSnapshot
@@ -330,6 +331,7 @@ func (s *ServiceUpdater) processBatch() {
 			if s.retryGate(serviceUID, opState) {
 				continue
 			}
+			opState.InFlightState = StateDeletionInProgress
 			opState.OperationStartedAt = time.Now()
 			workToDo = append(workToDo, workItem{serviceUID, opState.Config, StateDeletionInProgress, opState.CorrelationID, opState.TriggeringPodNamespace, opState.TriggeringPodName})
 
@@ -337,6 +339,8 @@ func (s *ServiceUpdater) processBatch() {
 			if s.retryGate(serviceUID, opState) {
 				continue
 			}
+			opState.EgressConfigDirty = false
+			opState.InFlightState = StateUpdateInProgress
 			// Snapshot the desired config so OnServiceCreationComplete can detect drift.
 			opState.OperationStartedAt = time.Now()
 			configSnapshot := opState.Config
@@ -396,9 +400,10 @@ func (s *ServiceUpdater) processBatch() {
 					if cfg.IsInbound {
 						s.updateInboundService(uid, cfg.InboundConfig, corrID)
 					} else {
-						s.logger.Info("Skipped outbound service update; egress identities cannot be updated in place", "serviceUID", uid)
-						recordOutboundServiceUpdateSkipped()
-						s.onComplete(uid, true, nil)
+						ctx, cancel := context.WithTimeout(s.ctx, getNRPOperationTimeout())
+						defer cancel()
+						err := s.diffTracker.reconcileEgressConfig(ctx, uid)
+						s.onComplete(uid, err == nil, err)
 					}
 				})
 			}(work.serviceUID, work.config, work.correlationID)

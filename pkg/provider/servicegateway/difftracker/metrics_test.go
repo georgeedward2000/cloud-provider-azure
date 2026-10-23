@@ -322,6 +322,27 @@ func TestOnServiceCreationComplete_PreEmptRecordsInFlightUpdate(t *testing.T) {
 		"an already-applied service's preempted op is an update, not a create")
 }
 
+func TestOnServiceCreationComplete_PreEmptUsesDispatchProvenance(t *testing.T) {
+	RegisterMetrics()
+	serviceOperationTotal.Reset()
+	dt := newTestDiffTracker()
+	config := NewOutboundServiceConfig("payments", nil)
+	dt.pendingServiceOps["payments"] = &ServiceOperationState{
+		ServiceUID: "payments", Config: config, State: StateDeletionPending,
+		InFlightState: StateCreationInProgress, InFlightConfig: &config, LastAppliedConfig: &config,
+	}
+	dt.pendingServiceDeletions["payments"] = &PendingServiceDeletion{ServiceUID: "payments"}
+	dt.OnServiceCreationComplete("payments", true, nil)
+	created, err := testutil.GetCounterMetricValue(
+		serviceOperationTotal.WithLabelValues("create", "outbound", "success", "", "false"))
+	assert.NoError(t, err)
+	assert.Equal(t, 1.0, created, "a prior config must not override the dispatched operation kind")
+	updated, err := testutil.GetCounterMetricValue(
+		serviceOperationTotal.WithLabelValues("update", "outbound", "success", "", "false"))
+	assert.NoError(t, err)
+	assert.Zero(t, updated)
+}
+
 func TestOnServiceCreationComplete_OrphanDeleteSuccessCountsOrphanCleanup(t *testing.T) {
 	RegisterMetrics()
 
@@ -460,11 +481,7 @@ func TestOnServiceCreationComplete_RefreshesPendingDeletionsGauge(t *testing.T) 
 		"the gauge must track the map after a completion, not stay at the value the last DeleteService set")
 }
 
-// TestOnServiceCreationComplete_OutboundUpdateRecordsNoAzureWrite pins that an outbound update
-// completion does not report a successful Azure operation. The updater cannot apply an outbound
-// update, so it completes the operation without calling Azure; recording the operation counter and
-// duration histogram there would report a write that never happened.
-func TestOnServiceCreationComplete_OutboundUpdateRecordsNoAzureWrite(t *testing.T) {
+func TestOnServiceCreationComplete_OutboundUpdateRecordsOperation(t *testing.T) {
 	RegisterMetrics()
 	serviceOperationTotal.Reset()
 	serviceOperationDuration.Reset()
@@ -491,11 +508,11 @@ func TestOnServiceCreationComplete_OutboundUpdateRecordsNoAzureWrite(t *testing.
 		serviceOperationTotal.WithLabelValues("update", "outbound", "success", "", "false"),
 	)
 	assert.NoError(t, err)
-	assert.Equal(t, 0.0, got, "an outbound update performs no Azure write and must not be counted as one")
+	assert.Equal(t, 1.0, got, "outbound configuration reconciliation is now a supported update operation")
 
 	durCount, err := testutil.GetHistogramMetricCount(
 		serviceOperationDuration.WithLabelValues("update", "outbound"),
 	)
 	assert.NoError(t, err)
-	assert.Equal(t, uint64(0), durCount, "no Azure call was made, so there is no duration to observe")
+	assert.Equal(t, uint64(1), durCount, "the completed update must have one duration observation")
 }

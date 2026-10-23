@@ -791,6 +791,8 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		dt.logger.V(4).Info("Could not complete service operation because pending operation was not found", "service", serviceUID)
 		return
 	}
+	inFlightState := opState.InFlightState
+	opState.InFlightState = StateNotStarted
 
 	// Measure latency from when the operation was dispatched (in processBatch), not from
 	// this callback which runs after the Azure work is done. Fall back to now if unset.
@@ -815,10 +817,11 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		opState.InFlightConfig = nil
 		// The in-flight create/update just completed (success or err) before being routed to deletion;
 		// record it once so the completion is counted like every other branch (the delete itself is
-		// recorded separately when it completes). Infer the op type from LastAppliedConfig: a service
-		// that was never successfully applied was mid-CREATE, otherwise mid-UPDATE.
+		// recorded separately when it completes). Use dispatch provenance when available; an
+		// applied configuration also distinguishes update callbacks without a dispatch snapshot.
 		preemptOp := "create"
-		if opState.LastAppliedConfig != nil {
+		if inFlightState == StateUpdateInProgress ||
+			(inFlightState == StateNotStarted && opState.LastAppliedConfig != nil) {
 			preemptOp = "update"
 		}
 		preemptErrCode := ""
@@ -862,20 +865,17 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 		return
 	}
 
-	// Determine if this is creation, update, or deletion based on current state
+	// Pod events can change State after dispatch; recorded operation provenance takes precedence.
 	isDeletion := (opState.State == StateDeletionInProgress)
-	isUpdate := (opState.State == StateUpdateInProgress)
+	isUpdate := inFlightState == StateUpdateInProgress ||
+		(inFlightState == StateNotStarted && opState.State == StateUpdateInProgress)
 
 	if isUpdate {
+		opState.State = StateUpdateInProgress
 		if success {
 			dt.logger.V(2).Info("Updated service", "service", serviceUID)
-			// An outbound completion reaches here from the updater's skip path, which performs no
-			// Azure call; recording an update duration and success would assert a write that never
-			// happened. Those completions are counted by outbound_service_updates_skipped_total.
-			if opState.Config.IsInbound {
-				recordServiceOperation("update", true, startTime, nil, "", opState.IsOrphan)
-				recordServiceOperationRetries("update", true, opState.RetryCount)
-			}
+			recordServiceOperation("update", opState.Config.IsInbound, startTime, nil, "", opState.IsOrphan)
+			recordServiceOperationRetries("update", opState.Config.IsInbound, opState.RetryCount)
 			// Persist the config that was actually applied (snapshot at dispatch time).
 			if opState.InFlightConfig != nil {
 				applied := *opState.InFlightConfig
@@ -884,7 +884,8 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			opState.RetryCount = 0
 
 			// If the desired Config drifted while the update was in flight, reschedule.
-			if opState.InFlightConfig != nil && !configsEqualForUpdate(opState.InFlightConfig, &opState.Config) {
+			if opState.EgressConfigDirty ||
+				(opState.InFlightConfig != nil && !configsEqualForUpdate(opState.InFlightConfig, &opState.Config)) {
 				dt.logger.V(5).Info("Rescheduled service update after desired config drifted", "service", serviceUID)
 				opState.State = StateUpdateInProgress
 				opState.LastAttempt = time.Now().Format(time.RFC3339)
@@ -1087,6 +1088,9 @@ func (dt *DiffTracker) OnServiceCreationComplete(serviceUID string, success bool
 			// Promote any pending endpoints and pods
 			dt.promotePendingEndpointsLocked(serviceUID)
 			dt.promotePendingPodsLocked(serviceUID)
+			if !opState.Config.IsInbound {
+				dt.queueEgressConfigLocked(serviceUID)
+			}
 
 			// Trigger LocationsUpdater to sync the service state (whether buffers existed or not)
 			dt.triggerLocationsUpdater()
@@ -1355,10 +1359,6 @@ func (dt *DiffTracker) addPod(serviceUID, podKey, podUID, location, address stri
 		dt.triggerLocationsUpdater()
 
 	case StateUpdateInProgress:
-		// Outbound updates are currently a fast-path no-op in the ServiceUpdater
-		// (see updateInboundService dispatch); they should not produce a sustained
-		// StateUpdateInProgress for NAT Gateway services. Treat the same as StateCreated
-		// for safety in case the outbound update path is implemented later.
 		dt.logger.V(5).Info("Added pod while service is updating", "service", serviceUID, "pod", podKey)
 		err := dt.updateK8sPodLocked(UpdatePodInputType{
 			PodOperation:           Add,
@@ -1424,6 +1424,7 @@ func (dt *DiffTracker) addPod(serviceUID, podKey, podUID, location, address stri
 		}); err != nil {
 			dt.logger.V(4).Info("Could not revive pod for service", "err", err, "pod", podKey, "service", serviceUID)
 		}
+		dt.queueEgressConfigLocked(serviceUID)
 		dt.triggerLocationsUpdater()
 
 	case StateDeletionInProgress:
@@ -1899,6 +1900,10 @@ func (dt *DiffTracker) markOutboundServiceForDeletionLocked(serviceUID string) {
 		if opState.State == StateDeletionInProgress {
 			return
 		}
+		if opState.State == StateCreated || opState.State == StateUpdateInProgress {
+			resetRetryStateLocked(opState)
+			opState.EgressConfigDirty = false
+		}
 		opState.State = StateDeletionPending
 	}
 	dt.pendingServiceDeletions[serviceUID] = &PendingServiceDeletion{
@@ -2354,7 +2359,7 @@ func (dt *DiffTracker) checkInitializationCompleteLocked() {
 }
 
 // configsEqualForUpdate returns true if two ServiceConfigs describe the same desired state
-// from the perspective of the update path. Only the inbound shape is compared today.
+// from the perspective of the update path. Egress settings come from the pod informer.
 func configsEqualForUpdate(a, b *ServiceConfig) bool {
 	if a == nil && b == nil {
 		return true
@@ -2368,7 +2373,7 @@ func configsEqualForUpdate(a, b *ServiceConfig) bool {
 	if a.IsInbound {
 		return a.InboundConfig.Equals(b.InboundConfig)
 	}
-	// Outbound update path is not implemented yet; treat as equal so we don't loop.
+	// EgressConfigDirty, not the creation-only IP-family shape, requests another outbound update.
 	return true
 }
 

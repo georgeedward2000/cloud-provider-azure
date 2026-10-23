@@ -258,6 +258,14 @@ const (
 	// PodAnnotationServiceEgressGatewayResourceGroup selects the same-named BYO NAT Gateway
 	// in this resource group, within the network subscription and outside the node resource group.
 	PodAnnotationServiceEgressGatewayResourceGroup = "kubernetes.azure.com/service-egress-gateway-resource-group"
+	PodAnnotationServiceEgressGatewayIdleTimeout   = "kubernetes.azure.com/service-egress-gateway-idle-timeout"
+	ServiceEgressGatewayIdleTimeoutDefaultMinutes  = int32(4)
+	ServiceEgressGatewayIdleTimeoutMinMinutes      = int32(4)
+	ServiceEgressGatewayIdleTimeoutMaxMinutes      = int32(120)
+	ServiceEgressGatewayReasonInvalidConfig        = "InvalidEgressConfig"
+	ServiceEgressGatewayReasonConfigConflict       = "EgressConfigConflict"
+	ServiceEgressGatewayReasonConfigApplied        = "EgressConfigApplied"
+	ServiceEgressGatewayReasonConfigRetrying       = "EgressConfigRetrying"
 
 	// ResourceGroupNamePattern follows Azure resource-group naming rules.
 	ResourceGroupNamePattern = `^[\p{L}\p{Nd}_().-]{0,89}[\p{L}\p{Nd}_()-]$` // codespell:ignore nd

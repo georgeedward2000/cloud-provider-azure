@@ -91,19 +91,25 @@ func (dt *DiffTracker) SetUpPodInformer(stopCh <-chan struct{}) error {
 		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
 			// Only watch pods with the egress gateway label
 			options.LabelSelector = consts.PodLabelServiceEgressGateway
+			// Configuration must not be decided from a stale initial list.
+			if options.ResourceVersion == "0" {
+				options.ResourceVersion = ""
+			}
 		}),
 	)
 
 	podInformer := podInformerFactory.Core().V1().Pods().Informer()
-	_, err := podInformer.AddEventHandler(
+	registration, err := podInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				pod := obj.(*v1.Pod)
+				dt.observeEgressConfigPod(pod, false)
 				dt.podInformerAddPod(pod)
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
 				oldPod := oldObj.(*v1.Pod)
 				newPod := newObj.(*v1.Pod)
+				dt.observeEgressConfigPod(newPod, oldPod.ResourceVersion == newPod.ResourceVersion)
 				dt.reconcileEgressPodUpdate(oldPod, newPod)
 			},
 			DeleteFunc: func(obj interface{}) {
@@ -115,12 +121,17 @@ func (dt *DiffTracker) SetUpPodInformer(stopCh <-chan struct{}) error {
 					return
 				}
 				// Idempotent - safe even if already processed in UpdateFunc.
+				dt.observeEgressConfigPod(pod, false)
 				dt.podInformerRemovePod(pod)
 			},
 		})
 	if err != nil {
 		return fmt.Errorf("setUpPodInformerForEgress: add event handlers: %w", err)
 	}
+	dt.mu.Lock()
+	dt.egressPodInformer = podInformer
+	dt.egressVotes, dt.egressVotesReady = egressConfigVotes{}, false
+	dt.mu.Unlock()
 
 	// Start the informer factory
 	klog.V(2).Infof("setUpPodInformerForEgress: Starting pod informer factory")
@@ -128,6 +139,17 @@ func (dt *DiffTracker) SetUpPodInformer(stopCh <-chan struct{}) error {
 	if !cache.WaitForCacheSync(stopCh, podInformer.HasSynced) {
 		return fmt.Errorf("setUpPodInformerForEgress: cache sync stopped before completion")
 	}
+	go func() {
+		if !cache.WaitForCacheSync(stopCh, registration.HasSynced) {
+			return
+		}
+		dt.mu.Lock()
+		defer dt.mu.Unlock()
+		dt.egressVotesReady = true
+		for identity := range dt.egressVotes.byIdentity {
+			dt.queueEgressConfigLocked(identity)
+		}
+	}()
 	klog.V(2).Infof("setUpPodInformerForEgress: Pod informer successfully initialized and synced")
 	return nil
 }

@@ -185,7 +185,7 @@ func (dt *DiffTracker) deleteLB(ctx context.Context, uid string) error {
 func withNATGatewayETag(ctx context.Context, etag *string) (context.Context, error) {
 	version := strings.TrimSpace(ptr.Deref(etag, ""))
 	if version == "" || version == "*" {
-		return nil, fmt.Errorf("BYO NAT Gateway was read without a usable ETag")
+		return nil, fmt.Errorf("NAT Gateway was read without a usable ETag")
 	}
 	// A retried PUT can return 412 after an earlier attempt applied; let the controller observe that ambiguity.
 	ctx = policy.WithRetryOptions(ctx, policy.RetryOptions{MaxRetries: -1})

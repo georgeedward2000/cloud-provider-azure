@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -39,6 +41,87 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 )
+
+func TestSetUpPodInformerEgressIdleUsesTheCompleteCurrentCache(t *testing.T) {
+	first := egressIdleTestPod("a", "payments", "12")
+	second := egressIdleTestPod("b", "PAYMENTS", "20")
+	first.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}
+	second.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}
+	kube := fake.NewSimpleClientset(first, second)
+	listVersions := make(chan string, 4)
+	kube.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		list, ok := action.(interface{ GetListOptions() metav1.ListOptions })
+		if !ok {
+			t.Errorf("pod list action does not expose its options: %T", action)
+		} else {
+			select {
+			case listVersions <- list.GetListOptions().ResourceVersion:
+			default:
+			}
+		}
+		return false, nil, nil
+	})
+	blocked, release := make(chan struct{}), make(chan struct{})
+	var blockOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	kube.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.GetAction).GetName() == "b" {
+			blockOnce.Do(func() { close(blocked) })
+			<-release
+		}
+		return false, nil, nil
+	})
+	dt := newTestDiffTracker()
+	dt.kubeClient = kube
+	dt.NRPResources.NATGateways.Insert("payments")
+	stop := make(chan struct{})
+	defer close(stop)
+	done := make(chan error, 1)
+	go func() { done <- dt.SetUpPodInformer(stop) }()
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second pod handler did not reach its finalizer read")
+	}
+	select {
+	case err := <-done:
+		assert.NoError(t, err, "configuration indexing must not wait on every pod's API handler")
+	case <-time.After(5 * time.Second):
+		t.Fatal("pod informer startup waited on the blocked handler")
+	}
+	select {
+	case version := <-listVersions:
+		assert.Empty(t, version, "initial configuration membership must use a consistent list")
+	default:
+		t.Fatal("no initial pod list was observed")
+	}
+	dt.mu.Lock()
+	assert.False(t, dt.egressVotesReady, "a partial initial handler batch must not enable configuration")
+	assert.Equal(t, 2, dt.egressVotes.byIdentity["payments"].pods, "pod API work must not delay recording an observed vote")
+	assert.Empty(t, dt.pendingServiceOps, "no configuration update may be queued before all initial votes arrive")
+	dt.mu.Unlock()
+	unblock()
+	assert.Eventually(t, func() bool {
+		dt.mu.Lock()
+		defer dt.mu.Unlock()
+		_, voteErr := dt.egressVotes.agreed("payments")
+		return dt.egressVotesReady && errors.Is(voteErr, errEgressConfigConflict)
+	}, 5*time.Second, 10*time.Millisecond)
+
+	current, err := kube.CoreV1().Pods("test").Get(context.Background(), "b", metav1.GetOptions{})
+	assert.NoError(t, err)
+	current.Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] = "12"
+	_, err = kube.CoreV1().Pods("test").Update(context.Background(), current, metav1.UpdateOptions{})
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool {
+		dt.mu.Lock()
+		defer dt.mu.Unlock()
+		config, voteErr := dt.egressVotes.agreed("payments")
+		return voteErr == nil && config.IdleTimeoutMinutes == 12 &&
+			dt.egressVotes.byIdentity["payments"].pods == 2
+	}, 5*time.Second, 10*time.Millisecond)
+}
 
 func TestPodInformerCollisionDoesNotStrandFinalizer(t *testing.T) {
 	const identity = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"

@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient/mock_servicegatewayclient"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/servicegatewayclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/log"
 )
 
@@ -593,6 +594,132 @@ func TestInitialNATPutResponse(t *testing.T) {
 		err := &azcore.ResponseError{StatusCode: http.StatusForbidden,
 			RawResponse: &http.Response{Request: &http.Request{Method: method}}}
 		assert.Equal(t, method == http.MethodPut, isLinkRefusal(err))
+	}
+}
+
+func TestEgressIdleTimeoutConditionalWrites(t *testing.T) {
+	const identity = "idle-wire"
+	for _, mode := range []string{"success", "stale-etag", "applied-but-response-failed", "owner-deleted"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := testConfig()
+			id := fmt.Sprintf(consts.NatGatewayIDTemplate, cfg.networkResourceSubscriptionID(), cfg.ResourceGroup, identity)
+			live := byoNATGateway(identity)
+			live.ID, live.Name = ptr.To(id), ptr.To(identity)
+			live.Tags[EgressIdentityTagKey] = ptr.To(identity)
+			live.Properties.ServiceGateway = &armnetwork.SubResource{ID: ptr.To(cfg.ServiceGatewayResourceID())}
+			live.Properties.IdleTimeoutInMinutes = ptr.To[int32](4)
+			live.Properties.ProvisioningState = ptr.To(armnetwork.ProvisioningStateSucceeded)
+			lastReadETag := ""
+			gets, puts := 0, 0
+			transport := natGatewayTransportFunc(func(req *http.Request) (*http.Response, error) {
+				assert.Contains(t, req.URL.Path, "/resourceGroups/rg/providers/Microsoft.Network/natGateways/"+identity)
+				status := http.StatusOK
+				var body []byte
+				switch req.Method {
+				case http.MethodGet:
+					if req.Header.Get("If-Match") == "" {
+						gets++
+						if live != nil {
+							lastReadETag = derefString(live.Etag)
+						}
+					}
+					if live == nil {
+						status = http.StatusNotFound
+						body = []byte(`{"error":{"code":"ResourceNotFound","message":"gone"}}`)
+					} else {
+						var marshalErr error
+						body, marshalErr = json.Marshal(live)
+						assert.NoError(t, marshalErr)
+					}
+				case http.MethodPut:
+					puts++
+					assert.NotEmpty(t, req.Header.Get("If-Match"))
+					assert.Equal(t, lastReadETag, req.Header.Get("If-Match"))
+					data, readErr := io.ReadAll(req.Body)
+					assert.NoError(t, readErr)
+					var written armnetwork.NatGateway
+					assert.NoError(t, json.Unmarshal(data, &written))
+					if puts == 1 && mode == "stale-etag" {
+						live.Etag = ptr.To(`W/"owner-changed"`)
+						live.Tags["owner"] = ptr.To("preserve-new-value")
+					}
+					if puts == 1 && mode == "owner-deleted" {
+						live = nil
+					}
+					switch {
+					case live == nil && req.Header.Get("If-Match") != "":
+						status = http.StatusNotFound
+						body = []byte(`{"error":{"code":"ResourceNotFound","message":"gone"}}`)
+					case live != nil && req.Header.Get("If-Match") != derefString(live.Etag):
+						status = http.StatusPreconditionFailed
+						body = []byte(`{"error":{"code":"PreconditionFailed","message":"changed"}}`)
+					default:
+						if assert.NotNil(t, live, "an unprotected PUT would recreate the owner's deleted resource") {
+							assert.Equal(t, live.Tags, written.Tags)
+							assert.Equal(t, live.Zones, written.Zones)
+							assert.Equal(t, live.Properties.Nat64, written.Properties.Nat64)
+							assert.Equal(t, live.Properties.SourceVirtualNetwork, written.Properties.SourceVirtualNetwork)
+							assert.Equal(t, live.Properties.PublicIPAddresses, written.Properties.PublicIPAddresses)
+							assert.Equal(t, live.Properties.PublicIPAddressesV6, written.Properties.PublicIPAddressesV6)
+							assert.Equal(t, live.Properties.ServiceGateway, written.Properties.ServiceGateway)
+						}
+						assert.Equal(t, int32(12), *written.Properties.IdleTimeoutInMinutes)
+						live = &written
+						live.Etag = ptr.To(`W/"updated"`)
+						live.Properties.ProvisioningState = ptr.To(armnetwork.ProvisioningStateSucceeded)
+						var marshalErr error
+						body, marshalErr = json.Marshal(live)
+						assert.NoError(t, marshalErr)
+						if mode == "applied-but-response-failed" && puts == 1 {
+							status = http.StatusInternalServerError
+							body = []byte(`{"error":{"code":"InternalServerError","message":"response lost after apply"}}`)
+						}
+					}
+				default:
+					t.Errorf("unexpected HTTP method %s", req.Method)
+					return nil, fmt.Errorf("unexpected HTTP method %s", req.Method)
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}},
+					Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+			})
+			client, err := natgatewayclient.New("sub", fakeCredential{}, &arm.ClientOptions{
+				ClientOptions: azcore.ClientOptions{Transport: transport},
+			})
+			if !assert.NoError(t, err) {
+				return
+			}
+			ctrl := gomock.NewController(t)
+			factory := mock_azclient.NewMockClientFactory(ctrl)
+			sgw := mock_servicegatewayclient.NewMockInterface(ctrl)
+			factory.EXPECT().GetNatGatewayClient().Return(client).AnyTimes()
+			factory.EXPECT().GetServiceGatewayClient().Return(sgw).AnyTimes()
+			sgw.EXPECT().GetServices(gomock.Any(), "rg", "sgw").Return(nil, nil).AnyTimes()
+			dt := newTestDiffTracker()
+			dt.config, dt.networkClientFactory = cfg, factory
+			changed, err := dt.updateEgressConfig(context.Background(), identity, egressConfig{IdleTimeoutMinutes: 12})
+			if mode == "success" {
+				assert.NoError(t, err)
+				assert.True(t, changed)
+			} else {
+				assert.Error(t, err)
+				assert.False(t, changed)
+			}
+			assert.Equal(t, 1, puts, "the SDK must not hide an ambiguous write behind an automatic retry")
+			if mode == "stale-etag" || mode == "applied-but-response-failed" {
+				changed, err = dt.updateEgressConfig(context.Background(), identity, egressConfig{IdleTimeoutMinutes: 12})
+				assert.NoError(t, err)
+				assert.Equal(t, mode == "stale-etag", changed)
+				assert.Equal(t, 2, gets, "the controller must read the actual state before retrying")
+				wantPuts := 1
+				if mode == "stale-etag" {
+					wantPuts++
+				}
+				assert.Equal(t, wantPuts, puts)
+			}
+			if mode == "owner-deleted" {
+				assert.Nil(t, live)
+			}
+		})
 	}
 }
 

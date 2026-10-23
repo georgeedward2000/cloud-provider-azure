@@ -1180,14 +1180,475 @@ func TestServiceUpdaterUpdateInboundService_PortRemovalDropsOnlyThatRule(t *test
 	}
 }
 
-// TestServiceUpdaterOutboundUpdateIsCountedAsSkipped pins that an outbound update dispatched by
-// processBatch is counted as skipped. The updater has no way to apply it, so the requested spec
-// change is silently dropped and the service keeps its existing Azure configuration; this counter
-// is the only signal an operator gets that the change was not applied.
-func TestServiceUpdaterOutboundUpdateIsCountedAsSkipped(t *testing.T) {
+func TestEgressConfigReconcilesAfterRevival(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		inFlight bool
+		failRead bool
+	}{
+		{name: "idle"},
+		{name: "successful update in flight", inFlight: true},
+		{name: "failed update in flight", inFlight: true, failRead: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			m := newOutboundMocks(ctrl)
+			dt := newTestDiffTracker()
+			dt.config, dt.networkClientFactory = testConfig(), m.factory
+			dt.NRPResources.NATGateways.Insert("payments")
+			old := egressIdleTestPod("old", "payments", "12")
+			old.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}
+			dt.kubeClient = fake.NewSimpleClientset(old)
+			informer := newEgressIdleTestInformer(t, old)
+			dt.egressPodInformer = informer
+			seedEgressIdleTestVotes(t, dt)
+			dt.podInformerAddPod(old)
+			dt.NRPResources.Locations[old.Status.HostIP] = NRPLocation{Addresses: map[string]NRPAddress{
+				old.Status.PodIP: {Services: newIgnoreCaseSetFromSlice([]string{"payments"})},
+			}}
+			dt.queueEgressConfig("payments")
+
+			live := byoNATGateway("payments")
+			live.Tags = egressIdentityTags("payments")
+			live.Properties.ServiceGateway = &armnetwork.SubResource{ID: ptr.To(dt.config.ServiceGatewayResourceID())}
+			live.Properties.IdleTimeoutInMinutes = ptr.To[int32](12)
+			if test.inFlight {
+				live.Properties.IdleTimeoutInMinutes = ptr.To[int32](4)
+			}
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+			reads := 0
+			m.nat.EXPECT().Get(gomock.Any(), "rg", "payments", nil).
+				DoAndReturn(func(context.Context, string, string, *string) (*armnetwork.NatGateway, error) {
+					reads++
+					if reads == 1 {
+						close(started)
+						if test.inFlight {
+							<-release
+						}
+						if test.failRead {
+							return nil, errors.New("read interrupted")
+						}
+					}
+					gateway, properties := *live, *live.Properties
+					gateway.Properties = &properties
+					return &gateway, nil
+				}).AnyTimes()
+			m.sgw.EXPECT().GetServices(gomock.Any(), "rg", "sgw").Return(nil, nil).AnyTimes()
+			m.nat.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "payments", gomock.Any()).
+				DoAndReturn(func(_ context.Context, _, _ string, desired armnetwork.NatGateway) (*armnetwork.NatGateway, error) {
+					live = &desired
+					return live, nil
+				}).AnyTimes()
+			updater := newTestServiceUpdater(dt)
+			updater.onComplete = dt.OnServiceCreationComplete
+			updater.processBatch()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("configuration reconciliation did not reach the NAT read")
+			}
+			if !test.inFlight {
+				updater.wg.Wait()
+			}
+
+			assert.NoError(t, informer.GetStore().Delete(old))
+			dt.observeEgressConfigPod(old, false)
+			dt.podInformerRemovePod(old)
+			assert.Equal(t, StateDeletionPending, dt.pendingServiceOps["payments"].State)
+			replacement := egressIdleTestPod("replacement", "payments", "20")
+			replacement.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}
+			replacement.Status.PodIP, replacement.Status.PodIPs = "10.0.0.3", []v1.PodIP{{IP: "10.0.0.3"}}
+			_, err := dt.kubeClient.CoreV1().Pods(replacement.Namespace).Create(context.Background(), replacement, metav1.CreateOptions{})
+			assert.NoError(t, err)
+			assert.NoError(t, informer.GetStore().Add(replacement))
+			dt.observeEgressConfigPod(replacement, false)
+			dt.podInformerAddPod(replacement)
+			unblock()
+			updater.wg.Wait()
+			if test.failRead {
+				dt.mu.Lock()
+				op := dt.pendingServiceOps["payments"]
+				assert.Equal(t, StateUpdateInProgress, op.State, "an update failure must not dispatch managed creation")
+				assert.Equal(t, 1, op.RetryCount)
+				op.NextRetryAt = time.Time{}
+				dt.mu.Unlock()
+			}
+			updater.processBatch()
+			updater.wg.Wait()
+			assert.Equal(t, int32(20), *live.Properties.IdleTimeoutInMinutes, "revival must reconcile without another Pod event or resync")
+			assert.Equal(t, StateCreated, dt.pendingServiceOps["payments"].State)
+			assert.False(t, dt.pendingServiceOps["payments"].EgressConfigDirty)
+		})
+	}
+}
+
+func TestEgressConfigWaitsForCurrentInformerVotes(t *testing.T) {
+	a, b := egressIdleTestPod("a", "payments", "12"), egressIdleTestPod("b", "payments", "20")
+	a.ResourceVersion, b.ResourceVersion = "1", "1"
+	a.Finalizers, b.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}, []string{ServiceGatewayPodCleanupFinalizer}
+	b.Status.PodIP, b.Status.PodIPs = "10.0.0.3", []v1.PodIP{{IP: "10.0.0.3"}}
+	kube := fake.NewSimpleClientset(a, b)
+	blockedA, releaseA := make(chan struct{}), make(chan struct{})
+	blockedOther, releaseOther := make(chan struct{}), make(chan struct{})
+	var armA atomic.Bool
+	var aOnce, otherOnce, releaseAOnce, releaseOtherOnce sync.Once
+	unblockA := func() { releaseAOnce.Do(func() { close(releaseA) }) }
+	unblockOther := func() { releaseOtherOnce.Do(func() { close(releaseOther) }) }
+	defer unblockA()
+	defer unblockOther()
+	kube.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		switch action.(k8stesting.GetAction).GetName() {
+		case "blocker":
+			otherOnce.Do(func() { close(blockedOther) })
+			<-releaseOther
+		case "a":
+			if armA.Load() {
+				aOnce.Do(func() { close(blockedA) })
+				<-releaseA
+			}
+		}
+		return false, nil, nil
+	})
+	ctrl := gomock.NewController(t)
+	m := newOutboundMocks(ctrl)
+	dt := newTestDiffTracker()
+	dt.config, dt.networkClientFactory, dt.kubeClient = testConfig(), m.factory, kube
+	m.nat.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	m.nat.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	dt.NRPResources.NATGateways.Insert("payments")
+	stop := make(chan struct{})
+	defer close(stop)
+	if !assert.NoError(t, dt.SetUpPodInformer(stop)) {
+		return
+	}
+	if !assert.Eventually(t, func() bool {
+		dt.mu.Lock()
+		defer dt.mu.Unlock()
+		return dt.egressVotesReady
+	}, 5*time.Second, time.Millisecond) {
+		return
+	}
+	updater := newTestServiceUpdater(dt)
+	updater.onComplete = dt.OnServiceCreationComplete
+	updater.processBatch()
+	updater.wg.Wait()
+
+	blocker := egressIdleTestPod("blocker", "unrelated", "")
+	_, err := kube.CoreV1().Pods("test").Create(context.Background(), blocker, metav1.CreateOptions{})
+	if !assert.NoError(t, err) {
+		return
+	}
+	select {
+	case <-blockedOther:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unrelated handler did not block in its finalizer read")
+	}
+	armA.Store(true)
+	updatedA, updatedB := a.DeepCopy(), b.DeepCopy()
+	updatedA.ResourceVersion, updatedB.ResourceVersion = "2", "2"
+	updatedA.Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] = "20"
+	updatedA.Status.HostIP = "10.0.0.10"
+	updatedB.Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] = "30"
+	podResource := v1.SchemeGroupVersion.WithResource("pods")
+	assert.NoError(t, kube.Tracker().Update(podResource, updatedA, "test"))
+	assert.NoError(t, kube.Tracker().Update(podResource, updatedB, "test"))
+	assert.NoError(t, kube.Tracker().Delete(podResource, "test", blocker.Name))
+	if !assert.Eventually(t, func() bool {
+		for key, wanted := range map[string]string{"test/a": "20", "test/b": "30"} {
+			obj, exists, getErr := dt.egressPodInformer.GetStore().GetByKey(key)
+			if getErr != nil || !exists || obj.(*v1.Pod).Annotations[consts.PodAnnotationServiceEgressGatewayIdleTimeout] != wanted {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, time.Millisecond) {
+		return
+	}
+	unblockOther()
+	select {
+	case <-blockedA:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first changed vote was not processed")
+	}
+	dt.mu.Lock()
+	selected, voteErr := dt.egressVotes.agreed("payments")
+	dt.mu.Unlock()
+	assert.NoError(t, voteErr)
+	assert.Equal(t, int32(20), selected.IdleTimeoutMinutes, "the fixture must expose apparently unanimous stale counters")
+	updater.processBatch()
+	updater.wg.Wait()
+	unblockA()
+	assert.Eventually(t, func() bool {
+		dt.mu.Lock()
+		defer dt.mu.Unlock()
+		_, err := dt.egressVotes.agreed("payments")
+		return errors.Is(err, errEgressConfigConflict)
+	}, 5*time.Second, time.Millisecond)
+}
+
+func TestEgressConfigIsScheduledAfterSuccessfulCreation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	m := newOutboundMocks(ctrl)
+	dt := newOutboundDiffTracker("payments", m, nil)
+	pod := egressIdleTestPod("member", "payments", "12")
+	dt.egressPodInformer = newEgressIdleTestInformer(t, pod)
+	seedEgressIdleTestVotes(t, dt)
+	op := dt.pendingServiceOps["payments"]
+	op.State, op.InFlightState = StateCreationInProgress, StateCreationInProgress
+	inFlight := op.Config
+	op.InFlightConfig = &inFlight
+	dt.NRPResources.NATGateways.Insert("payments")
+
+	dt.OnServiceCreationComplete("payments", true, nil)
+	assert.Equal(t, StateUpdateInProgress, op.State)
+	assert.True(t, op.EgressConfigDirty, "registration must be followed by the already-observed configuration")
+	gateway := byoNATGateway("payments")
+	gateway.Tags = egressIdentityTags("payments")
+	gateway.Properties.ServiceGateway = &armnetwork.SubResource{ID: ptr.To(dt.config.ServiceGatewayResourceID())}
+	gateway.Properties.IdleTimeoutInMinutes = ptr.To[int32](4)
+	m.nat.EXPECT().Get(gomock.Any(), "rg", "payments", nil).Return(gateway, nil)
+	m.sgw.EXPECT().GetServices(gomock.Any(), "rg", "sgw").Return(nil, nil)
+	var written *int32
+	m.nat.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "payments", gomock.Any()).
+		DoAndReturn(func(_ context.Context, _, _ string, desired armnetwork.NatGateway) (*armnetwork.NatGateway, error) {
+			written = desired.Properties.IdleTimeoutInMinutes
+			return &desired, nil
+		})
+	updater := newTestServiceUpdater(dt)
+	updater.onComplete = dt.OnServiceCreationComplete
+	updater.processBatch()
+	updater.wg.Wait()
+	if assert.NotNil(t, written) {
+		assert.Equal(t, int32(12), *written)
+	}
+	assert.Equal(t, StateCreated, op.State)
+	assert.False(t, op.EgressConfigDirty)
+}
+
+func TestEgressCreationRetryAfterRevivalRemainsCreation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	m := newOutboundMocks(ctrl)
+	dt := newTestDiffTracker()
+	dt.config, dt.networkClientFactory = testConfig(), m.factory
+	old := egressIdleTestPod("old", "payments", "12")
+	old.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}
+	dt.kubeClient = fake.NewSimpleClientset(old)
+	informer := newEgressIdleTestInformer(t, old)
+	dt.egressPodInformer = informer
+	seedEgressIdleTestVotes(t, dt)
+	if err := dt.UpdateK8sPod(UpdatePodInputType{
+		PodOperation: Add, PublicOutboundIdentity: "payments",
+		PodKey: "test/old", PodUID: string(old.UID),
+		Location: old.Status.HostIP, Address: old.Status.PodIP,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	op := &ServiceOperationState{
+		ServiceUID: "payments", Config: NewOutboundServiceConfig("payments", nil),
+		State: StateNotStarted, RetryCount: maxServiceRetries, RetriesExhausted: true,
+		NextRetryAt: time.Now().Add(-time.Second), TriggeringPodNamespace: "test", TriggeringPodName: "old",
+	}
+	dt.pendingServiceOps["payments"] = op
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	updater := newTestServiceUpdater(dt)
+	updater.onComplete = dt.OnServiceCreationComplete
+	t.Cleanup(func() { unblock(); updater.wg.Wait() })
+	m.nat.EXPECT().Get(gomock.Any(), "rg", "payments", nil).Return(nil, notFoundError())
+	m.pip.EXPECT().Get(gomock.Any(), "rg", "payments-pip", nil).
+		DoAndReturn(func(context.Context, string, string, *string) (*armnetwork.PublicIPAddress, error) {
+			close(started)
+			<-release
+			return nil, errors.New("transient PIP read failure")
+		})
+	updater.processBatch()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("creation retry did not reach PIP read")
+	}
+	assert.Equal(t, StateCreationInProgress, op.InFlightState)
+	assert.Zero(t, op.RetryCount)
+	assert.NoError(t, informer.GetStore().Delete(old))
+	dt.observeEgressConfigPod(old, false)
+	dt.podInformerRemovePod(old)
+	assert.Equal(t, StateDeletionPending, op.State)
+	replacement := egressIdleTestPod("replacement", "payments", "20")
+	replacement.Finalizers = []string{ServiceGatewayPodCleanupFinalizer}
+	_, err := dt.kubeClient.CoreV1().Pods("test").Create(context.Background(), replacement, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	assert.NoError(t, informer.GetStore().Add(replacement))
+	dt.observeEgressConfigPod(replacement, false)
+	dt.podInformerAddPod(replacement)
+	assert.Equal(t, StateCreationInProgress, op.InFlightState, "revival must preserve the dispatched operation")
+	unblock()
+	updater.wg.Wait()
+	assert.Equal(t, StateNotStarted, op.State, "failed provisioning must retry creation, not configuration")
+	assert.False(t, dt.NRPResources.NATGateways.Has("payments"))
+}
+
+func TestUpdateEgressIdleTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		edit       func(*DiffTracker, *armnetwork.NatGateway)
+		getErr     error
+		services   []*armnetwork.ServiceGatewayService
+		serviceErr error
+		putErr     error
+		wantGet    bool
+		wantList   bool
+		wantPut    bool
+		wantError  bool
+	}{
+		{name: "updates only idle timeout", wantGet: true, wantList: true, wantPut: true},
+		{name: "already matches", edit: func(_ *DiffTracker, n *armnetwork.NatGateway) {
+			n.Properties.IdleTimeoutInMinutes = ptr.To[int32](12)
+		}, wantGet: true, wantList: true},
+		{name: "untagged", edit: func(_ *DiffTracker, n *armnetwork.NatGateway) { n.Tags = nil }, wantGet: true, wantError: true},
+		{name: "foreign owner", edit: func(_ *DiffTracker, n *armnetwork.NatGateway) {
+			n.Tags = egressIdentityTags("somebody-else")
+		}, wantGet: true, wantError: true},
+		{name: "missing gateway", getErr: notFoundError(), wantGet: true, wantError: true},
+		{name: "read failure", getErr: errors.New("ARM read unavailable"), wantGet: true, wantError: true},
+		{name: "missing properties", edit: func(_ *DiffTracker, n *armnetwork.NatGateway) { n.Properties = nil }, wantGet: true, wantError: true},
+		{name: "provisioning incomplete", edit: func(_ *DiffTracker, n *armnetwork.NatGateway) {
+			n.Properties.ProvisioningState = ptr.To(armnetwork.ProvisioningStateUpdating)
+		}, wantGet: true, wantError: true},
+		{name: "foreign link", edit: func(_ *DiffTracker, n *armnetwork.NatGateway) {
+			n.Properties.ServiceGateway.ID = ptr.To("/subscriptions/other/resourceGroups/rg/providers/Microsoft.Network/serviceGateways/foreign")
+		}, wantGet: true, wantError: true},
+		{name: "service listing failure", serviceErr: errors.New("services unavailable"), wantGet: true, wantList: true, wantError: true},
+		{name: "shared gateway", services: []*armnetwork.ServiceGatewayService{
+			{Name: ptr.To("other"), Properties: &armnetwork.ServiceGatewayServicePropertiesFormat{
+				PublicNatGatewayID: ptr.To("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/natGateways/payments"),
+			}},
+		}, wantGet: true, wantList: true, wantError: true},
+		{name: "missing etag", edit: func(_ *DiffTracker, n *armnetwork.NatGateway) { n.Etag = nil }, wantGet: true, wantList: true, wantError: true},
+		{name: "wildcard etag", edit: func(_ *DiffTracker, n *armnetwork.NatGateway) { n.Etag = ptr.To("*") }, wantGet: true, wantList: true, wantError: true},
+		{name: "write failure", putErr: errors.New("PUT result unknown"), wantGet: true, wantList: true, wantPut: true, wantError: true},
+		{name: "BYO binding", edit: func(dt *DiffTracker, _ *armnetwork.NatGateway) {
+			dt.setBYONATGatewayID("payments", "/subscriptions/sub/resourceGroups/customer/providers/Microsoft.Network/natGateways/payments")
+		}, wantError: true},
+		{name: "inbound owner", edit: func(dt *DiffTracker, _ *armnetwork.NatGateway) {
+			dt.NRPResources.LoadBalancers.Insert("payments")
+		}, wantError: true},
+		{name: "RP-owned identity", edit: func(dt *DiffTracker, _ *armnetwork.NatGateway) {
+			dt.NRPResources.ReservedOutboundServices = utilsets.NewString("payments")
+		}, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			m := newOutboundMocks(ctrl)
+			dt := newOutboundDiffTracker("payments", m, nil)
+			dt.pendingServiceOps["payments"].State = StateUpdateInProgress
+			id := fmt.Sprintf(consts.NatGatewayIDTemplate, dt.config.networkResourceSubscriptionID(), dt.config.ResourceGroup, "payments")
+			gateway := &armnetwork.NatGateway{
+				Name: ptr.To("payments"), ID: ptr.To(id), Etag: ptr.To(`W/"version-1"`),
+				Location: ptr.To("eastus"), Zones: []*string{ptr.To("1")},
+				SKU:  &armnetwork.NatGatewaySKU{Name: ptr.To(armnetwork.NatGatewaySKUNameStandardV2)},
+				Tags: map[string]*string{EgressIdentityTagKey: ptr.To("payments"), "owner-note": ptr.To("keep")},
+				Properties: &armnetwork.NatGatewayPropertiesFormat{
+					ProvisioningState:    ptr.To(armnetwork.ProvisioningStateSucceeded),
+					IdleTimeoutInMinutes: ptr.To[int32](4),
+					ServiceGateway:       &armnetwork.SubResource{ID: ptr.To(dt.config.ServiceGatewayResourceID())},
+					PublicIPAddresses:    []*armnetwork.SubResource{{ID: ptr.To("v4-pip")}},
+					PublicIPAddressesV6:  []*armnetwork.SubResource{{ID: ptr.To("v6-pip")}},
+					PublicIPPrefixes:     []*armnetwork.SubResource{{ID: ptr.To("v4-prefix")}},
+					PublicIPPrefixesV6:   []*armnetwork.SubResource{{ID: ptr.To("v6-prefix")}},
+				},
+			}
+			if test.edit != nil {
+				test.edit(dt, gateway)
+			}
+			if test.wantGet {
+				m.nat.EXPECT().Get(gomock.Any(), "rg", "payments", nil).Return(gateway, test.getErr)
+			}
+			if test.wantList {
+				services := test.services
+				if len(services) != 0 {
+					services = []*armnetwork.ServiceGatewayService{{Name: ptr.To("other"),
+						Properties: &armnetwork.ServiceGatewayServicePropertiesFormat{PublicNatGatewayID: ptr.To(id)}}}
+				}
+				m.sgw.EXPECT().GetServices(gomock.Any(), "rg", "sgw").Return(services, test.serviceErr)
+			}
+			if test.wantPut {
+				want, properties := *gateway, *gateway.Properties
+				properties.IdleTimeoutInMinutes = ptr.To[int32](12)
+				want.Properties = &properties
+				m.nat.EXPECT().CreateOrUpdate(gomock.Any(), "rg", "payments", gomock.Any()).
+					DoAndReturn(func(_ context.Context, _, _ string, got armnetwork.NatGateway) (*armnetwork.NatGateway, error) {
+						assert.Equal(t, want, got, "only the idle timeout may change")
+						assert.Equal(t, int32(4), *gateway.Properties.IdleTimeoutInMinutes, "the fetched object must not be mutated")
+						return &got, test.putErr
+					})
+			}
+			changed, err := dt.updateEgressConfig(context.Background(), "payments", egressConfig{IdleTimeoutMinutes: 12})
+			assert.Equal(t, test.wantPut && !test.wantError, changed)
+			if test.wantError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestReconcileEgressIdleTimeoutDoesNotWriteBlockedConfiguration(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		pods   []*v1.Pod
+		byo    bool
+		reason string
+	}{
+		{name: "no members"},
+		{name: "conflict", pods: []*v1.Pod{
+			egressIdleTestPod("a", "payments", "12"), egressIdleTestPod("b", "payments", "20"),
+		}, reason: consts.ServiceEgressGatewayReasonConfigConflict},
+		{name: "invalid", pods: []*v1.Pod{egressIdleTestPod("a", "payments", "bad")}, reason: consts.ServiceEgressGatewayReasonInvalidConfig},
+		{name: "BYO configuration refused", pods: []*v1.Pod{egressIdleTestPod("a", "payments", "12")}, byo: true, reason: consts.ServiceEgressGatewayReasonInvalidConfig},
+		{name: "BYO selector alone", pods: []*v1.Pod{egressIdleTestPod("a", "payments", "")}, byo: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dt := newTestDiffTracker()
+			if test.byo {
+				dt.setBYONATGatewayID("payments", "/subscriptions/sub/resourceGroups/customer/providers/Microsoft.Network/natGateways/payments")
+				for _, pod := range test.pods {
+					if pod.Annotations == nil {
+						pod.Annotations = map[string]string{}
+					}
+					pod.Annotations[consts.PodAnnotationServiceEgressGatewayResourceGroup] = "customer"
+				}
+			}
+			dt.egressPodInformer = newEgressIdleTestInformer(t, test.pods...)
+			seedEgressIdleTestVotes(t, dt)
+			for _, pod := range test.pods {
+				dt.pendingPods["payments"] = append(dt.pendingPods["payments"], PendingPodUpdate{
+					PodKey: pod.Namespace + "/" + pod.Name, PodUID: string(pod.UID),
+					Location: pod.Status.HostIP, Address: pod.Status.PodIP,
+				})
+			}
+			recorder := record.NewFakeRecorder(20)
+			dt.SetEventRecorder(recorder)
+			assert.NoError(t, dt.reconcileEgressConfig(context.Background(), "payments"))
+			if test.reason == "" {
+				assert.Empty(t, recorder.Events)
+			} else if assert.NotEmpty(t, recorder.Events) {
+				assert.Contains(t, <-recorder.Events, test.reason)
+			}
+		})
+	}
+}
+
+func TestServiceUpdaterOutboundUpdateWithoutMembersIsCountedAsSkipped(t *testing.T) {
 	RegisterMetrics()
 
 	dt := newTestDiffTracker()
+	dt.egressPodInformer = newEgressIdleTestInformer(t)
+	seedEgressIdleTestVotes(t, dt)
 	uid := "outbound-update"
 	dt.pendingServiceOps[uid] = &ServiceOperationState{
 		ServiceUID: uid,
@@ -1205,12 +1666,12 @@ func TestServiceUpdaterOutboundUpdateIsCountedAsSkipped(t *testing.T) {
 
 	called, success, opErr := got.result()
 	assert.True(t, called, "the operation must be completed so the state machine does not strand")
-	assert.True(t, success, "the completion is reported as success to release the operation")
+	assert.True(t, success, "an identity without members has no configuration to apply")
 	assert.NoError(t, opErr)
 
 	after, err := testutil.GetCounterMetricValue(outboundServiceUpdatesSkippedTotal)
 	assert.NoError(t, err)
-	assert.Equal(t, 1.0, after-before, "a dropped outbound update must be counted exactly once")
+	assert.Equal(t, 1.0, after-before, "a no-op reconciliation must be counted exactly once")
 }
 
 // newRetryTimerTestUpdater builds an updater whose fired timer is observable as a buffered token.
